@@ -4,22 +4,21 @@
 
 通过本章，读者将学会：
 
-- 在壬远AI网关中为产品（Product）绑定自定义域名；
+- 理解当前版本中域名管理功能的状态与限制；
 - 上传 TLS 服务端证书与私钥，并理解控制面的校验规则；
-- 设置和维护默认证书（Default Certificate），保证未知域名的 HTTPS 握手不失败；
+- 设置和维护默认证书（Default Certificate），保证 HTTPS 握手不失败；
 - 跟踪证书过期时间，规划续期与替换流程；
-- 验证 HTTPS 访问是否生效，并排查常见的域名与证书不匹配问题；
-- 在同一网关中为多个域名配置独立的证书和路由规则。
+- 验证 HTTPS 访问是否生效，并排查常见的证书不匹配问题。
 
 ---
 
-## 域名绑定操作
+## 域名管理现状
 
-壬远AI网关的数据面 BFE 使用 `server_data_conf` 中的 **HostTable（域名表）** 将请求域名映射到具体的产品线（Product），再由 **RouteTable（路由表）** 将流量分发到目标 Cluster。域名绑定不是直接修改 BFE 配置文件，而是在 AI Gateway API 中维护 Provider / Cluster / 路由规则后，由 InnerAPI 自动导出为 BFE 可消费的配置。
+> **重要说明**：当前版本的壬远 AI 网关未开放域名管理功能。`ai-gateway-api/endpoints/openapi_v1/domain/` 下的接口实现虽然存在，但对应的 Endpoint 注册已被移除（`endpoints.go` 中 `Endpoints = []*xreq.Endpoint{}`），`create.go` 中也明确标注 `deprecated, endpoint registration removed per optimization plan v1.2`。因此，无论是 Dashboard 还是 OpenAPI，当前都不提供 `/domains` 接口。
 
-### 域名与产品线的映射关系
+在 AI 网关场景下，域名绑定本身也不会参与 AI 路由选择。请求转发目标完全由 `mod_ai_route` 根据 API-Key / Entity / Global 三级 AI 路由规则决定；BFE 的 `findProduct()` 在按 hostname 找不到匹配产品时，会回退到默认产品线（`defaultProduct`，对应控制面 `AIRouteInnerProductName`），从而加载默认产品线下的 AI 模块配置。由于当前版本无需维护自定义域名即可正常工作，域名管理功能暂时未对外开放。
 
-`server_data_conf` 的 `HostTable` 包含三层映射：
+如果未来版本重新开放域名管理，其设计将遵循传统 BFE 的 HostTable 机制：
 
 ```
 hostname（例如 api.example.com）
@@ -31,33 +30,19 @@ host-tag（例如 host-tag-1）
 product（例如 AI_product）
 ```
 
-- **Hosts**：`host-tag` 到 `hostname` 列表的映射，一个 host-tag 可以关联多个域名；
-- **HostTags**：`product` 到 `host-tag` 列表的映射，一个 product 可以关联多组 host-tag；
-- **DefaultProduct**：当请求域名无法匹配任何 Hosts 时，BFE 使用该默认产品线处理请求。
+- **Hosts**：`host-tag` 到 `hostname` 列表的映射；
+- **HostTags**：`product` 到 `host-tag` 列表的映射；
+- **DefaultProduct**：未匹配任何域名时的回退产品线。
 
-在 Dashboard 中，域名绑定通常在创建或编辑 Cluster / 路由规则时同步完成。管理员填入希望对外暴露的域名（如 `api.example.com`）后，AI Gateway API 会自动生成对应的 HostTable 与 RouteTable 条目，并通过 InnerAPI `/configs/tls_conf/server_data_conf` 导出给 Conf Agent 与 BFE。
+届时仍需注意：AI 模块配置只关联默认 AI 产品线，自定义域名若绑定到非默认产品线，将导致 AI 模块无法命中规则。
 
-### 默认产品线的作用
-
-`DefaultProduct` 决定了未匹配任何域名时的 fallback 行为。对于 AI 网关场景，建议将主 AI 产品设置为默认产品线，这样即使业务方使用临时域名或 IP 直接访问，也能进入正确的路由逻辑。若默认产品线配置错误，可能导致请求返回 404 或被路由到非预期的 Cluster。
-
-### 域名变更的生效流程
-
-域名或路由规则变更后，并不会立即作用于 BFE，而是遵循配置导出与热加载流程：
-
-1. AI Gateway API 收到域名或路由规则变更请求，完成校验后写入 MySQL，并生成新的配置版本号；
-2. InnerAPI `/configs/tls_conf/server_data_conf` 将 HostTable、RouteTable 和 ClusterConf 导出为 BFE 可识别的 JSON 结构；
-3. Conf Agent 按固定周期轮询 InnerAPI，发现版本号变化后，拉取新配置并持久化到本地版本目录；
-4. Conf Agent 通过符号链接（Symlink）原子切换当前生效目录，然后调用 BFE 的 `/reload` 接口热加载；
-5. BFE 在不中断已有连接的情况下使用新的域名与路由配置处理后续请求。
-
-管理员可以通过 Dashboard 或 InnerAPI 查看当前生效的配置版本号，确认变更是否已下发到目标 BFE 节点。
+---
 
 ---
 
 ## TLS 证书上传
 
-HTTPS 接入依赖服务端证书（Server Certificate）和私钥（Private Key）。壬远AI网关通过 OpenAPI `/certificates` 统一管理证书，而不是要求管理员登录 BFE 节点手动上传文件。控制面负责校验、存储、版本控制，并通过 InnerAPI 将证书路径映射下发给数据面。
+HTTPS 接入依赖服务端证书（Server Certificate）和私钥（Private Key）。当前版本的 Dashboard 同样未提供证书管理界面，证书需通过 OpenAPI `/certificates` 直接维护。控制面负责校验、存储、版本控制，并通过 InnerAPI 将证书路径映射下发给数据面。
 
 ### 证书数据模型
 
@@ -172,7 +157,7 @@ DELETE /open-api/v1/certificates/{cert_name}
 建议通过以下方式持续跟踪证书状态：
 
 1. **定期调用证书列表接口**：遍历 `expired_date`，对 30 天、14 天、7 天内即将过期的证书设置告警；
-2. **Dashboard 可视化**：在控制台证书管理页面置顶显示即将过期或已过期证书；
+2. **可视化提醒**：当前版本需通过外部告警系统或自行开发的运维面板展示即将过期或已过期证书，Dashboard 暂未提供证书管理页面；
 3. **告警规则示例**：
    - 证书剩余有效期 ≤ 30 天：提示（Info）；
    - 证书剩余有效期 ≤ 7 天：警告（Warning）；
@@ -394,5 +379,5 @@ curl -v https://api.example.com/v1/chat/completions \
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/server-cert-conf.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/server-data-conf.md`
 - `bfe/docs/zh_cn/configuration/tls_conf/server_cert_conf.data.md`
-- [第五章 壬远AI网关架构设计](../design/chapter05-system-architecture.md)
+- [第五章 壬远AI网关架构与核心概念](../design/chapter05-system-architecture.md)
 - [第七章 数据面转发设计：BFE](../design/chapter07-data-plane-design.md)

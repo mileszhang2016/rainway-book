@@ -1,18 +1,62 @@
-# 第九章 API-Key 设计
+# 第九章 Entity 与 API-Key 设计
 
 ## 本章目标
 
-API-Key 是壬远 AI 网关面向业务方的核心调用凭证，也是后续配额、限流、路由、成本核算等能力的挂载点。通过阅读本章，读者将理解：
+Entity 与 API-Key 是壬远 AI 网关消费者侧的两个核心概念。Entity 表达业务组织架构（如公司、部门、团队、项目），是模型白名单、配额、限流、路由等策略的承载单元；API-Key 是业务系统面向数据面的核心调用凭证，通过挂载到 Entity 继承其策略，也可拥有独立配置。两者共同构成后续配额、限流、路由、成本核算等能力的挂载点。通过阅读本章，读者将理解：
 
-- API-Key 的数据模型与字段含义；
-- API-Key 的生成、校验与完整生命周期；
-- Entity 业务组织单元如何形成层级树，并把模型白名单、配额、限流、路由策略继承给 API-Key；
+- Entity 的数据模型、层级树约束与模型继承规则；
+- API-Key 的数据模型、生成校验与完整生命周期；
+- API-Key 如何挂载到 Entity，并继承其策略；
 - API-Key 与配额、限流、路由规则如何绑定并导出到 BFE 数据面；
 - 数据面最终生效规则的形成过程。
 
 ---
 
-## API-Key 的数据模型
+## Entity 数据模型与层级树
+
+### Entity 与 Entity-Type
+
+Entity 是业务组织单元，如公司、部门、项目组、个人。Entity 通过 `parent_id` 字段自底向上形成层级树，其类型由 `entity_types` 表定义，每个 Entity-Type 拥有一个 `Level`（1–5，数字越小级别越高）。
+
+创建或更新 Entity 时必须满足层级约束：
+
+- 父 Entity 必须存在；
+- 父 Entity 的 Entity-Type Level 必须 **小于** 当前 Entity 的 Level。
+
+即层级只能从高级别指向低级别，不允许同级或反向引用，从而避免成环。
+
+### 模型继承规则
+
+Entity 可以配置 `allow_models` 与 `block_models`，挂载到其上的 API-Key 会继承这些模型策略：
+
+- `allow_models`：取交集继承。层级中所有非空且不含 `*` 的 `allow_models` 取交集；若某一层级为 `*` 或空数组，则视为不限制，不参与交集。
+- `block_models`：取并集继承。层级中所有非空的 `block_models` 取并集。
+- API-Key 自身的 `models` 也会参与最终的交集计算。
+
+例如，某 Entity 层级如下：
+
+| Entity | allow_models | block_models |
+|--------|-------------|--------------|
+| 公司根 | `["*"]` | `[]` |
+| 部门 A | `["gpt-4", "gpt-3.5-turbo"]` | `["gpt-4-32k"]` |
+| 项目 X | `["gpt-4", "claude-3"]` | `["davinci"]` |
+| API-Key | `[]`（未设置） | `[]` |
+
+最终允许的模型为部门 A 与项目 X 的交集 `["gpt-4"]`；最终禁止的模型为 `["gpt-4-32k", "davinci"]`。若 API-Key 自身也设置了非空白名单，则再与上述结果取交集；交集为空时，该 API-Key 在导出时会被禁用（`Enabled=false`）。
+
+### Entity 级策略绑定
+
+每个 Entity 均可独立配置：
+
+- `quota_plan_id`：配额计划；
+- `rate_limit_policy_id`：限流策略；
+- `route_rules_id`：路由规则。
+
+这些策略与 API-Key 自身策略共同作用，形成多层策略叠加的效果。
+
+---
+
+## API-Key 数据模型
 
 API-Key 是业务系统调用大模型服务时使用的凭证，其核心字段如下：
 
@@ -84,50 +128,6 @@ API-Key 的生命周期由以下 OpenAPI 接口管理：
 - `enabled=false` 或 `expired_time` 到达后，数据面校验失败，请求被拒绝；
 - 删除 API-Key 时，级联删除其专属的 `quota_plan`、`rate_limit_policy`、`route_rules` 及底层资源（若未被其他对象引用），并通过 `quotaCache.DeleteKeys` 清理对应 Redis Key；
 - 修改 `quota_plan.quota`（单位不变）时保留 `used`，按 `remaining = max(0, 新 quota - used)` 调整；修改 `unit` 或 `unlimited` 时重置 `used=0`。
-
----
-
-## Entity 层级树与模型继承
-
-### Entity 与 Entity-Type
-
-Entity 是业务组织单元，如公司、部门、项目组、个人。Entity 通过 `parent_id` 字段自底向上形成层级树，其类型由 `entity_types` 表定义，每个 Entity-Type 拥有一个 `Level`（1–5，数字越小级别越高）。
-
-创建或更新 Entity 时必须满足层级约束：
-
-- 父 Entity 必须存在；
-- 父 Entity 的 Entity-Type Level 必须 **小于** 当前 Entity 的 Level。
-
-即层级只能从高级别指向低级别，不允许同级或反向引用，从而避免成环。
-
-### 模型继承规则
-
-Entity 可以配置 `allow_models` 与 `block_models`，挂载到其上的 API-Key 会继承这些模型策略：
-
-- `allow_models`：取交集继承。层级中所有非空且不含 `*` 的 `allow_models` 取交集；若某一层级为 `*` 或空数组，则视为不限制，不参与交集。
-- `block_models`：取并集继承。层级中所有非空的 `block_models` 取并集。
-- API-Key 自身的 `models` 也会参与最终的交集计算。
-
-例如，某 Entity 层级如下：
-
-| Entity | allow_models | block_models |
-|--------|-------------|--------------|
-| 公司根 | `["*"]` | `[]` |
-| 部门 A | `["gpt-4", "gpt-3.5-turbo"]` | `["gpt-4-32k"]` |
-| 项目 X | `["gpt-4", "claude-3"]` | `["davinci"]` |
-| API-Key | `[]`（未设置） | `[]` |
-
-最终允许的模型为部门 A 与项目 X 的交集 `["gpt-4"]`；最终禁止的模型为 `["gpt-4-32k", "davinci"]`。若 API-Key 自身也设置了非空白名单，则再与上述结果取交集；交集为空时，该 API-Key 在导出时会被禁用（`Enabled=false`）。
-
-### Entity 级策略绑定
-
-每个 Entity 均可独立配置：
-
-- `quota_plan_id`：配额计划；
-- `rate_limit_policy_id`：限流策略；
-- `route_rules_id`：路由规则。
-
-这些策略与 API-Key 自身策略共同作用，形成多层策略叠加的效果。
 
 ---
 
@@ -217,22 +217,13 @@ AI 路由导出时，API-Key 按以下优先级绑定路由表：
 
 ## 关键数据模型示例
 
-### `api_keys` 表
+### `entity_types` 表
 
 ```sql
-CREATE TABLE api_keys (
-    id VARCHAR(64) PRIMARY KEY,
-    key VARCHAR(128) NOT NULL UNIQUE,
-    description VARCHAR(512) NOT NULL,
-    enabled TINYINT NOT NULL DEFAULT 1,
-    expired_time BIGINT DEFAULT -1,
-    unlimited_quota TINYINT NOT NULL DEFAULT 0,
-    models TEXT COMMENT 'JSON 数组',
-    subnet TEXT COMMENT 'JSON 数组',
-    quota_plan_id BIGINT DEFAULT NULL,
-    rate_limit_policy_id BIGINT DEFAULT NULL,
-    route_rules_id BIGINT DEFAULT NULL,
-    entity_id VARCHAR(64) DEFAULT NULL COMMENT '挂载的 Entity ID',
+CREATE TABLE entity_types (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(64) NOT NULL UNIQUE,
+    level INT NOT NULL COMMENT '层级级别，数字越小级别越高',
     create_time BIGINT NOT NULL,
     update_time BIGINT NOT NULL
 );
@@ -256,13 +247,22 @@ CREATE TABLE entities (
 );
 ```
 
-### `entity_types` 表
+### `api_keys` 表
 
 ```sql
-CREATE TABLE entity_types (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    name VARCHAR(64) NOT NULL UNIQUE,
-    level INT NOT NULL COMMENT '层级级别，数字越小级别越高',
+CREATE TABLE api_keys (
+    id VARCHAR(64) PRIMARY KEY,
+    key VARCHAR(128) NOT NULL UNIQUE,
+    description VARCHAR(512) NOT NULL,
+    enabled TINYINT NOT NULL DEFAULT 1,
+    expired_time BIGINT DEFAULT -1,
+    unlimited_quota TINYINT NOT NULL DEFAULT 0,
+    models TEXT COMMENT 'JSON 数组',
+    subnet TEXT COMMENT 'JSON 数组',
+    quota_plan_id BIGINT DEFAULT NULL,
+    rate_limit_policy_id BIGINT DEFAULT NULL,
+    route_rules_id BIGINT DEFAULT NULL,
+    entity_id VARCHAR(64) DEFAULT NULL COMMENT '挂载的 Entity ID',
     create_time BIGINT NOT NULL,
     update_time BIGINT NOT NULL
 );
@@ -272,15 +272,17 @@ CREATE TABLE entity_types (
 
 ## 本章小结
 
-本章详细介绍了壬远 AI 网关中最核心的调用凭证——API-Key：
+本章详细介绍了壬远 AI 网关消费者侧的两个核心概念——Entity 与 API-Key：
 
-- **数据模型**：`api_keys` 表记录了 Key 值、启用状态、过期时间、模型白名单、子网限制、挂载 Entity 等关键字段；
+- **Entity 数据模型**：`entities` 表与 `entity_types` 表共同表达业务组织架构，通过 `parent_id` 与 `level` 约束形成层级树；
+- **模型继承**：Entity 层级中的 `allow_models` 取交集、`block_models` 取并集，最终与 API-Key 自身白名单共同决定可用模型；
+- **Entity 级策略绑定**：每个 Entity 可独立绑定配额计划、限流策略与路由规则，作为 API-Key 继承策略的来源；
+- **API-Key 数据模型**：`api_keys` 表记录 Key 值、启用状态、过期时间、模型白名单、子网限制、挂载 Entity 等关键字段；
 - **生成与校验**：支持外部 Key 导入和后台生成，数据面 BFE 在 `mod_ai_token_auth` 中完成有效性、过期、子网等多维度校验；
 - **生命周期**：通过 OpenAPI 完成创建、查询、更新、删除、配额重置，删除时会级联清理专属配置与 Redis Key；
-- **Entity 继承**：API-Key 挂载到 Entity 后，继承 Entity 层级树上的模型白名单（交集）、黑名单（并集）、配额计划、限流策略和路由规则；
-- **策略绑定**：导出到 BFE 时，API-Key 自身策略与 Entity 层级策略合并，形成最终生效的多 Redis Key 配额、多限流策略和多级路由绑定。
+- **策略绑定与导出**：API-Key 挂载到 Entity 后，自身策略与 Entity 层级策略合并，形成最终生效的多 Redis Key 配额、多限流策略和多级路由绑定。
 
-理解 API-Key 的设计，是正确配置配额、限流与路由规则的基础，也是排查数据面权限与策略问题的关键。
+理解 Entity 与 API-Key 的设计，是正确配置配额、限流与路由规则的基础，也是排查数据面权限与策略问题的关键。
 
 ---
 
