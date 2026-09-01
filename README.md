@@ -65,3 +65,9 @@
 - `ai-gateway-api/`：控制面核心组件
 - `bfe/`：数据面转发引擎
 - `conf-agent/`：配置代理
+
+## 版权许可
+
+本书采用 [Creative Commons Attribution 4.0 International License (CC-BY-4.0)](https://creativecommons.org/licenses/by/4.0/) 许可。
+
+在遵守署名要求的前提下，您可以自由地分享、改编本书内容，包括用于商业用途。完整许可条款见 [LICENSE](./LICENSE)。
