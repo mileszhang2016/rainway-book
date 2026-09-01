@@ -12,7 +12,7 @@
 
 ---
 
-## 17.1 Dashboard 访问方式与默认账号
+## Dashboard 访问方式与默认账号
 
 Dashboard 是壬远 AI 网关的管理控制台（Admin Console），它以 Web UI 形式调用 AI Gateway API 的 OpenAPI v1 接口，完成策略与配置的可视化管理。在本地或测试环境启动 AI Gateway API 后，默认可通过浏览器访问：
 
@@ -33,7 +33,7 @@ http://api-server:8183/
 
 ---
 
-## 17.2 控制台界面导览
+## 控制台界面导览
 
 Dashboard 的导航由 `/meta` 接口动态返回，对应 `conf/nav_tree.toml` 中定义的导航树。当前管理员（admin）视角下的主导航包括资源管理、路由管理、消费者管理、用户管理四大类，与 OpenAPI v1 的模块划分基本一致。界面布局通常如下：
 
@@ -73,41 +73,41 @@ Dashboard 的导航由 `/meta` 接口动态返回，对应 `conf/nav_tree.toml` 
 
 ---
 
-## 17.3 产品/域名/实例池等基础概念
+## 产品/域名/实例池等基础概念
 
 控制台中的诸多操作都围绕以下基础概念展开，理解它们是正确使用 Dashboard 的前提。
 
-### 17.3.1 产品（Product）
+### 产品（Product）
 
 产品（Product）是壬远 AI 网关中的顶层资源隔离单位，对应数据库中的 `products` 表。历史上它曾用于区分不同业务线，并在中间件 `McProductProbe` 中解析产品线上下文。当前版本中，控制台面向管理员时默认工作在单一产品视图下，后续若扩展多租户能力，产品将成为权限隔离与配置分组的基础。
 
-### 17.3.2 域名（Domain）
+### 域名（Domain）
 
 域名（Domain）对应 `domains` 表，是流量进入 BFE 数据面的入口标识。控制面在导出 Server Data 配置时，会将域名、基础/高级路由规则与集群配置组装成 BFE 可消费的 `HostTable`、`RouteTable` 与 `ClusterConf`。Dashboard 中的路由规则配置最终都会映射到具体的域名命中条件上。
 
-### 17.3.3 实例池（Instance Pool）
+### 实例池（Instance Pool）
 
 实例池（Instance Pool）在 Provider 数据模型中通过 `instance_pool` 字段定义，描述下游 AI 服务的真实后端地址、端口与权重。与早期将实例信息直接写在 Cluster 中不同，当前架构把实例池收敛到 Provider 中，供多个 Cluster 复用。创建或更新 Provider 时，控制面会根据 `instance_pool` 自动生成实例池、子集群并完成绑定；修改 Provider 的实例池时，也会同步刷新引用该 Provider 的所有 Cluster 所生成的实例池。
 
-### 17.3.4 Provider 与 Cluster
+### Provider 与 Cluster
 
 Provider（提供商）回答“下游是谁、能访问哪些模型、如何认证、后端在哪里”的问题；Cluster（集群）回答“流量如何转发、用哪些模型、Key 权重如何分配”的问题。二者解耦后，Cluster 通过 `llm_config.provider` 强引用 Provider，而 Provider 可以被多个 Cluster 共享。详细设计动机与数据模型参见 [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)。
 
-### 17.3.5 Entity 与 API-Key
+### Entity 与 API-Key
 
 Entity（实体）用于表达组织架构，例如部门、团队或项目。每个 Entity 拥有独立的模型白名单/黑名单、配额计划（QuotaPlan）、限流策略（RateLimitPolicy）与路由规则。API-Key 则是调用方访问 AI 网关的凭证，可与 Entity 关联以继承其配额与限流策略，也可拥有独立的 api-key 级路由规则。
 
 ---
 
-## 17.4 用户与权限管理
+## 用户与权限管理
 
 Dashboard 的用户与权限由 `/auth` 接口族管理，相关定义详见 `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/auth.md`。
 
-### 17.4.1 用户（User）
+### 用户（User）
 
 用户是登录 Dashboard 的自然人账号，当前版本仅支持管理员用户（`is_admin=true`），即拥有 System 权限。创建用户时需要指定 `user_name`、`password` 与 `is_admin`；密码不能等于用户名或其逆序。管理员可通过 Dashboard 的“用户管理”入口完成新增、删除与密码重置。
 
-### 17.4.2 Session Key 与 Token
+### Session Key 与 Token
 
 - **Session Key**：由 `/auth/session-keys` 根据用户名和密码生成，用于 Dashboard 登录后的请求鉴权，格式为 `Authorization: Session {session_key}`。Session 有过期时间，默认由 `SessionExpireInDay` 控制。
 - **Token**：由 `/auth/tokens` 创建，主要用于机器调用或数据面组件（如 Conf Agent、BFE）访问 InnerAPI。Token 分为两种 Scope：
@@ -118,7 +118,7 @@ Dashboard 的用户与权限由 `/auth` 接口族管理，相关定义详见 `ai
 
 ---
 
-## 17.5 全局配置视图
+## 全局配置视图
 
 Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键资源状态，通常包括：
 
@@ -153,7 +153,7 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 
 ---
 
-## 17.6 配置版本与变更记录查看
+## 配置版本与变更记录查看
 
 壬远 AI 网关采用基于 MD5 签名与版本号的配置导出机制，详细设计参见 [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)。在 Dashboard 中，管理员可以在“全局配置”或“版本管理”入口查看以下信息：
 
@@ -167,7 +167,7 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 
 ---
 
-## 17.7 通过 Dashboard 进行首次配置的完整流程
+## 通过 Dashboard 进行首次配置的完整流程
 
 以下是一个从空环境到流量可转发的最小配置流程，适用于首次使用 Dashboard 的读者。
 
@@ -232,7 +232,7 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 
 ---
 
-## 17.8 操作注意事项
+## 操作注意事项
 
 在使用 Dashboard 进行日常运维时，应注意以下事项：
 

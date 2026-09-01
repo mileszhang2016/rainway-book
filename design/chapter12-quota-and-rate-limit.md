@@ -13,7 +13,7 @@
 
 ---
 
-## 11.1 为什么需要配额与限流
+## 为什么需要配额与限流
 
 企业在统一接入大模型服务后，通常面临两类资源失控风险：
 
@@ -24,11 +24,11 @@
 
 ---
 
-## 11.2 QuotaPlan 模型：total_token 与 RMB 两种单位
+## QuotaPlan 模型：total_token 与 RMB 两种单位
 
 `QuotaPlan`（配额计划）是壬远AI网关中最基础的配额抽象。它既可以按 Token 总量计费，也可以按人民币金额计费，分别对应 `unit = total_token` 与 `unit = RMB`。
 
-### 11.2.1 数据表结构
+### 数据表结构
 
 配额计划持久化在 `quota_plans` 表中，核心字段如下（完整定义见 `ai-gateway-api/design-docs/sys-design/details/配额余额同步机制.md`）：
 
@@ -57,20 +57,20 @@ CREATE TABLE `quota_plans` (
 | `reset_period` | 重置周期，可选 `never`、`weekly`、`monthly`。 |
 | `last_reset_at` | 上次重置时间，周期重置据此判断是否跨越自然周/月边界。 |
 
-### 11.2.2 两种单位的适用场景
+### 两种单位的适用场景
 
 - **`total_token`**：适用于按 Token 计费的模型（如 OpenAI、Anthropic）。管理员可以直接限制每月可用的输入+输出 Token 总量。
 - **`RMB`**：适用于需要把不同模型、不同价格统一折算为成本的场景。系统会根据请求消耗的 Token 和模型单价，实时折算为人民币并从余额中扣减。
 
-### 11.2.3 RMB 配额精度
+### RMB 配额精度
 
 为了避免浮点误差，`ai-gateway-api` 与 BFE 在 Redis 内部统一把 RMB 金额乘以 `1e8` 后转为定点整数存储；对外展示时统一按 4 位小数输出。例如 `0.0000015` 元在内部表示为 `150`，序列化时通过 `strconv.FormatFloat(v, 'f', -1, 64)` 强制使用十进制表示法，避免科学计数法导致可读性问题或中间层截断。
 
 ---
 
-## 11.3 Redis 作为余额唯一真实来源
+## Redis 作为余额唯一真实来源
 
-### 11.3.1 核心矛盾
+### 核心矛盾
 
 配额消耗发生在请求链路（BFE 数据面实时扣减），需要高并发、低延迟；而管理面（AI Gateway API）需要向 OpenAPI 展示 `used` / `remaining`，又希望数据实时、一致。
 
@@ -80,7 +80,7 @@ CREATE TABLE `quota_plans` (
 - 同步任务本身增加系统复杂度和出错概率；
 - 周期重置时需要同时更新两张表，容易不一致。
 
-### 11.3.2 新架构：Redis 唯一真实来源
+### 新架构：Redis 唯一真实来源
 
 当前架构废弃了 `quota_balances` 表，由 Redis 直接作为余额的唯一真实来源：
 
@@ -101,7 +101,7 @@ flowchart TD
 
 在该架构中，`QuotaCache` 接口（定义于 `ai-gateway-api/model/quotacache/quotacache.go`，实现于 `ai-gateway-api/model/quotacache/redis.go`）封装了对 Redis 的所有操作，包括 `GetRemaining`、`BatchGetRemaining`、`SetRemaining`、`ResetToQuota` 和 `DeleteKeys`。
 
-### 11.3.3 Redis Key 规则
+### Redis Key 规则
 
 Redis Key 由 `AIUsedQuotaKey` 生成（`ai-gateway-api/stateful/config_redis.go`）：
 
@@ -119,7 +119,7 @@ func AIUsedQuotaKey(key string) string {
 
 Key 不再拼接 `KeyCreateAt` 时间戳，生命周期与 API-Key / Entity 保持一致，避免 Key 膨胀。API-Key 或 Entity 删除时，会调用 `DeleteKeys` 主动清理对应 Redis Key。
 
-### 11.3.4 原子扣减与归零策略
+### 原子扣减与归零策略
 
 无论是周期重置还是手动重置，系统都使用原子 `IncrBy(delta)` 而非 `SET 0`。原因如下：
 
@@ -129,9 +129,9 @@ Key 不再拼接 `KeyCreateAt` 时间戳，生命周期与 API-Key / Entity 保�
 
 ---
 
-## 11.4 自然周/月重置与过期重置
+## 自然周/月重置与过期重置
 
-### 11.4.1 周期重置策略
+### 周期重置策略
 
 `QuotaPlan.reset_period` 支持三种取值：
 
@@ -141,7 +141,7 @@ Key 不再拼接 `KeyCreateAt` 时间戳，生命周期与 API-Key / Entity 保�
 
 `QuotaResetScheduler`（`ai-gateway-api/model/quota/scheduler.go`）每分钟执行一次 `ResetExpiredBalances`，仅对需要重置的计划进行处理，不再执行旧实现中的全量同步。
 
-### 11.4.2 重置边界判断
+### 重置边界判断
 
 `BalanceSyncManager`（`ai-gateway-api/model/quota/balance_sync.go`）通过注入的 `Clock` 接口获取当前时间，再调用 `shouldResetByPeriod` 判断是否跨越周期边界：
 
@@ -166,7 +166,7 @@ func (m *BalanceSyncManager) shouldResetByPeriod(
 
 `getWeekStart` 与 `getMonthStart` 将时间归一化为周一或每月 1 日的 00:00:00（本地时区）。由于判断基于周/月起始时间点的比较，即使调度器因故错过某个时刻，只要当前周期起始点晚于上次重置时的周期起始点，就会触发重置，具备自愈能力。
 
-### 11.4.3 重置执行流程
+### 重置执行流程
 
 ```mermaid
 sequenceDiagram
@@ -186,7 +186,7 @@ sequenceDiagram
     end
 ```
 
-### 11.4.4 手动重置接口
+### 手动重置接口
 
 除了周期重置，系统还提供手动重置接口：
 
@@ -195,15 +195,15 @@ sequenceDiagram
 
 手动重置调用 `QuotaPlanManager.ResetBalance(..., updateLastResetAt=false)`，即只重置 Redis 余额，不更新 `last_reset_at`，避免干扰周期调度器对自然周/月的判断。若传入新的 `quota`，则同时更新 `quota_plans.quota`。
 
-### 11.4.5 多实例部署说明
+### 多实例部署说明
 
 当前 `QuotaResetScheduler` 在每个 AI Gateway API 实例中独立启动。多实例部署时，所有实例都会尝试执行 `ResetExpiredBalances()`，存在重复重置的风险。由于重置基于 Redis 的 `IncrBy(delta)` 操作，重复执行通常不会导致数据错误（幂等），但会产生不必要的日志和 Redis 操作。后续如需严格避免重复执行，可引入 Redis 分布式锁或单实例调度器。
 
 ---
 
-## 11.5 RateLimitPolicy：TPM、RPM、并发限制
+## RateLimitPolicy：TPM、RPM、并发限制
 
-### 11.5.1 策略模型
+### 策略模型
 
 `RateLimitPolicy`（限流策略）用于控制 API-Key 或 Entity 对后端 AI 模型的访问速率，支持三类限制：
 
@@ -228,7 +228,7 @@ CREATE TABLE rate_limit_policies (
 );
 ```
 
-### 11.5.2 TPM 与 RPM 规则结构
+### TPM 与 RPM 规则结构
 
 TPM 与 RPM 规则以 JSON 数组形式存储在 `tpm_configs` 与 `rpm_configs` 字段中：
 
@@ -257,7 +257,7 @@ TPM 与 RPM 规则以 JSON 数组形式存储在 `tpm_configs` 与 `rpm_configs`
 
 `model` 支持具体模型名或通配符 `*`，未命中具体模型时使用默认限制。`name` 在同一策略内唯一且创建后不可修改，是规则导出的稳定标识。
 
-### 11.5.3 校验规则
+### 校验规则
 
 `RateLimitPolicyManager` 在创建/更新时执行严格校验：
 
@@ -269,9 +269,9 @@ TPM 与 RPM 规则以 JSON 数组形式存储在 `tpm_configs` 与 `rpm_configs`
 
 ---
 
-## 11.6 层级合并与导出
+## 层级合并与导出
 
-### 11.6.1 引用关系
+### 引用关系
 
 API-Key 与 Entity 均通过 `rate_limit_policy_id` 字段引用限流策略：
 
@@ -283,7 +283,7 @@ API-Key 与 Entity 均通过 `rate_limit_policy_id` 字段引用限流策略：
 | 导出 Redis Key | `QUOTA_xxx` | `RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>` |
 | 余额同步 | 有 | 无 |
 
-### 11.6.2 Entity 层级向上合并
+### Entity 层级向上合并
 
 导出时，`RateLimitPolicyGenerator`（`ai-gateway-api/model/rate_limit_policy/rate_limit_policy_manager.go`）对每个 API-Key 递归收集其自身及所有父 Entity 绑定的策略 ID：
 
@@ -304,7 +304,7 @@ func (m *RateLimitPolicyManager) fetchEntityRateLimitPolicyIDs(ctx context.Conte
 }
 ```
 
-### 11.6.3 导出文件
+### 导出文件
 
 导出结果写入两个文件：
 
@@ -313,7 +313,7 @@ func (m *RateLimitPolicyManager) fetchEntityRateLimitPolicyIDs(ctx context.Conte
 
 导出的策略名称统一格式为 `rlp-<policy_id>`，避免命名冲突并便于 BFE 索引。只有 `enabled=true` 的策略才会被导出并生成绑定。
 
-### 11.6.4 Redis Key 稳定性
+### Redis Key 稳定性
 
 为了消除"改名/改 model 导致计数器重置"的问题，控制面在导出时为每条规则生成稳定的 Redis Key：
 
@@ -341,7 +341,7 @@ flowchart TD
     J --> K
 ```
 
-### 11.6.5 BFE 侧预期行为
+### BFE 侧预期行为
 
 BFE 收到配置后：
 
@@ -353,13 +353,13 @@ BFE 收到配置后：
 
 ---
 
-## 11.7 RMB 配额分时段定价
+## RMB 配额分时段定价
 
-### 11.7.1 背景
+### 背景
 
 随着 DeepSeek 等模型提供商采用"高峰 / 空闲"分时段定价策略，BFE RMB 配额扣费需要具备按请求发生时刻匹配不同价格的能力。壬远AI网关把时段模板放在 `/providers`，把分时段价格放在 `/model-prices`，实现 Provider 与价格的分离管理。
 
-### 11.7.2 核心概念
+### 核心概念
 
 | 概念 | 说明 |
 |------|------|
@@ -368,7 +368,7 @@ BFE 收到配置后：
 | **Provider 时段模板** | 定义在 `/providers` 上的 `time_zone` 和 `tiers`，同一 provider 下所有模型共享。 |
 | **Model tier 价格** | 定义在 `/model-prices` 上的 `tier_prices`，描述某个模型在某个 tier 下的价格。 |
 
-### 11.7.3 配置归属与下发链路
+### 配置归属与下发链路
 
 ```mermaid
 flowchart TD
@@ -385,7 +385,7 @@ flowchart TD
 
 多个 cluster 引用同一个 provider 时，会各自得到一份相同的 `ModelTable` 数据；provider 的时段规则变更后，所有引用它的 cluster 在下一次配置导出时自动生效。
 
-### 11.7.4 BFE ModelTable 结构
+### BFE ModelTable 结构
 
 导出后的 `AIConf.ModelTable` 结构如下（定义于 BFE 侧相关配置加载代码）：
 
@@ -410,7 +410,7 @@ type ModelPrice struct {
 }
 ```
 
-### 11.7.5 运行时时段匹配
+### 运行时时段匹配
 
 BFE 加载阶段解析 `TimeZone` 并校验 `Tiers`，运行时使用 `ActiveTierName` 根据请求发生时刻匹配 tier：
 
@@ -443,7 +443,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 
 命中 tier 且该 tier 配置了对应价格键时，使用 tier 价格；否则 fallback 到默认 `Prices`。时间区间左闭右开，跨午夜需拆成两段。
 
-### 11.7.6 向后兼容
+### 向后兼容
 
 - `/providers` 不填 `time_zone` / `tiers` 时，`ModelTable.TimeZone` / `Tiers` 为空，行为与固定价格一致；
 - `/model-prices` 不填 `tier_prices` 时，按默认 `Prices` 计费；
@@ -452,9 +452,9 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 
 ---
 
-## 11.8 配额与限流配置示例
+## 配额与限流配置示例
 
-### 11.8.1 QuotaPlan 示例
+### QuotaPlan 示例
 
 以下是一个按月重置、总量为 1 亿 Token 的配额计划：
 
@@ -492,7 +492,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 }
 ```
 
-### 11.8.2 RateLimitPolicy 示例
+### RateLimitPolicy 示例
 
 以下是一个限制 gpt-4 模型 TPM/RPM 并设置最大并发为 50 的策略：
 
@@ -539,7 +539,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 }
 ```
 
-### 11.8.3 RMB 分时段定价示例
+### RMB 分时段定价示例
 
 Provider 时段模板：
 

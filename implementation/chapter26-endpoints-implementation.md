@@ -16,7 +16,7 @@
 
 ---
 
-## 25.1 endpoints 目录结构
+## endpoints 目录结构
 
 `ai-gateway-api/endpoints/` 是 HTTP 请求的入口层，所有管理面接口与数据面导出接口都集中在这里。为了降低耦合，目录被清晰地划分为根路由、公共中间件、OpenAPI 子系统与 InnerAPI 子系统四个部分：
 
@@ -64,7 +64,7 @@ ai-gateway-api/endpoints/
 
 ---
 
-## 25.2 xreq.Endpoint 抽象
+## xreq.Endpoint 抽象
 
 接口层采用统一的 `xreq.Endpoint` 抽象来描述每个 HTTP 接口。其定义位于 `lib/xreq/result.go`：
 
@@ -163,14 +163,14 @@ graph LR
 
 ---
 
-## 25.3 全局中间件与路由子树中间件
+## 全局中间件与路由子树中间件
 
 `endpoints/router.go` 在根路由器上注册了全局中间件，并在 OpenAPI / InnerAPI 子路由器上分别挂载业务中间件。可以把它们分为两组：
 
 - **全局中间件**：Recovery、Logger、CORS，对所有请求生效；
 - **路由子树中间件**：Product Probe、User Probe，根据前缀差异挂载。
 
-### 25.3.1 根路由注册
+### 根路由注册
 
 ```go
 // ai-gateway-api/endpoints/router.go
@@ -188,7 +188,7 @@ func RegisterRouters(router *mux.Router) {
 
 `router.Use` 注册的中间件会作用于所有子路由器，因此 Recovery、Logger、CORS 对所有 API 路径生效。`NotFoundHandler` 与 `MethodNotAllowedHandler` 也被显式配置，确保 `/open-api/v1` 与 `/inner-api/v1` 路径未命中时返回 JSON 格式的 404/405，而不是回退到静态文件。
 
-### 25.3.2 Recovery：panic 恢复
+### Recovery：panic 恢复
 
 `middleware/recovery.go` 中的 `NewRecovery` 会在 `defer` 中捕获 handler 发生的 panic，记录异常堆栈，并返回统一的 500 错误响应，避免进程崩溃：
 
@@ -231,7 +231,7 @@ func (rec *Recovery) ServeHTTP(rw http.ResponseWriter, req *http.Request, next h
 
 Recovery 中间件是第一个挂载的中间件，因此后续的 Logger 才能拿到它初始化的 `RequestInfo`，并在 panic 时记录到完整上下文。
 
-### 25.3.3 Logger：访问日志与监控
+### Logger：访问日志与监控
 
 `middleware/access_logger.go` 在请求完成后统一记录访问日志，并根据 URL Pattern、HTTP 方法、状态码更新 Prometheus 指标：
 
@@ -254,7 +254,7 @@ func (l *LoggerMiddleWare) ServeHTTP(rw http.ResponseWriter, r *http.Request, ne
 
 `UpdateMonitor` 使用 `URLPattern` 作为标签，因此接口监控可以精确到具体路由。`URLPattern` 会在 Endpoint 注册时被赋值。
 
-### 25.3.4 CORS：跨域处理
+### CORS：跨域处理
 
 `middleware/cors.go` 使用 `rs/cors` 库，允许所有来源、常用方法与头部，并支持携带凭证：
 
@@ -273,7 +273,7 @@ func NewCors() *cors.Cors {
 
 CORS 中间件处理预检请求并添加响应头，使得 Dashboard 前端可以直接跨域调用管理面接口。
 
-### 25.3.5 Product Probe：产品线上下文
+### Product Probe：产品线上下文
 
 `middleware/product_probe.go` 从 URI 参数中解析 `product_id` 或 `product_name`，查询到唯一的产品线后，将其写入请求上下文：
 
@@ -307,7 +307,7 @@ func ProductProbeAction(req *http.Request) (*http.Request, error) {
 
 Product Probe 只在 OpenAPI 子树挂载，因为管理面操作通常需要区分产品线；InnerAPI 面向数据面拉取配置，不涉及产品线上下文。
 
-### 25.3.6 User Probe：身份与权限
+### User Probe：身份与权限
 
 `middleware/user_probe.go` 从 `Authorization` 请求头解析鉴权信息，交给 `AuthenticateManager` 完成身份校验，并把访客信息写入上下文：
 
@@ -342,7 +342,7 @@ func UserProbeAction(req *http.Request) (*http.Request, error) {
 
 ---
 
-## 25.4 OpenAPI v1 路由注册与子包合并
+## OpenAPI v1 路由注册与子包合并
 
 OpenAPI v1 的前缀为 `/open-api/v1`，注册入口在 `endpoints/openapi_v1/endpoints.go`：
 
@@ -405,7 +405,7 @@ var Endpoints = []*xreq.Endpoint{
 
 ---
 
-## 25.5 InnerAPI v1 导出接口注册
+## InnerAPI v1 导出接口注册
 
 InnerAPI v1 的前缀为 `/inner-api/v1`，主要面向 BFE 数据面与 Conf Agent 导出配置。注册入口在 `endpoints/innerapi_v1/endpoints.go`：
 
@@ -455,9 +455,9 @@ func RegisterRouter(router *mux.Router) *mux.Router {
 
 ---
 
-## 25.6 参数绑定、鉴权、统一响应
+## 参数绑定、鉴权、统一响应
 
-### 25.6.1 参数绑定
+### 参数绑定
 
 `lib/xreq/param.go` 提供了一组基于 `go-playground/validator` 与 `gorilla/mux` 的参数绑定函数：
 
@@ -496,7 +496,7 @@ func validateData(data interface{}, lang ut.Translator) error {
 
 这种分层校验把“字段类型、必填、范围”等通用规则交给框架，把跨字段或业务语义相关的规则交给参数结构体自身，便于复用与单测。
 
-### 25.6.2 鉴权
+### 鉴权
 
 每个 Endpoint 的 `Authorizer` 字段由 `iauth.FA(feature, action)` 生成。注册时，`Endpoint.Register` 会创建一个子路由器，并在其中调用 `container.AuthorizeManager.Authorizate(ctx, authorizer)`。例如：
 
@@ -512,7 +512,7 @@ var EntityTypeCreateRoute = &xreq.Endpoint{
 
 当请求到达该 Endpoint 时，若当前访客不具备 `FeatureEntityType + ActionCreate` 权限，则直接返回 401/402 错误。OpenAPI 的权限模型已经收敛：用户 `is_admin` 仅支持 `true`，Token `scope` 仅保留 `System`/`Support`，因此大多数管理操作需要 System 权限。
 
-### 25.6.3 统一响应
+### 统一响应
 
 `xreq.Result` 定义了统一的响应结构：
 
@@ -533,9 +533,9 @@ type Result struct {
 
 ---
 
-## 25.7 典型接口实现示例
+## 典型接口实现示例
 
-### 25.7.1 OpenAPI：Entity-Type 创建
+### OpenAPI：Entity-Type 创建
 
 `endpoints/openapi_v1/entity_type/create.go` 展示了一个标准的管理面接口：先绑定并校验参数，再检查资源存在性，最后调用模型层 Manager 完成创建并返回结果。
 
@@ -596,7 +596,7 @@ func EntityTypeCreateAction(req *http.Request) (interface{}, error) {
 
 该示例体现了接口层的典型流程：参数绑定 → 基础校验 → 业务存在性检查 → 调用模型层 → 返回结果。所有写操作完成后都会再查询一次，确保返回的数据包含模型层自动填充的字段（如创建时间、ID 等）。
 
-### 25.7.2 InnerAPI：mod-api-key 导出
+### InnerAPI：mod-api-key 导出
 
 `endpoints/innerapi_v1/mod_api_key/export.go` 展示了数据面导出接口的典型模式：解析 `version` 参数，调用 Manager 的 `ConfigExport`，由版本控制机制决定是否返回全量配置。
 
@@ -627,7 +627,7 @@ func exportActionProcess(req *http.Request) (interface{}, error) {
 
 ---
 
-## 25.8 关键代码片段汇总
+## 关键代码片段汇总
 
 下表整理了本章涉及的核心代码位置及其作用，方便读者在源码中快速定位：
 

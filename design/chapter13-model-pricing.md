@@ -13,7 +13,7 @@
 
 ---
 
-## 12.1 模型定价数据的作用
+## 模型定价数据的作用
 
 在壬远AI网关中，模型定价数据（Model Price）是连接"资源使用"与"成本核算"的桥梁。当业务系统通过 API-Key 调用模型服务时，BFE 数据面会解析请求与响应中的 Token 用量，并依据控制面下发的定价数据计算本次调用产生的成本。
 
@@ -29,11 +29,11 @@
 
 ---
 
-## 12.2 ModelPrice 数据模型
+## ModelPrice 数据模型
 
 `ModelPrice` 是控制面维护的单条模型定价记录，主键为 `(provider, model, mode)` 三元组。OpenAPI 路径 `/model-prices` 提供了完整的 CRUD 与批量导入能力。
 
-### 12.2.1 核心字段
+### 核心字段
 
 ```json
 {
@@ -87,7 +87,7 @@
 | `price_currency` | 价格货币，当前固定为 `RMB` |
 | `metadata` | 元数据，包括价格来源、备注等 |
 
-### 12.2.2 价格字段枚举
+### 价格字段枚举
 
 `prices` 与 `tier_prices.<tier>` 中可使用的键名包括：
 
@@ -109,17 +109,17 @@
 
 当前版本主要使用按 Token 计费的价格项，其余字段为后续多模态计费预留。
 
-### 12.2.3 价格精度
+### 价格精度
 
 `prices` 与 `tier_prices` 中的价格字段为浮点数，业务上支持 8 位及更多小数精度，例如 `0.0000015`、`0.00000075`。为避免默认 JSON encoder 将极小数值输出为科学计数法（如 `1.5e-6`），AI Gateway API 与 BFE 两侧对 `PriceMap` / `TierPriceMap` 均实现了自定义 `MarshalJSON`，强制使用十进制表示法。该表示方式仅影响配置文本的可读性，不改变 `float64` 数值语义，也不影响 BFE 内部的定点整数扣减逻辑。
 
 ---
 
-## 12.3 model-list.yaml 导入格式
+## model-list.yaml 导入格式
 
 当需要批量维护大量模型定价时，可通过 `/v1/model-prices/import` 接口导入 `model-list.yaml` 文件。该文件是 `model_prices` 表的权威数据源之一。
 
-### 12.3.1 顶层结构
+### 顶层结构
 
 ```yaml
 version: v1.0                    # 格式版本，必填
@@ -128,7 +128,7 @@ models:                          # 模型列表，必填
   - ...
 ```
 
-### 12.3.2 单条记录结构
+### 单条记录结构
 
 ```yaml
 models:
@@ -156,7 +156,7 @@ models:
       notes: "DeepSeek V3"
 ```
 
-### 12.3.3 导入模式
+### 导入模式
 
 `/v1/model-prices/import` 支持两种导入模式：
 
@@ -167,11 +167,11 @@ models:
 
 ---
 
-## 12.4 RMB 配额分时段定价机制
+## RMB 配额分时段定价机制
 
 随着 DeepSeek 等模型提供商采用"高峰 / 空闲"分时段定价策略，RMB 配额扣减需要具备按请求发生时刻匹配不同价格的能力。
 
-### 12.4.1 核心概念
+### 核心概念
 
 | 概念 | 说明 |
 |------|------|
@@ -180,7 +180,7 @@ models:
 | **Provider 时段模板** | 定义在 `/providers` 上的 `time_zone` 和 `tiers`，同一 provider 下所有模型共享 |
 | **Model tier 价格** | 定义在 `/model-prices` 上的 `tier_prices`，描述某个模型在某个 tier 下的价格 |
 
-### 12.4.2 配置归属与下发链路
+### 配置归属与下发链路
 
 ```
 /provider deepseek
@@ -200,7 +200,7 @@ models:
 
 多个 cluster 引用同一个 provider 时，会各自得到一份相同的 `ModelTable` 数据；provider 的时段规则变更后，所有引用它的 cluster 在下一次配置导出时自动生效。
 
-### 12.4.3 Provider 时段模板
+### Provider 时段模板
 
 `/providers` 新增 `time_zone` 与 `tiers` 字段，用于描述共享的时段规则：
 
@@ -216,7 +216,7 @@ models:
 
 `time_zone` 须为合法 IANA 时区名，默认 `Asia/Shanghai`。同一 tier 内部的 `time_ranges` 不得重叠，且 `end` 必须大于 `start`；跨午夜时段需拆成两段。
 
-### 12.4.4 BFE ModelTable 结构
+### BFE ModelTable 结构
 
 控制面导出给 BFE 的 `AIConf.ModelTable` 结构如下：
 
@@ -258,11 +258,11 @@ type ModelTable struct {
 
 ---
 
-## 12.5 BFE 侧成本计算逻辑
+## BFE 侧成本计算逻辑
 
 BFE 数据面在加载 `AIConf` 时完成价格数据的预处理，在请求转发结束后根据实际 Token 用量和当前时段计算成本。
 
-### 12.5.1 配置加载阶段
+### 配置加载阶段
 
 ```
 AIConf.ModelTable
@@ -281,7 +281,7 @@ AIConf.ModelTable
 
 BFE 使用定点整数存储价格，避免运行时浮点运算引入误差。所有价格字段按统一精度放大后参与扣减计算。
 
-### 12.5.2 运行时时段匹配
+### 运行时时段匹配
 
 BFE 在请求结束时根据当前时间匹配活跃 tier：
 
@@ -312,7 +312,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 }
 ```
 
-### 12.5.3 运行时成本计算
+### 运行时成本计算
 
 成本计算流程如下：
 
@@ -343,7 +343,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 
 若某个 tier 未配置特定价格键，则自动 fallback 到默认 `prices` 中的对应键。`TokenUsage` 增加 `CachedTokens` 字段后，缓存命中与未命中的输入 Token 可分别计价。
 
-### 12.5.4 向后兼容
+### 向后兼容
 
 分时段定价设计保持了对固定价格的向后兼容：
 
@@ -356,17 +356,17 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 
 ---
 
-## 12.6 定价数据与 Provider/Cluster 的关系
+## 定价数据与 Provider/Cluster 的关系
 
 在 Provider 与 Cluster 概念分离后，模型定价的归属与引用关系也变得更加清晰。
 
-### 12.6.1 概念分离回顾
+### 概念分离回顾
 
 - **Provider**：模型提供方，包含接入端点、可用模型、API Key、实例池、支持的协议以及时段模板（`time_zone`、`tiers`）。
 - **Cluster**：转发集群，决定把流量按什么模型、什么权重、什么策略转发到某个 provider。
 - **Model Price**：一条 `(provider, model, mode)` 的价格记录，`provider` 字段仅作为价格归集标识，不强制引用已存在的 provider。
 
-### 12.6.2 配置下发关系
+### 配置下发关系
 
 ```
 /providers
@@ -392,7 +392,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
    ModelTable.Models   ← /model-prices 中 provider=deepseek 的记录
 ```
 
-### 12.6.3 弱引用带来的灵活性
+### 弱引用带来的灵活性
 
 `/model-prices` 的 `provider` 字段不再强制引用 `/providers`，带来了以下好处：
 
@@ -402,7 +402,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 
 推荐配置顺序为 `/providers → /model-prices → /clusters → 路由规则`，但 `/model-prices` 与 `/providers` 之间为弱引用关系，实际可独立维护。
 
-### 12.6.4 对成本计算的影响
+### 对成本计算的影响
 
 弱引用关系意味着：BFE 在进行成本计算时，只关心 `AIConf.ModelTable` 中是否包含对应 `(provider, model, mode)` 的价格记录，而不关心该 provider 是否仍然存在。即使某个 Provider 已被删除，只要其价格记录保留，历史请求的成本核算依然可以正确完成。
 
@@ -410,11 +410,11 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 
 ---
 
-## 12.7 定价配置示例
+## 定价配置示例
 
 以下示例展示如何为一个支持高峰/闲时计价的 Provider 配置模型定价。
 
-### 12.7.1 Provider 时段模板
+### Provider 时段模板
 
 ```json
 {
@@ -434,7 +434,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 }
 ```
 
-### 12.7.2 model-list.yaml 片段
+### model-list.yaml 片段
 
 ```yaml
 version: v1.0
@@ -466,7 +466,7 @@ models:
       notes: "DeepSeek V3 官方 API"
 ```
 
-### 12.7.3 Cluster 引用
+### Cluster 引用
 
 ```json
 {

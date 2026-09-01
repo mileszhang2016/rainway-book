@@ -15,7 +15,7 @@
 
 ---
 
-## 20.1 核心概念与配置入口
+## 核心概念与配置入口
 
 在壬远 AI 网关中，API-Key 是业务方调用大模型服务的最终凭证，而 Entity 是承载组织层级与策略继承的业务单元。控制面通过 `/open-api/v1/api-keys` 与 `/open-api/v1/entities` 两组接口管理它们。
 
@@ -29,11 +29,11 @@ API-Key 与 Entity 均可以绑定三类策略资源：
 
 ---
 
-## 20.2 API-Key 生命周期管理
+## API-Key 生命周期管理
 
 API-Key（应用编程接口密钥）是业务方调用 AI 网关时使用的凭证。控制面提供完整的 CRUD 接口，端点统一为 `/open-api/v1/api-keys`。
 
-### 20.2.1 创建 API-Key
+### 创建 API-Key
 
 创建 API-Key 时，系统会自动生成一个全局唯一的 Key 值，并级联创建其专属的配额计划、限流策略与路由规则。若这些资源未显式传入，则使用默认值：
 
@@ -94,7 +94,7 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 
 返回中包含 `id`（内部标识）与 `key`（鉴权值），请妥善保存 `key`，控制面不会再次明文返回。若丢失 Key 值，通常需要删除并重新创建 API-Key。
 
-### 20.2.2 查询 API-Key
+### 查询 API-Key
 
 列表查询支持按启用状态、挂载 Entity、是否无限配额过滤。详情查询会返回完整的嵌套结构，其中 `quota_plan` 包含实时 `balance`。
 
@@ -110,7 +110,7 @@ curl http://localhost:8183/open-api/v1/api-keys/apikey-001 \
 
 返回的 `quota_plan.balance` 直接来自 Redis，反映当前剩余配额与已用量。若 Redis 不可用，查询接口会返回错误，管理面不再降级到数据库冷数据。
 
-### 20.2.3 更新 API-Key
+### 更新 API-Key
 
 控制面提供全量更新（`PUT`）与部分更新（`PATCH`）两种方式。更新时 `key` 字段会被忽略，无法修改 Key 值本身；如需更换 Key，应删除旧 Key 并创建新 Key。
 
@@ -127,7 +127,7 @@ curl -X PATCH http://localhost:8183/open-api/v1/api-keys/apikey-001 \
 
 若将 API-Key 挂载到新的 Entity，且 `unlimited_quota=false` 且 `quota_plan.unlimited=false`，则要求新 Entity 或其祖先链上至少存在一个有效的 Quota Plan，否则更新会被拒绝。
 
-### 20.2.4 删除 API-Key
+### 删除 API-Key
 
 删除会级联清理其专属的 `quota_plan`、`rate_limit_policy`、`route_rules` 以及底层资源（若未被其他对象引用），同时删除 Redis 中的配额 Key：
 
@@ -140,7 +140,7 @@ curl -X DELETE http://localhost:8183/open-api/v1/api-keys/apikey-001 \
 
 ---
 
-## 20.3 外部 Key 导入
+## 外部 Key 导入
 
 若业务方已在其他系统中持有 API-Key，可通过创建接口的 `key` 参数将其导入壬远 AI 网关，实现平滑迁移。导入后，原 Key 值即可继续用于请求，但配额、限流、路由与模型权限由控制面统一接管。
 
@@ -173,11 +173,11 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 
 ---
 
-## 20.4 QuotaPlan 配置：total_token 与 RMB
+## QuotaPlan 配置：total_token 与 RMB
 
 `QuotaPlan`（配额计划）用于控制 API-Key 或 Entity 在周期内可消耗的资源总量，支持两种单位。选择哪种单位取决于企业的计费模式与管理诉求。
 
-### 20.4.1 total_token 配额
+### total_token 配额
 
 `unit = total_token` 适用于按 Token 计费的模型（如 OpenAI、Anthropic）。系统直接统计输入与输出 Token 的总量，并从余额中扣减。该方式直观、易于理解，适合模型单价相对固定或按 Token 采购的场景。
 
@@ -193,7 +193,7 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 }
 ```
 
-### 20.4.2 RMB 配额
+### RMB 配额
 
 `unit = RMB` 适用于需要按成本统一预算管理的场景。当企业同时使用多种模型、多种价格时，系统会根据模型单价与 Token 消耗量，实时折算为人民币并扣减余额。该方式便于财务部门按月度预算控制总成本。
 
@@ -211,7 +211,7 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 
 RMB 配额在 Redis 内部以 `1e-8` 元为单位的定点整数存储，对外统一按 4 位小数展示，避免浮点误差。若使用分时段定价，BFE 会根据请求发生时刻匹配当前 tier 价格，再折算为成本扣减。
 
-### 20.4.3 关键字段说明
+### 关键字段说明
 
 | 字段 | 说明 |
 |------|------|
@@ -221,7 +221,7 @@ RMB 配额在 Redis 内部以 `1e-8` 元为单位的定点整数存储，对外�
 | `unit` | 单位，可选 `total_token` 或 `RMB`，创建后修改会导致余额重置。 |
 | `reset_period` | 重置周期，可选 `never`、`weekly`、`monthly`。 |
 
-### 20.4.4 单位选择建议
+### 单位选择建议
 
 - 若企业对每种模型分别采购额度，或主要使用单一模型，优先使用 `total_token`；
 - 若企业需要跨模型统一成本预算，或模型价格差异大、波动频繁，优先使用 `RMB`；
@@ -229,9 +229,9 @@ RMB 配额在 Redis 内部以 `1e-8` 元为单位的定点整数存储，对外�
 
 ---
 
-## 20.5 余额查询与手动重置
+## 余额查询与手动重置
 
-### 20.5.1 查询配额余额
+### 查询配额余额
 
 OpenAPI 查询 API-Key 详情时，`quota_plan` 中已包含实时 `balance`。也可通过独立接口获取：
 
@@ -262,7 +262,7 @@ curl http://localhost:8183/open-api/v1/api-keys/apikey-001/quota-plan \
 
 余额直接读取 Redis，是实时数据；Redis 不可用时查询接口会报错。无限配额返回 sentinel balance（`used=0`，`remaining=100000000`）。
 
-### 20.5.2 手动重置配额
+### 手动重置配额
 
 当需要提前恢复额度、修正配额总量或修复 Redis 异常时，可调用重置接口：
 
@@ -283,7 +283,7 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys/apikey-001/quota-plan/re
 
 Entity 的余额查询与重置接口为 `/entities/{id}/quota-plan` 与 `/entities/{id}/quota-plan/reset`，行为与 API-Key 一致。
 
-### 20.5.3 周期重置与手动重置的关系
+### 周期重置与手动重置的关系
 
 系统每分钟执行一次 `ResetExpiredBalances`，对 `reset_period` 为 `weekly` 或 `monthly` 且非无限配额的计划进行周期重置。周期重置会同时更新 Redis 与 `quota_plans.last_reset_at`。
 
@@ -291,7 +291,7 @@ Entity 的余额查询与重置接口为 `/entities/{id}/quota-plan` 与 `/entit
 
 ---
 
-## 20.6 Entity 层级与配额继承
+## Entity 层级与配额继承
 
 Entity（实体）是业务组织单元，例如公司、部门、项目、个人。API-Key 通过 `entity_id` 挂载到 Entity 后，会继承该 Entity 及其父级 Entity 的策略。
 
@@ -310,7 +310,7 @@ flowchart BT
     Dept -.->|向上递归| Root
 ```
 
-### 20.6.1 模型白名单与黑名单继承
+### 模型白名单与黑名单继承
 
 - `allow_models`（白名单）：取层级交集。非空且不含 `*` 的配置才参与交集；若交集为空且双方均有非空非 `*` 配置，则该 API-Key 导出时被禁用。
 - `block_models`（黑名单）：取层级并集。
@@ -326,7 +326,7 @@ flowchart BT
 
 最终允许模型为 `gpt-4`，禁止模型为 `gpt-4-32k` 与 `davinci`。若 API-Key 自身也设置了非空白名单，则再与上述结果取交集。
 
-### 20.6.2 配额计划的层级收集
+### 配额计划的层级收集
 
 导出到 BFE 时，系统会收集 API-Key 自身及 Entity 层级向上的所有**非无限**配额计划。每个计划对应一个 Redis Key：
 
@@ -335,18 +335,18 @@ flowchart BT
 
 因此，单个 API-Key 可能同时受多个 Redis Key 的配额控制。例如，某 API-Key 自身有 2000 万 Token 配额，挂载的项目有 1 亿 Token 配额，部门有 5000 元 RMB 预算，则该 Key 必须同时满足这三项约束。
 
-### 20.6.3 限流策略与路由规则的层级合并
+### 限流策略与路由规则的层级合并
 
 - 限流策略：向上递归收集所有**启用**的策略，导出为 `rlp-<policy_id>` 并绑定到 API-Key。收集顺序不影响最终限制，因为各策略独立生效，任一策略触发都会返回 429。
 - 路由规则：按 `API-Key 级 → 直接 Entity 级 → 父 Entity 级 → Global 级` 的优先级绑定，BFE 按此顺序匹配。这意味着 API-Key 级规则优先级最高，适合为特定业务方指定专属集群。
 
 ---
 
-## 20.7 API-Key 绑定到 Entity、配额、限流、路由规则
+## API-Key 绑定到 Entity、配额、限流、路由规则
 
 API-Key 创建后即可绑定各类策略。通常推荐先创建 Entity，再创建 API-Key 并指定 `entity_id`。这样可以在组织层面统一配置模型权限与预算，在 API-Key 层面叠加细粒度控制。
 
-### 20.7.1 创建 Entity 并配置策略
+### 创建 Entity 并配置策略
 
 ```bash
 curl -X POST http://localhost:8183/open-api/v1/entities \
@@ -379,7 +379,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   }'
 ```
 
-### 20.7.2 创建 API-Key 并挂载到 Entity
+### 创建 API-Key 并挂载到 Entity
 
 ```bash
 curl -X POST http://localhost:8183/open-api/v1/api-keys \
@@ -428,7 +428,7 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 
 ---
 
-## 20.8 客户端调用示例
+## 客户端调用示例
 
 业务方获得 API-Key 后，在请求头中携带 `Authorization: Bearer <key>` 调用 AI 网关。以下以 OpenAI 兼容接口为例：
 
@@ -448,11 +448,11 @@ curl http://localhost:8080/v1/chat/completions \
 
 ---
 
-## 20.9 完整配置示例
+## 完整配置示例
 
 以下为一个完整的部门级预算配置：部门拥有 5000 元/月的 RMB 预算，子项目拥有独立的 Token 配额，API-Key 挂载到项目并配置专用限流与路由。
 
-### 20.9.1 创建部门 Entity
+### 创建部门 Entity
 
 ```bash
 curl -X POST http://localhost:8183/open-api/v1/entities \
@@ -474,7 +474,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   }'
 ```
 
-### 20.9.2 创建项目 Entity
+### 创建项目 Entity
 
 ```bash
 curl -X POST http://localhost:8183/open-api/v1/entities \
@@ -508,7 +508,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   }'
 ```
 
-### 20.9.3 创建 API-Key 并挂载
+### 创建 API-Key 并挂载
 
 ```bash
 curl -X POST http://localhost:8183/open-api/v1/api-keys \
@@ -568,7 +568,7 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 
 ---
 
-## 20.10 常见问题与排查
+## 常见问题与排查
 
 | 现象 | 可能原因 | 排查方法 |
 |------|---------|---------|

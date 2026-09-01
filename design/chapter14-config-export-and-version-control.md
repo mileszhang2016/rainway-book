@@ -14,7 +14,7 @@
 
 ---
 
-## 13.1 InnerAPI 的配置导出机制
+## InnerAPI 的配置导出机制
 
 AI Gateway API 除了面向管理员的管理面 OpenAPI（`/open-api/v1`）之外，还提供了一组面向数据面的 **InnerAPI**（路由前缀 `/inner-api/v1`）。BFE、Conf Agent 等下游组件通过这组只读接口拉取运行时配置，因此 InnerAPI 也被称为控制面与数据面之间的配置同步协议。
 
@@ -31,7 +31,7 @@ InnerAPI 与 OpenAPI 的对比如 `ai-gateway-api/design-docs/api-define/InnerAP
 
 ---
 
-## 13.2 VersionControlManager 的 MD5 签名与版本号
+## VersionControlManager 的 MD5 签名与版本号
 
 `VersionControlManager` 是配置导出的核心协调器，其结构定义如下：
 
@@ -96,7 +96,7 @@ var ZeroVersion = Version(time.Time{})
 
 ---
 
-## 13.3 config_versions 表与增量同步
+## config_versions 表与增量同步
 
 `config_versions` 表是持久化配置版本信息的载体，其字段含义如下：
 
@@ -166,7 +166,7 @@ flowchart LR
 
 ---
 
-## 13.4 九类配置导出主题
+## 九类配置导出主题
 
 InnerAPI 当前共导出九类配置主题，详细信息见 `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`。它们分别对应 BFE 的不同模块或配置文件：
 
@@ -184,7 +184,7 @@ InnerAPI 当前共导出九类配置主题，详细信息见 `ai-gateway-api/des
 
 其中 `gslb.<bfe_cluster>` 因为依赖 BFE 集群名参数，不同 BFE 集群拥有独立的版本线；`extra_files` 按文件名原样返回内容，不走版本控制流程。
 
-### 13.4.1 Server Data
+### Server Data
 
 `route_rule` 主题导出 BFE 的 Server Data 配置，由 `model/iroute_conf/exporter.go` 实现。导出结构体包含：
 
@@ -199,21 +199,21 @@ type RouteRuleExportData struct {
 
 生成流程为：查询所有 `domains`、`clusters`、`products`，组装成 HostTable、RouteTable 和 ClusterConf，再调用 `VersionControlManager.ExportConfig`。当 Cluster 配置了 `llm_config` 时，导出的 `ClusterConf.Config.<cluster_name>.AIConf` 会包含模型映射、认证密钥、模型定价表、协议风格列表以及 Key 亲和性策略，供 BFE 的 AI 转发模块消费。
 
-### 13.4.2 GSLB 与 Cluster Table
+### GSLB 与 Cluster Table
 
 `gslb.<bfe_cluster>` 与 `cluster_table` 由 `model/icluster_conf/exporter.go` 实现。`gslb` 根据请求的 `bfe_cluster` 参数返回对应集群的调度矩阵；`cluster_table` 导出所有集群的后端实例，其中 IPv6 地址会自动用 `[]` 包裹，实例 `Weight=0` 表示不接收流量。
 
-### 13.4.3 Server Cert
+### Server Cert
 
 `certificate` 主题由 `model/iprotocol/exporter.go` 实现。导出时将所有证书/密钥文件路径写入配置，并在 `UpdateVersion` 时对路径做版本化替换（例如 `tls_conf_<version>/...`），便于 BFE 按版本加载。
 
-### 13.4.4 mod-api-key、mod-body-process、rate-limit-policy、ai-route
+### mod-api-key、mod-body-process、rate-limit-policy、ai-route
 
 这四个主题面向 BFE 的 AI 专用模块，导出逻辑集中在 `model/imods/` 与 `model/rate_limit_policy/` 下。其中 `mod-api-key` 的配置量最大、关联关系最复杂，因此采用了专门的性能优化，将在下一节详细说明。
 
 ---
 
-## 13.5 mod-api-key 批量预加载与内存回溯优化
+## mod-api-key 批量预加载与内存回溯优化
 
 `mod-api-key` 主题导出 BFE `mod_ai_token_auth` 模块所需的全部 API-Key 规则、配额计划与 Token 列表。该主题的数据特点是：需要跨越多张表（`api_keys`、`entities`、`quota_plans`、`entity_types` 等）并沿 Entity 层级向上回溯。
 
@@ -249,7 +249,7 @@ type ModAPIKeyRuleConf struct {
 
 ---
 
-## 13.6 Conf Agent 拉取与 BFE 热加载的衔接
+## Conf Agent 拉取与 BFE 热加载的衔接
 
 Conf Agent 是部署在 BFE 侧的 Sidecar 组件，负责将 InnerAPI 导出的配置转换为 BFE 可加载的本地文件，并在配置变化时触发 BFE 热加载。其整体流程见 `conf-agent/AGENTS.md`。
 
@@ -284,7 +284,7 @@ flowchart LR
 
 ---
 
-## 13.7 配置导出示例
+## 配置导出示例
 
 下面以 `mod-api-key` 主题为例，展示一次完整的增量同步过程。
 

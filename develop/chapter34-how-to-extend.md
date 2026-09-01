@@ -13,9 +13,9 @@
 
 本章将给出每个场景的关键代码路径、实现步骤、测试要点，并通过流程图展示跨组件协作关系。阅读本章前，建议先回顾 [第三十一章 代码组织与启动流程](../implementation/chapter25-code-layout-and-startup.md)、[第三十一章 接口层实现：OpenAPI与InnerAPI](../implementation/chapter26-endpoints-implementation.md) 以及 [第三十五章 Conf Agent实现](../implementation/chapter33-conf-agent-implementation.md)。
 
-## 33.1 扩展前的准备工作
+## 扩展前的准备工作
 
-### 33.1.1 开发环境
+### 开发环境
 
 三个仓库均使用 Go 1.22，构建入口都是 `Makefile`。扩展开发前，请确认本地环境满足以下要求：
 
@@ -41,7 +41,7 @@ go test ./...
 cd test/integration && go test -v -count=1 ./tests/...
 ```
 
-### 33.1.2 代码结构理解
+### 代码结构理解
 
 扩展前需要理解三个仓库的分层结构：
 
@@ -61,7 +61,7 @@ cd test/integration && go test -v -count=1 ./tests/...
 
 对于非平凡的改动，`ai-gateway-api/design-docs/README.md` 规定了“六步变更法”：创建变更说明 → 更新 API 定义 → 更新系统设计 → 按设计实现代码 → 补充测试 → 沉淀细节文档。本章的四个场景都建议遵循这一流程。
 
-## 33.2 场景一：新增一个 OpenAPI 接口
+## 场景一：新增一个 OpenAPI 接口
 
 OpenAPI 面向控制台和外部调用方，新增接口的实质是按“接口层 → 模型层 → 存储层”的顺序补齐代码，并在 `endpoints/openapi_v1/endpoints.go` 中注册路由。
 
@@ -190,7 +190,7 @@ func (f *fakeTxn) AtomExecute(ctx context.Context, do func(context.Context) erro
 
 新增 OpenAPI 后，务必执行 `make test-model-cover-gate`，确保 `model/` 语句覆盖率不低于 70%。
 
-## 33.3 场景二：新增一个 BFE 模块
+## 场景二：新增一个 BFE 模块
 
 BFE 的扩展点以模块（Module）形式存在。新增模块需要实现 `bfe_module.BfeModule` 接口，在合适的回调点注册处理函数，并加入 `bfe_modules/bfe_modules.go` 的模块列表。
 
@@ -318,7 +318,7 @@ flowchart TB
     J --> K[HandleRequestFinish]
 ```
 
-## 33.4 场景三：扩展配置导出主题（InnerAPI）
+## 场景三：扩展配置导出主题（InnerAPI）
 
 InnerAPI 是控制面向数据面“吐出”配置的主题。新增一个导出主题，意味着控制面要把某个管理对象转换成 BFE 可消费的 `.data` 文件，Conf Agent 要拉取该文件并触发 BFE 热加载，BFE 模块要消费该文件。
 
@@ -472,7 +472,7 @@ func (m *ModuleAiRoute) loadRouteRuleConf(query url.Values) error {
 4. `trigger` 调用 BFE `/reload/<module>`；
 5. BFE 模块通过注册的重载函数读取新配置并更新运行时结构。
 
-## 33.5 场景四：扩展 Provider 协议支持
+## 场景四：扩展 Provider 协议支持
 
 Provider 协议扩展是 AI 网关特有的场景，通常需要同时修改控制面的协议校验、模型发现，以及数据面的鉴权方式、请求/响应转换。
 
@@ -647,7 +647,7 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 7. 更新 `model/icluster_conf/cluster.go` 导出逻辑，确保 `ModelProtocols` 正确下发；
 8. 补充单元测试与集成测试（参考 `bfe/tests/integration/implementation/scenario-SC06-claude-protocol-support/`）。
 
-## 33.6 本章小结
+## 本章小结
 
 扩展壬远AI网关时，最关键的是识别改动会跨越哪些组件，并维护好组件之间的契约：
 

@@ -16,7 +16,7 @@
 
 ---
 
-## 15.1 安全设计总体视图
+## 安全设计总体视图
 
 壬远AI网关的安全设计采用**分层防御（Defense in Depth）**思想：从外到内依次为传输层安全、身份认证、权限授权、请求准入、策略执行、数据清理与审计追溯。每一层都有独立的校验与拦截能力，即使某一层被绕过，后续层次仍可继续防护。
 
@@ -65,9 +65,9 @@
 
 ---
 
-## 15.2 API-Key 安全存储与传输
+## API-Key 安全存储与传输
 
-### 15.2.1 API-Key 的角色与存储
+### API-Key 的角色与存储
 
 在壬远AI网关中，**API-Key** 是业务系统调用大模型服务时的直接凭证。控制面将 API-Key 存储在 `api_keys` 表中，字段包括 key 值、状态、过期时间 `expired_time`、允许的子网 `allowed_subnets`、挂载的 Entity 等。数据面 BFE 在 `mod_ai_token_auth` 中根据请求头中的 API-Key 进行校验。
 
@@ -80,7 +80,7 @@ API-Key 与 **Entity（业务组织单元）** 通过 `api_keys.entity_id` 关�
 
 这种设计使得管理员可以在组织层面统一管控策略，而 API-Key 只作为最终使用凭证。详见 `ai-gateway-api/design-docs/sys-design/details/API-Key与Entity关联及模型继承.md`。
 
-### 15.2.2 传输安全
+### 传输安全
 
 API-Key 在 HTTP Header 中传输，必须通过 **TLS/HTTPS** 加密，防止中间人窃取或篡改。生产环境中应关闭明文 HTTP 入口，强制 HTTPS 访问。同时建议：
 
@@ -91,9 +91,9 @@ API-Key 在 HTTP Header 中传输，必须通过 **TLS/HTTPS** 加密，防止�
 
 ---
 
-## 15.3 TLS/HTTPS 配置
+## TLS/HTTPS 配置
 
-### 15.3.1 数据面 TLS 终止
+### 数据面 TLS 终止
 
 BFE 作为数据面入口，支持 HTTPS 监听与 TLS 终止。TLS 相关配置位于 `bfe_config/bfe_tls_conf/` 与 `conf/tls_conf/` 目录下，包括证书文件、私钥文件、TLS 规则表等。管理员可以为不同域名配置不同证书，并指定最低 TLS 版本与加密套件。
 
@@ -104,15 +104,15 @@ BFE 作为数据面入口，支持 HTTPS 监听与 TLS 终止。TLS 相关配置
 - 证书与私钥文件权限设置为 `600`，避免被非授权用户读取；
 - 开启 HSTS（HTTP Strict Transport Security）头，强制客户端使用 HTTPS。
 
-### 15.3.2 控制面 HTTPS
+### 控制面 HTTPS
 
 AI Gateway API 与 Dashboard 也应通过 HTTPS 暴露管理接口。虽然当前默认配置以 HTTP 启动，但生产部署时应在 AI Gateway API 前部署 Nginx/Envoy 等反向代理完成 TLS 终止，或直接在应用层启用 TLS。管理面涉及 API-Key 创建、Token 分发、密码修改等敏感操作，必须加密传输。
 
 ---
 
-## 15.4 认证授权机制
+## 认证授权机制
 
-### 15.4.1 访问者模型
+### 访问者模型
 
 AI Gateway API 的认证授权模块位于 `model/iauth`，负责 OpenAPI 与 InnerAPI 的访问者身份识别与权限控制。该模块复用了 BFE 历史代码中 `users` 表同时存储“用户”与“Token”的设计，通过 `type` 字段区分：
 
@@ -132,7 +132,7 @@ type Visitor struct {
 
 `Visitor` 实现 `Loginer` 接口，统一提供 `GetName`、`GetScopes`、`GetType`、`IsAdmin` 方法，后续授权校验只关心 `Visitor`，不关心底层是用户还是 Token。详见 `ai-gateway-api/design-docs/sys-design/details/认证授权机制.md`。
 
-### 15.4.2 四种认证方式
+### 四种认证方式
 
 控制面支持四种认证方式：
 
@@ -154,7 +154,7 @@ const (
 
 `Skip` 认证仅在 `RunTime.SkipTokenValidate = true` 时生效，**严禁在生产环境开启**。
 
-### 15.4.3 Feature-Action 权限模型
+### Feature-Action 权限模型
 
 授权采用 **Feature（功能维度）+ Action（操作维度）** 模型：
 
@@ -183,7 +183,7 @@ var APIKeyCreateRoute = &xreq.Endpoint{
 4. 判断所需 Action 是否被允许；
 5. 若需要，再校验 Visitor 与当前产品线的绑定关系。
 
-### 15.4.4 中间件链
+### 中间件链
 
 控制面的全局中间件链为：
 
@@ -202,9 +202,9 @@ MCRecovery ──► MCLogger ──► MCCors
 
 ---
 
-## 15.5 访问日志审计
+## 访问日志审计
 
-### 15.5.1 数据面错误码与日志字段
+### 数据面错误码与日志字段
 
 BFE 数据面在请求处理各阶段（认证、限流、配额、转发）会返回结构化错误响应，并通过 `mod_access_pb3` 输出访问日志。与安全审计相关的日志字段包括：
 
@@ -217,7 +217,7 @@ BFE 数据面在请求处理各阶段（认证、限流、配额、转发）会�
 
 典型错误码包括 `NO_API_KEY`、`INVALID_API_KEY`、`KEY_DISABLED`、`KEY_EXPIRED`、`SUBNET_NOT_ALLOWED`、`MODEL_NOT_ALLOWED`、`QUOTA_EXHAUSTED`、`RPM_LIMIT_EXCEEDED`、`TPM_LIMIT_EXCEEDED` 等。详见 `bfe/docs/zh_cn/sys_design/ai_error_codes.md`。
 
-### 15.5.2 错误响应体
+### 错误响应体
 
 数据面错误响应采用 OpenAI 兼容格式，便于上游业务系统统一处理：
 
@@ -248,9 +248,9 @@ BFE 数据面在请求处理各阶段（认证、限流、配额、转发）会�
 
 ---
 
-## 15.6 Redis Key 清理与敏感数据保护
+## Redis Key 清理与敏感数据保护
 
-### 15.6.1 Redis 中的敏感 Key
+### Redis 中的敏感 Key
 
 控制面运行时会向 Redis 写入两类关键状态 Key：
 
@@ -259,7 +259,7 @@ BFE 数据面在请求处理各阶段（认证、限流、配额、转发）会�
 
 BFE 实际访问时还会拼接前缀 `default_bfe_<policyId>_...`，形成完整 Key。
 
-### 15.6.2 清理触发场景
+### 清理触发场景
 
 为避免 API-Key、Entity 被删除后 Redis 中残留无用 Key，控制面在以下场景主动清理：
 
@@ -270,7 +270,7 @@ BFE 实际访问时还会拼接前缀 `default_bfe_<policyId>_...`，形成完�
 
 配额 plan 的常规变更（改配额、改单位、切换 unlimited）不会删除 Quota Key，只会覆盖其值。清理操作通过 `QuotaCache.DeleteKeys` 使用 Redis Pipeline 批量执行 `UNLINK`（小 Key 可直接 `DEL`）。详见 `ai-gateway-api/design-docs/sys-design/details/Redis Key 清理机制.md`。
 
-### 15.6.3 敏感数据保护
+### 敏感数据保护
 
 - Redis 应开启认证（`requirepass`）与 TLS 连接，避免未授权访问；
 - 避免在日志中打印完整 API-Key 或 Redis Key；
@@ -279,9 +279,9 @@ BFE 实际访问时还会拼接前缀 `default_bfe_<policyId>_...`，形成完�
 
 ---
 
-## 15.7 限流与配额作为安全防线
+## 限流与配额作为安全防线
 
-### 15.7.1 多层级策略继承
+### 多层级策略继承
 
 API-Key 可挂载到 Entity，从而继承 Entity 层级向上的配额计划与限流策略。导出到 BFE 时：
 
@@ -291,7 +291,7 @@ API-Key 可挂载到 Entity，从而继承 Entity 层级向上的配额计划与
 
 这种设计使得安全策略可以在组织、部门、项目、应用多个层级生效，避免单点配置遗漏。
 
-### 15.7.2 防止滥用与成本失控
+### 防止滥用与成本失控
 
 限流与配额是防止 API-Key 泄露或滥用后的第二道防线：
 
@@ -303,9 +303,9 @@ API-Key 可挂载到 Entity，从而继承 Entity 层级向上的配额计划与
 
 ---
 
-## 15.8 黑名单与 WAF 联动能力
+## 黑名单与 WAF 联动能力
 
-### 15.8.1 BFE WAF 模块
+### BFE WAF 模块
 
 BFE 内置 WAF（Web Application Firewall）模块，支持基于规则的内容检测与拦截。AI 网关场景下，WAF 可用于：
 
@@ -313,7 +313,7 @@ BFE 内置 WAF（Web Application Firewall）模块，支持基于规则的内容
 - 基于请求头、URL、Method 等条件进行访问控制；
 - 与 IP 黑名单、地理位置等条件组合，实现多维防护。
 
-### 15.8.2 模型白名单与黑名单
+### 模型白名单与黑名单
 
 除 WAF 外，壬远AI网关还通过 Entity 继承机制提供模型级黑白名单：
 
@@ -322,7 +322,7 @@ BFE 内置 WAF（Web Application Firewall）模块，支持基于规则的内容
 
 若 API-Key 自身 `allow_models` 与 Entity 继承结果交集为空，则该 API-Key 导出时会被禁用（`Enabled=false`），从数据面直接拒绝请求。
 
-### 15.8.3 联动架构
+### 联动架构
 
 ```
 客户端请求
@@ -360,9 +360,9 @@ BFE 内置 WAF（Web Application Firewall）模块，支持基于规则的内容
 
 ---
 
-## 15.9 安全配置示例
+## 安全配置示例
 
-### 15.9.1 控制面运行时安全配置
+### 控制面运行时安全配置
 
 `ai_gateway_api.toml` 中与安全直接相关的配置项：
 
@@ -381,7 +381,7 @@ SessionExpireInDay = 7
 Debug = false
 ```
 
-### 15.9.2 数据面 TLS 配置示例
+### 数据面 TLS 配置示例
 
 BFE 的 TLS 配置通常位于 `conf/tls_conf/tls_rule_conf.data`，示例片段：
 
@@ -402,7 +402,7 @@ BFE 的 TLS 配置通常位于 `conf/tls_conf/tls_rule_conf.data`，示例片段
 
 证书文件 `conf/tls_conf/example_product.crt` 与私钥 `conf/tls_conf/example_product.key` 应严格限制文件权限。
 
-### 15.9.3 API-Key 安全策略示例
+### API-Key 安全策略示例
 
 创建 API-Key 时建议同时配置：
 
@@ -420,7 +420,7 @@ BFE 的 TLS 配置通常位于 `conf/tls_conf/tls_rule_conf.data`，示例片段
 
 ---
 
-## 15.10 本章小结
+## 本章小结
 
 - 壬远AI网关采用分层防御思想，安全机制覆盖传输层、认证授权层、请求准入层与策略执行层。
 - API-Key 是请求链路的直接凭证，应通过 HTTPS 传输，并结合 Entity 继承实现组织级策略管控。

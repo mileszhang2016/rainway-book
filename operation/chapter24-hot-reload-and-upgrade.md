@@ -14,7 +14,7 @@
 
 ---
 
-## 23.1 配置生效的完整流程
+## 配置生效的完整流程
 
 壬远AI网关采用**控制面生成、数据面拉取**的架构。管理员在 Dashboard 或通过 OpenAPI 修改配置后，配置不会立即推送到 BFE，而是先由 AI Gateway API 持久化到数据库，再由部署在 BFE 侧的 Conf Agent 定期拉取并触发热加载。完整流程如下：
 
@@ -44,7 +44,7 @@ flowchart LR
 
 ---
 
-## 23.2 Conf Agent 轮询与版本比对
+## Conf Agent 轮询与版本比对
 
 Conf Agent 是配置下发链路的关键组件，其架构与职责见 `conf-agent/AGENTS.md`。每个配置主题对应一个 `Reloader`，每个 `Reloader` 包含三个子模块：
 
@@ -95,7 +95,7 @@ Conf Agent 收到空响应后跳过写入与热加载。若版本已变化，则
 
 ---
 
-## 23.3 BFE 热加载触发机制
+## BFE 热加载触发机制
 
 BFE 在启动时会监听一个监控端口（默认 8421），用于接收管理类请求，其中就包括配置热加载接口 `/reload/{module}`。Conf Agent 的 `trigger` 模块在 `file_store` 完成软链接切换后，会构造如下请求：
 
@@ -131,7 +131,7 @@ BFE 收到重载请求后，会重新读取对应模块的配置文件并更新�
 
 ---
 
-## 23.4 如何查看当前生效配置版本
+## 如何查看当前生效配置版本
 
 运维中经常需要确认 BFE 当前加载的是哪一版配置。可通过以下三种方式查看：
 
@@ -163,7 +163,7 @@ cat /home/work/bfe/conf/mod_ai_token_auth_20260102120000/token_rule.data | head 
 
 ---
 
-## 23.5 版本回滚操作
+## 版本回滚操作
 
 当新配置导致 BFE 行为异常时，可快速回滚到上一版本。由于 Conf Agent 保留了若干历史版本目录（数量由 `VersionKeepCount` 控制，默认通常保留最近几个版本），回滚无需重新从控制面拉取。
 
@@ -194,11 +194,11 @@ curl -X POST http://127.0.0.1:8421/reload/mod_ai_token_auth
 
 ---
 
-## 23.6 升级注意事项
+## 升级注意事项
 
 AI Gateway 涉及控制面（AI Gateway API）、Dashboard、Conf Agent、BFE 以及 MySQL 等多个组件。升级时需按正确顺序执行，并关注数据库迁移与配置兼容性。以下以 `ai-gateway-api/docs/zh_cn/upgrade.md` 中 v0.0.2 的升级路径为例说明。
 
-### 23.6.1 数据库迁移
+### 数据库迁移
 
 AI Gateway API 升级时常伴随数据库表结构变更。升级前应备份数据库，然后按升级文档执行 DDL。例如 v0.0.2 需要对 `users` 表做以下调整：
 
@@ -224,7 +224,7 @@ ALTER TABLE users ADD UNIQUE KEY `name_uni` (`name`, `type`);
 - 在测试环境先验证 DDL 与数据迁移脚本；
 - 确认升级文档中列出的起始版本是否包含当前版本。
 
-### 23.6.2 配置兼容性
+### 配置兼容性
 
 新版本可能引入新的配置字段或变更鉴权头格式。例如 v0.0.2 中，Conf Agent 请求头从 `Session {Token}` 调整为 `Token {Token}`：
 
@@ -242,7 +242,7 @@ ConfTaskHeaders = {"Authorization" = "Token {Token}"}
 - 新增模块的 `Reloader` 是否已正确配置；
 - BFE 是否支持新模块的热加载接口。
 
-### 23.6.3 组件版本配套
+### 组件版本配套
 
 根据 `upgrade.md`，v0.0.2 升级需要：
 
@@ -261,7 +261,7 @@ ConfTaskHeaders = {"Authorization" = "Token {Token}"}
 
 ---
 
-## 23.7 灰度发布建议
+## 灰度发布建议
 
 配置变更或版本升级不应一次性全量下发，否则一旦新配置存在问题，会影响全部流量。建议采用以下灰度策略：
 
@@ -302,7 +302,7 @@ Conf Agent 的轮询周期默认为 5 秒，意味着配置下发到 BFE 生效�
 
 ---
 
-## 23.8 完整操作示例
+## 完整操作示例
 
 以下演示从 Dashboard 修改 API-Key 配额到 BFE 热加载生效，再到回滚的完整操作。
 

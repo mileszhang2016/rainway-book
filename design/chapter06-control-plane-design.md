@@ -13,7 +13,7 @@
 
 ---
 
-## 6.1 AI Gateway API 的定位与职责
+## AI Gateway API 的定位与职责
 
 **AI Gateway API** 是壬远AI网关的控制面（Control Plane）核心组件，负责对外暴露管理面接口与数据面导出接口，完成策略/配置的创建、存储、版本控制和下发。它向上为 Dashboard 和管理员脚本提供可编程的管理接口，向下为 BFE 数据面和 Conf Agent 生成可消费的配置快照。
 
@@ -28,7 +28,7 @@
 
 AI Gateway API 当前的功能范围覆盖：API-Key / Entity / Entity-Type 管理、Provider 与 Cluster 管理、模型定价管理、配额计划与限流策略管理、AI 路由规则管理、证书与附加文件管理、认证授权以及面向数据面的配置导出。
 
-### 6.1.1 控制面与数据面的边界
+### 控制面与数据面的边界
 
 控制面负责“决策”，数据面负责“执行”。两者的职责边界可概括如下：
 
@@ -46,7 +46,7 @@ AI Gateway API 当前的功能范围覆盖：API-Key / Entity / Entity-Type 管�
 
 ---
 
-## 6.2 三层架构
+## 三层架构
 
 AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与数据持久化解耦：
 
@@ -63,7 +63,7 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2.1 接口层
+### 接口层
 
 接口层位于 `endpoints/`，是 HTTP 请求的入口。其主要职责包括：
 
@@ -83,7 +83,7 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 | `endpoints/middleware/` | Recovery、Logger、CORS、Product Probe、User Probe |
 | `lib/xreq` | 统一的 `Endpoint` 抽象与参数绑定工具 |
 
-### 6.2.2 模型层
+### 模型层
 
 模型层位于 `model/`，采用 **Manager + Storager 接口** 的分层模式：
 
@@ -107,7 +107,7 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 | `model/itxn/` | 事务抽象接口 `TxnStorager` |
 | `model/shared/` | 跨包共享类型与通用 Storager 接口 |
 
-### 6.2.3 存储层
+### 存储层
 
 存储层位于 `storage/rdb/`，采用 **DAO + Storage** 两层结构：
 
@@ -131,7 +131,7 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 | `storage/rdb/route_rules/` | `model/shared`、`model/route_rules` | `route_rules` |
 | `storage/rdb/provider/` | `model/iprovider` | `providers` |
 
-### 6.2.4 层间交互关系
+### 层间交互关系
 
 一条 HTTP 请求在三层层间的流转路径如下：
 
@@ -174,7 +174,7 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 - 模型层只依赖同包或 `model/shared` 中定义的 `XxxStorager` 接口以及 `itxn.TxnStorager`；
 - 存储层只负责数据库读写，通过 `lib.DBContextFactory` 从上下文中获取事务或普通连接。
 
-### 6.2.5 设计原则与约定
+### 设计原则与约定
 
 三层架构遵循以下设计原则：
 
@@ -189,7 +189,7 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 
 ---
 
-## 6.3 OpenAPI v1 与 InnerAPI v1 的职责划分
+## OpenAPI v1 与 InnerAPI v1 的职责划分
 
 AI Gateway API 将对外接口划分为两大接口族：
 
@@ -198,7 +198,7 @@ AI Gateway API 将对外接口划分为两大接口族：
 | **OpenAPI v1** | `/open-api/v1` | 管理面接口 | `McProductProbe` + `McUserProbe` | Dashboard、管理员脚本 |
 | **InnerAPI v1** | `/inner-api/v1` | 数据面导出接口 | `McUserProbe` | BFE、Conf Agent |
 
-### 6.3.1 OpenAPI v1 主要模块
+### OpenAPI v1 主要模块
 
 OpenAPI v1 负责暴露可管理资源，典型模块包括：
 
@@ -215,7 +215,7 @@ OpenAPI v1 负责暴露可管理资源，典型模块包括：
 | `certificate` | `/certificates` | 证书管理 |
 | `auth` | `/auth`、`/meta` | 用户、Session Key、Token |
 
-### 6.3.2 InnerAPI v1 主要导出接口
+### InnerAPI v1 主要导出接口
 
 InnerAPI v1 将控制面持久化的配置按主题导出，供数据面消费：
 
@@ -233,7 +233,7 @@ InnerAPI v1 将控制面持久化的配置按主题导出，供数据面消费�
 
 所有 InnerAPI 导出接口均支持 `version` 查询参数，通过 `model/iversion_control` 实现增量同步：当请求版本与当前版本一致时返回 `Data: nil`，避免重复下发。
 
-### 6.3.3 中间件执行顺序
+### 中间件执行顺序
 
 全局中间件在 `endpoints/router.go` 的 `RegisterRouters` 中按顺序注册：
 
@@ -255,7 +255,7 @@ router.Use(middleware.MCCors)
 
 ---
 
-## 6.4 统一的 xreq.Endpoint 抽象
+## 统一的 xreq.Endpoint 抽象
 
 接口层采用统一的 `xreq.Endpoint` 抽象描述每个 HTTP 接口：
 
@@ -324,7 +324,7 @@ func EntityTypeCreateAction(req *http.Request) (interface{}, error) {
 
 ---
 
-## 6.5 全局容器与依赖注入
+## 全局容器与依赖注入
 
 AI Gateway API 使用**全局容器 + 手动依赖注入**模式。所有 Manager 与 Storager 单例声明在 `stateful/container/components.go`，初始化逻辑集中在 `stateful/container/rdb/components.go:Init()`。
 
@@ -394,7 +394,7 @@ quota.NewEntityStoragerAdapter(entityStorager)
 
 ---
 
-## 6.6 启动流程
+## 启动流程
 
 AI Gateway API 的启动流程从 `main.go` 开始，经过配置加载、数据库初始化、依赖注入、路由注册，最终启动 HTTP 服务：
 
@@ -460,9 +460,9 @@ func RegisterRouters(router *mux.Router) {
 
 ---
 
-## 6.7 配置示例与代码片段
+## 配置示例与代码片段
 
-### 6.7.1 Cluster 转发策略示例
+### Cluster 转发策略示例
 
 Provider 与 Cluster 分离后，Cluster 的 `llm_config` 只保留转发策略，后端能力通过 `provider` 引用 Provider 获取：
 
@@ -497,7 +497,7 @@ Provider 与 Cluster 分离后，Cluster 的 `llm_config` 只保留转发策略�
 }
 ```
 
-### 6.7.2 模型层事务编排示例
+### 模型层事务编排示例
 
 模型层通过 `itxn.TxnStorager.AtomExecute` 编排跨多个 Storager 的原子操作。以下片段展示了 API-Key 创建时级联创建 QuotaPlan、RateLimitPolicy 与 RouteRules 的典型写法：
 
@@ -533,7 +533,7 @@ func (m *APIKeyManager) CreateAPIKey(ctx context.Context, param *APIKeyParam) er
 }
 ```
 
-### 6.7.3 InnerAPI 增量导出示例
+### InnerAPI 增量导出示例
 
 InnerAPI 导出接口通过 `export_util.NewExportFromReq` 解析 `version` 参数，并交给对应 Manager 的 `ConfigExport` 方法处理：
 
