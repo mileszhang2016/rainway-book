@@ -257,13 +257,195 @@ make test-model-cover-gate
 
 > `coverage.out` 是生成文件，不应提交到仓库。
 
+## 集成测试
+
+除了单元测试，壬远AI网关在 `ai-gateway-api` 与 `bfe` 两个仓库还维护着集成测试，用于验证控制面 API 与数据面转发链路的真实行为。贡献者在提交跨仓库特性时，应视情况补充对应的集成测试。
+
+### AI Gateway API 集成测试（本地离线测试）
+
+`ai-gateway-api/test/integration/` 是控制面的本地集成测试环境。它通过 `make build` 编译出真实的 `ai-gateway-api` 二进制运行完整的 API 测试。默认配置使用 SQLite 本地数据库与内嵌的 miniredis，无需外部 MySQL / Redis；同时支持通过配置文件切换到真实的 MySQL 与 Redis，便于在更接近生产环境的场景下回归验证。
+
+#### 目录结构
+
+```text
+ai-gateway-api/test/integration/
+├── go.mod / go.sum                # 独立 Go module，通过 replace 指向主项目
+├── conf/                          # 测试专用配置（默认 SQLite + miniredis + SkipTokenValidate）
+├── data/                          # 运行时数据文件（自动创建与清理）
+├── testutil/                      # 测试工具包
+│   ├── server.go                  # 编译/复制二进制、子进程启动/关闭管理
+│   ├── client.go                  # HTTP 客户端封装
+│   ├── assert.go                  # 断言函数
+│   ├── fixture.go                 # 测试数据工厂
+│   └── db.go                      # 数据库初始化/清理（SQLite / MySQL）
+├── tests/                         # 测试用例代码 + 设计文档（按模块组织）
+│   ├── api_key/
+│   ├── ai_route/
+│   ├── auth/
+│   ├── entity/
+│   ├── route_tables/
+│   ├── expression_verify/
+│   ├── innerapi/
+│   └── ...
+└── tests/schema/                  # Schema 集成测试
+    ├── openapi/
+    └── innerapi/
+```
+
+#### 测试环境特点
+
+| 特点 | 说明 |
+|---|---|
+| 独立 Go module | `integration/go.mod` 通过 `replace github.com/rainway-ai-gateway/ai-gateway-api => ../../` 引用主项目源码，不污染生产代码 |
+| 真实二进制子进程 | 使用 `exec.CommandContext` 启动 `make build` 编译出的真实二进制，覆盖完整启动链路 |
+| 数据库可切换：SQLite / MySQL | 默认采用 `glebarez/go-sqlite` 纯 Go 驱动，无需 CGO，每个测试进程使用独立数据库文件（含 PID），测试结束后自动清理；修改 `conf/ai_gateway_api.toml` 亦可对接真实 MySQL |
+| Redis 可切换：miniredis / Redis | 默认启动内嵌 miniredis，无需外部 Redis；修改配置后可对接真实 Redis，用于验证配额、限流等依赖 Redis 的链路 |
+| 跳过认证 | 配置 `SkipTokenValidate = true`，测试请求无需真实 Token 认证 |
+| 按模块组织 | 同一模块的测试代码与 `design.md` 放在同一目录，降低维护成本 |
+
+#### 常用命令
+
+```bash
+# 在 ai-gateway-api 根目录编译二进制
+make build
+
+# 下载测试依赖
+cd ai-gateway-api/test/integration
+go mod tidy
+
+# 运行全部集成测试
+../scripts/run_all_tests.sh
+# 或: go test -v -count=1 -timeout 300s ./tests/...
+
+# 运行指定模块测试
+../scripts/run_module_tests.sh api_key
+# 或: go test -v -count=1 -timeout 120s ./tests/api_key/...
+
+# 运行单个接口测试
+go test -v -count=1 -timeout 120s ./tests/api_key/create/
+
+# 清理运行时数据
+../scripts/clean.sh
+```
+
+#### 测试代码模板
+
+每个接口一个子目录，模块内通过 `TestMain` 共享一个服务器实例：
+
+```go
+package create
+
+import (
+    "os"
+    "testing"
+    "github.com/rainway-ai-gateway/ai-gateway-api/integration/testutil"
+)
+
+var sm *testutil.ServerManager
+
+func TestMain(m *testing.M) {
+    var err error
+    sm, err = testutil.StartServer()
+    if err != nil {
+        panic("failed to start server: " + err.Error())
+    }
+    code := m.Run()
+    sm.Shutdown()
+    os.Exit(code)
+}
+
+func TestCreate_NormalCase(t *testing.T) {
+    body := map[string]interface{}{"field": "value"}
+    resp, err := testutil.GetClient().Post("/open-api/v1/xxx", body)
+    if err != nil {
+        t.Fatalf("request failed: %v", err)
+    }
+    testutil.AssertSuccess(t, resp)
+    testutil.AssertDataFieldEquals(t, resp, "field", "value")
+}
+```
+
+`testutil` 同时提供 `AssertErrCode`、`AssertListLen`、`AssertPagination` 等断言，以及 `UniqueName`、`RandomString`、`GenerateTestCert` 等辅助函数。
+
+#### Schema 集成测试
+
+为严格校验每个接口返回值是否符合 `design-docs/api-define` 中的定义，项目维护了一组 schema 集成测试：
+
+```bash
+# 全部 schema 测试
+go test -v -count=1 -timeout 300s ./tests/schema/...
+
+# 仅 OpenAPI schema 测试
+go test -v -count=1 -timeout 300s ./tests/schema/openapi/...
+
+# 仅 InnerAPI schema 测试
+go test -v -count=1 -timeout 300s ./tests/schema/innerapi/...
+```
+
+通用校验器位于 `testutil/schema.go`，支持对象字段存在性、类型、必填字段、可选字段、嵌套对象、数组元素、枚举值以及分页结构的校验。
+
+### BFE 集成测试（真实进程级）
+
+`bfe/tests/integration/` 是数据面的真实进程级集成测试。与仓库中 `integration-test/` 目录不同，它仅启动真实的 `bfe` 进程，不引入 `ai-gateway-api`、`conf-agent` 等外部组件；测试所需的 BFE 配置文件直接由测试代码或静态 `testdata` 提供，请求通过真实 HTTP 发送到 BFE 监听端口，验证转发行为与后端命中统计。
+
+#### 目录结构
+
+```text
+bfe/tests/integration/
+├── common/                                    # 公共 harness
+│   ├── process_env.go                         # 编译/启动/停止真实 BFE 进程
+│   ├── bfe_config_builder.go                  # 生成临时 BFE 配置
+│   ├── mock_backend.go                        # 本地 mock AI 后端
+│   └── util.go                                # 工具函数
+├── implementation/                            # Go 实现代码
+│   └── scenario-SC01-route-table-lookup/
+│       ├── sc01_route_table_lookup_test.go
+│       └── testdata/                          # 静态 BFE 配置模板
+└── 测试设计文档/                               # 中文测试设计文档
+    ├── 测试场景总体说明.md
+    └── scenario-SC01-路由表查找与绑定/
+        ├── 场景说明.md
+        └── TC-*.md
+```
+
+#### 运行方式
+
+```bash
+# 在 bfe 目录下运行全部集成测试
+go test ./tests/integration/... -v
+
+# 运行单个场景
+go test ./tests/integration/implementation/scenario-SC01-route-table-lookup/... -v
+
+# 运行单个测试例
+go test ./tests/integration/implementation/scenario-SC01-route-table-lookup/ -run TestTC01 -v
+```
+
+首次运行会自动编译 `bfe` 二进制并缓存到 `bfe/tests/integration/.integration-test-bin/`。
+
+#### 当前覆盖
+
+| 场景 | 说明 |
+|---|---|
+| SC01 路由表查找与绑定 | 验证 `mod_ai_route` 在多级路由表（API-Key / Entity / Global）中的搜索与回退顺序，以及 fallback 时的 body 回绕行为 |
+
+### 贡献集成测试时的注意事项
+
+1. **优先补充单元测试**：单元测试仍是 CI 门禁的核心，`model/` 层语句覆盖率不得低于 70%。集成测试用于覆盖真实进程、完整链路或 schema 契约，不应替代单元测试。
+2. **AI Gateway API 变更**：若新增或修改 OpenAPI / InnerAPI 接口，应在 `ai-gateway-api/test/integration/tests/` 对应模块下补充用例，并在 `tests/schema/` 中补充 schema 校验。
+3. **BFE 模块变更**：若修改 `mod_ai_route`、`mod_ai_token_auth`、`mod_ai_rate_limit` 等数据面模块，应评估是否需要在 `bfe/tests/integration/` 新增场景，覆盖真实转发行为。
+4. **磁盘空间**：`modernc.org/sqlite` / `glebarez/go-sqlite` 纯 Go 实现编译时需要较大临时空间，若构建失败请先检查磁盘并清理 Go 缓存：
+   ```bash
+   go clean -cache -testcache
+   ```
+5. **不要提交生成文件**：`coverage.out`、`.integration-test-bin/`、SQLite 数据库文件、WAL/SHM 文件等均不应提交到仓库。
+
 ## License 头与代码风格
 
 壬远AI网关遵循 [Golang style guide](https://github.com/golang/go/wiki/Style)，所有 Go 源文件需包含 Apache 2.0 / Rainway AI Gateway License 头。`ai-gateway-api/Makefile` 中示例头如下：
 
 ```go
 // Copyright(c) 2024 The Rainway AI Gateway (壬远AI网关) Authors. All rights reserved.
-// Copyright (c) 2019 The BFE Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // ...
@@ -338,74 +520,217 @@ AI 网关功能通常同时涉及控制面、数据面与配置下发。贡献�
 
 ## 完整的新手贡献示例流程
 
-以下以“为 AI 网关新增 API-Key 级别限流策略”为例，演示从 0 到 PR 的完整流程。
+以下以 `ai-gateway-api` 仓库一次真实提交为例，演示从 0 到 PR 的完整流程。
+
+> 参考提交：
+> - Commit：`51cded34dae072b6c909a4a08f30ceb0199deea9`
+> - 作者：`zhangmiao <zhangmiao@yf-networks.com>`
+> - 时间：`2026-08-31`
+> - 提交信息：`feat(operation-log): add operation log module and update sys-design docs; bump version to 0.0.9`
+> - 变更规模：`58 files changed, 4759 insertions(+), 70 deletions(-)`
+
+该提交为控制面新增“操作日志（Operation Log）”能力：记录 entity、api-key、provider 等配置域的写操作，并提供 `GET /open-api/v1/operation-logs` 查询接口。它不涉及 BFE 数据面，因此示例流程以单仓库控制面变更为主。
 
 ### 1. 创建变更记录
 
+在 `ai-gateway-api/design-docs/modifications/` 下新建目录，命名格式为 `YYYYMMDD-<变更目的简述>`。一次非平凡变更至少应包含 `change-summary.md`，若涉及接口或数据模型变化，还应同时创建 `api-changes.md` 与 `design-changes.md`。
+
 ```bash
 cd ai-gateway-api/design-docs/modifications
-mkdir 20260728-apikey-rate-limit
-cd 20260728-apikey-rate-limit
+mkdir 2026-08-31-operation-log
+cd 2026-08-31-operation-log
 cat > change-summary.md <<EOF
-# 背景与目标
-为 API-Key 增加独立限流策略，支持按 token/min 与 token/day 双维度限制。
+# 操作日志（Operation Log）变更摘要
 
-# 影响范围
-- model/quota/
-- storage/rdb/quota/
-- endpoints/openapi_v1/quota/
-- bfe/bfe_modules/mod_ai_rate_limit/
+## 1. 背景
+
+`ai-gateway-api` 当前仅记录 HTTP access log，缺少面向配置变更的结构化审计能力。当 entity、api-key、provider、route 等配置被修改后，无法快速回答“谁在什么时间做了什么修改、修改了哪些字段、结果如何”等问题。
+
+## 2. 目标
+
+- 对控制面所有会产生写操作的配置域记录操作日志，并持久化到数据库。
+- 提供结构化查询接口，支持按操作人、资源类型、资源 ID、动作类型、时间范围等维度检索。
+- 对 api-key token、密码、私钥等敏感字段进行脱敏，避免日志泄露。
+- 采用异步批量写入，尽量降低对主业务请求的延迟影响。
+
+## 3. 范围
+
+| 范围 | 说明 |
+|------|------|
+| 涉及仓库 | `ai-gateway-api` |
+| 涉及模块 | `model/ioperlog`、`storage/rdb/ioperlog`、`endpoints/openapi_v1/operation_log`、各配置域 Manager |
+| 涉及接口 | 新增 `GET /open-api/v1/operation-logs`；各既有写接口内部接入操作日志记录 |
+| 数据迁移 | 新增 `operation_logs` 表，无历史数据迁移 |
+| 数据面影响 | 无 |
+
+## 4. 关键决策
+
+| 决策 | 说明 |
+|------|------|
+| Manager 层主动记录 | 由业务 Manager 在写操作成功后构造 `OperationLogEntry`，可携带资源 ID、名称、变更摘要等业务语义，优于纯 Middleware 解析 |
+| 异步批量落库 | `OperationLogManager` 通过内存缓冲 + 后台 worker 批量写入数据库，默认 200 条或 5 秒触发一次 INSERT |
+| 全量域一期接入 | 第一期即覆盖 entity、entity_type、api_key、provider、cluster、route、domain、certificate、quota_plan、rate_limit_policy、model_price、user、token 等全部配置域 |
+| 失败操作一并记录 | 写操作失败时同样记录日志（`status = 2`），保留失败审计证据 |
+| 敏感字段统一脱敏 | 提供 `maskSensitiveFields` 工具函数，对 token、密码、私钥等字段进行掩码或排除 |
+| 查询接口仅对管理员开放 | 先按系统管理员权限控制；待权限体系重构后，再按 entity 维度细化 |
+
+## 5. 关联文档
+
+- `design-docs/modifications/2026-08-31-operation-log/api-changes.md`
+- `design-docs/modifications/2026-08-31-operation-log/design-changes.md`
 EOF
 ```
 
+`change-summary.md` 是后续讨论和 review 的入口，建议写清楚背景、目标、范围与关键决策，避免 reviewer 从代码中反推设计意图。若变更涉及接口契约或字段变更，`api-changes.md` 应详细列出新增/修改/删除的接口、请求响应字段与错误码；若涉及数据模型、流程或算法变更，`design-changes.md` 应给出表结构、状态机、调用链路或关键算法说明。
+
 ### 2. 更新 api-define 与 sys-design
 
-在 `design-docs/api-define/` 中新增 `/rate-limit-policies` 接口定义；在 `design-docs/sys-design/` 中更新限流模型与导出格式说明；必要时新增 `sys-design/details/限流策略与导出.md`。
+参考提交中的设计文档更新包括：
+
+- 在 `design-docs/api-define/` 中补充 `GET /open-api/v1/operation-logs` 的接口定义（请求参数、响应字段、错误码、权限控制）。
+- 在 `design-docs/sys-design/summary.md` 中索引新增的操作日志设计文档。
+- 在 `design-docs/sys-design/details/` 中新增或更新相关细节说明，例如异步缓冲、批量写入、脱敏规则、降级策略、监控指标等。
 
 ### 3. 实现控制面代码
 
-按接口层 → 模型层 → 存储层顺序实现：
+按接口层 → 模型层 → 存储层顺序实现。参考提交涉及的关键文件如下：
 
-- `endpoints/openapi_v1/quota/rate_limit_policy.go`
-- `model/quota/rate_limit_policy_manager.go`
-- `storage/rdb/quota/rate_limit_policy.go`
-- 更新 `db_ddl.sql` 增加限流策略表
+- **接口层**
+  - `endpoints/openapi_v1/operation_log/endpoints.go`：注册 endpoint。
+  - `endpoints/openapi_v1/operation_log/list.go`：实现 `GET /open-api/v1/operation-logs` handler。
+  - `endpoints/openapi_v1/endpoints.go`：将新 endpoint 注册到全局路由表。
 
-### 4. 实现数据面代码
+- **模型层**
+  - `model/ioperlog/types.go`：定义 `OperationLogEntry`、`OperationLogFilter`、`OperationLogQueryResult` 等类型。
+  - `model/ioperlog/storager.go`：定义 `OperationLogStorager` 接口。
+  - `model/ioperlog/manager.go`：实现 `OperationLogManager`，包括异步 `Record`、同步 `RecordSync`、`QueryLogs`、后台 worker 批量 INSERT 等。
+  - `model/ioperlog/mask.go`：实现敏感字段脱敏工具函数。
+  - 各配置域 Manager（如 `model/entity/entity_manager.go`、`model/api_key/api_key.go` 等）：在写操作成功后调用 `OperationLogManager.Record()`。
 
-在 `bfe/bfe_modules/mod_ai_rate_limit/` 中新增 API-Key 限流规则解析与执行逻辑。
+- **存储层**
+  - `storage/rdb/ioperlog/operation_log.go`：实现 `OperationLogStorager`。
+  - `storage/rdb/internal/dao/table_operation_logs.go`：新增 `TOperationLog*` 辅助函数。
+  - `db_ddl.sql` / `db_ddl_sqlite.sql`：新增 `operation_logs` 表及索引。
 
-### 5. 编写单元测试
+- **容器初始化**
+  - `stateful/container/components.go` 与 `stateful/container/rdb/components.go`：初始化 `OperationLogStorager` 与 `OperationLogManager`，并将其注入到各配置域 Manager。
+
+- **版本号**
+  - `version/version.go`：如有版本发布节奏，同步更新版本号。
+
+### 4. 编写单元测试
+
+参考提交中，单元测试与被测代码同包，覆盖核心逻辑与边界场景：
+
+```text
+model/ioperlog/
+├── manager.go
+├── manager_test.go       # 测试异步缓冲、批量写入、队列满降级、优雅关闭 flush
+├── mask.go
+└── mask_test.go          # 测试敏感字段脱敏规则
+
+model/entity/
+├── entity_manager.go
+├── entity_manager_test.go
+└── operation_log_test.go # 验证写操作后是否正确调用 OperationLogManager.Record()
+```
+
+测试应关注：
+
+- `model/ioperlog` 语句覆盖率需达到 70% 以上。
+- 验证异步缓冲、批量写入、队列满降级、优雅关闭 flush 等行为。
+- 验证所有接入域的 Manager 在写操作后正确调用 `OperationLogManager.Record()`。
+- 验证 api-key token、密码、私钥等敏感字段脱敏效果。
+
+### 5. 编写集成测试例
+
+控制面接口变更应补充 SQLite 离线集成测试。参考提交在 `ai-gateway-api/test/integration/tests/operation_log/` 下新增了设计文档与测试代码：
+
+```text
+test/integration/tests/operation_log/
+├── design.md             # 测试用例设计（接口列表、参数说明、场景设计）
+└── list/
+    └── list_test.go      # GET /open-api/v1/operation-logs 接口测试
+```
+
+典型测试代码结构：
 
 ```go
-// ai-gateway-api/model/quota/rate_limit_policy_manager_test.go
-func TestRateLimitPolicyManager_Create(t *testing.T) {
-    ctx := context.Background()
-    t.Run("success", func(t *testing.T) {
-        store := &fakeRateLimitPolicyStorager{
-            createFn: func(ctx context.Context, p *RateLimitPolicyParam) (int64, error) { return 1, nil },
-        }
-        m := NewRateLimitPolicyManager(&fakeTxn{}, store)
-        id, err := m.CreatePolicy(ctx, &RateLimitPolicyParam{Name: lib.PString("key-policy-1")})
-        require.NoError(t, err)
-        assert.Equal(t, int64(1), id)
-    })
+package list
+
+import (
+    "os"
+    "testing"
+
+    "github.com/rainway-ai-gateway/ai-gateway-api/integration/testutil"
+)
+
+var sm *testutil.ServerManager
+
+func TestMain(m *testing.M) {
+    var err error
+    sm, err = testutil.StartServer()
+    if err != nil {
+        panic("failed to start server: " + err.Error())
+    }
+    code := m.Run()
+    sm.Shutdown()
+    os.Exit(code)
+}
+
+func TestListOperationLogs_NormalCase(t *testing.T) {
+    resp, err := testutil.GetClient().Get("/open-api/v1/operation-logs?page=1&page_size=20")
+    if err != nil {
+        t.Fatalf("request failed: %v", err)
+    }
+    testutil.AssertSuccess(t, resp)
+    testutil.AssertPagedListSchema(t, resp, "list", "pagination")
 }
 ```
+
+若变更涉及数据面转发逻辑，还应在 `bfe/tests/integration/` 新增或扩展场景，验证真实 BFE 进程在路由、认证、限流等规则下的转发行为。
 
 ### 6. 本地验证
 
 ```bash
 cd ai-gateway-api
+
+# 1. 单元测试与覆盖率门禁
 make test-model-cover-gate
+
+# 2. License 头检查
 make license-check
-cd ../bfe
-make
+
+# 3. 运行新增集成测试
+cd test/integration
+go test -v -count=1 -timeout 120s ./tests/operation_log/...
 ```
+
+由于本次变更不涉及 BFE 数据面，无需在 `bfe/` 目录执行构建验证；若变更跨仓库，则需在对应仓库分别运行构建与测试。
 
 ### 7. 提交 PR
 
-在两个仓库分别创建 PR，并在描述中相互引用。PR 合并后清理分支。
+单仓库变更只需在 `ai-gateway-api` 提交一个 PR。提交信息可参考真实提交：
+
+```text
+feat(operation-log): add operation log module and update sys-design docs; bump version to 0.0.9
+```
+
+PR 描述中应说明：
+
+- 变更背景与目标（可引用 `change-summary.md`）。
+- 主要改动点（接口、模型、存储、测试、设计文档）。
+- 测试覆盖情况（单元测试、集成测试）。
+- 是否涉及数据面或 Conf Agent（本次不涉及）。
+
+PR 合并后清理本地与远端分支：
+
+```bash
+git push origin :feature-operation-log
+git checkout develop
+git pull upstream develop
+git branch -d feature-operation-log
+```
 
 ## 提交前自查清单
 
