@@ -1,4 +1,4 @@
-# 第三十三章 如何扩展壬远AI网关
+# 第三十四章 如何扩展壬远AI网关
 
 ## 本章目标
 
@@ -11,7 +11,7 @@
 - 在 `ai-gateway-api` 中新增一个 InnerAPI 配置导出主题，并打通 Conf Agent 与 BFE 的消费链路；
 - 扩展一种新的 Provider 协议支持（如新的模型发现协议、请求/响应转换）。
 
-本章将给出每个场景的关键代码路径、实现步骤、测试要点，并通过流程图展示跨组件协作关系。阅读本章前，建议先回顾 [第二十四章 代码组织与启动流程](../implementation/chapter24-code-layout-and-startup.md)、[第二十五章 接口层实现：OpenAPI与InnerAPI](../implementation/chapter25-endpoints-implementation.md) 以及 [第三十二章 Conf Agent实现](../implementation/chapter32-conf-agent-implementation.md)。
+本章将给出每个场景的关键代码路径、实现步骤、测试要点，并通过流程图展示跨组件协作关系。阅读本章前，建议先回顾 [第三十一章 代码组织与启动流程](../implementation/chapter25-code-layout-and-startup.md)、[第三十一章 接口层实现：OpenAPI与InnerAPI](../implementation/chapter26-endpoints-implementation.md) 以及 [第三十五章 Conf Agent实现](../implementation/chapter33-conf-agent-implementation.md)。
 
 ## 33.1 扩展前的准备工作
 
@@ -667,6 +667,6 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 - `bfe/AGENTS.md`
 - `bfe/CONTRIBUTING.md`
 - `conf-agent/AGENTS.md`
-- [第二十五章 接口层实现：OpenAPI与InnerAPI](../implementation/chapter25-endpoints-implementation.md)
-- [第二十八章 AI路由模块实现：mod_ai_route](../implementation/chapter28-mod-ai-route.md)
-- [第三十二章 Conf Agent实现](../implementation/chapter32-conf-agent-implementation.md)
+- [第三十一章 接口层实现：OpenAPI与InnerAPI](../implementation/chapter26-endpoints-implementation.md)
+- [第三十一章 AI路由模块实现：mod_ai_route](../implementation/chapter29-mod-ai-route.md)
+- [第三十五章 Conf Agent实现](../implementation/chapter33-conf-agent-implementation.md)

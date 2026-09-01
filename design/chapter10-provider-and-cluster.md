@@ -1,4 +1,4 @@
-# 第九章 Provider 与 Cluster 设计
+# 第十章 Provider 与 Cluster 设计
 
 ## 本章目标
 
@@ -494,6 +494,6 @@ curl -X POST "http://api-server:8183/api/v1/providers/tools/discover-models" \
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/cluster-table.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/ai-route.md`
 - [第六章 控制面核心设计：AI Gateway API](./chapter06-control-plane-design.md)
-- [第十八章 Provider 配置](./chapter18-provider-configuration.md)
-- [第十九章 Cluster 配置](./chapter19-cluster-configuration.md)
-- [第二十八章 mod_ai_route 实现](../implementation/chapter28-mod-ai-route.md)
+- [第二十一章 Provider 配置](../operation/chapter19-provider-and-model-config.md)
+- [第二十一章 Cluster 配置](../operation/chapter20-cluster-and-route-config.md)
+- [第三十一章 mod_ai_route 实现](../implementation/chapter29-mod-ai-route.md)

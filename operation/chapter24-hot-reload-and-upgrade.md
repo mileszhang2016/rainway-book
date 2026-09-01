@@ -1,4 +1,4 @@
-# 第二十三章 配置热加载与升级
+# 第二十四章 配置热加载与升级
 
 ## 本章目标
 
@@ -373,4 +373,4 @@ ls -l mod_ai_token_auth
 - `conf-agent/AGENTS.md`
 - `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/00-overview.md`
-- [第十三章 配置导出与版本控制设计](../design/chapter13-config-export-and-version-control.md)
+- [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)

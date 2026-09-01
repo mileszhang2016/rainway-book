@@ -4,7 +4,7 @@
 
 AI 网关每天需要把成千上万条请求准确地送达到正确的模型与集群。与传统七层负载均衡只关心“域名 + 路径 → 后端集群”不同，AI 请求还携带调用方身份（API-Key）、目标模型（model）、配额计划、降级策略等元信息。本章将帮助读者理解壬远 AI 网关如何把这些信息组织成可执行的路由与调度策略：
 
-- 区分产品级入口路由与 AI 层路由的职责边界；
+- 理解 AI 路由规则在请求处理链路中的位置；
 - 掌握 API-Key / Entity / Global 三级路由表的优先级与绑定顺序；
 - 理解模型级别的加权选择与 Fallback 降级机制；
 - 了解 Provider 与 Cluster 解耦后各自承担的职责；
@@ -15,23 +15,20 @@ AI 网关每天需要把成千上万条请求准确地送达到正确的模型�
 
 在传统负载均衡场景中，路由（Routing）通常指根据请求的 Host、Path、Header 等字段，把流量分发到某个后端集群（Cluster）。进入大模型时代后，同一条 `/v1/chat/completions` 路径可能对应 `gpt-4`、`deepseek-chat`、`claude-3-opus` 等数十种模型，不同调用方（API-Key）还可能拥有不同的可用模型列表、配额与优先级。因此，AI 网关需要在原有 L7 路由之上再增加一层面向“调用方 + 模型”的语义路由。
 
-壬远 AI 网关把路由拆成两个层次：
+在 AI 网关模式下，BFE 通过独立的 `ServeHTTPForAI()` 路径处理请求。该路径会调用 `findProduct()` 完成产品线识别，供中间件和配置加载使用，但**不会使用传统的产品级 BFE 路由规则来选择目标 Cluster**。请求最终转发到哪个模型与集群，完全由 AI 路由规则决定。
 
-1. **产品级路由规则（Product Route Rules）**：由 BFE 原生路由模型承载，决定外部请求是否进入 AI 网关 Cluster。它关心 Host、Path、HTTP Method、Header、BFE 条件表达式等入口信息，输出结果是单个 ClusterName。
-2. **AI 路由规则（AI Route Rules）**：存储在控制面的 `route_rules` 表中，决定 API-Key 鉴权之后请求应转发到哪个目标模型与集群。它输出的是一组 `targets`（集群 + 模型 + 权重）以及可选的 `fallbacks`（降级目标）。
-
-两层路由的协作关系可以用下图概括：
+AI 路由规则存储在控制面的 `route_rules` 表中，面向 API-Key / Entity / Global 三级，输出的是一组 `targets`（集群 + 模型 + 权重）以及可选的 `fallbacks`（降级目标）。
 
 ```mermaid
 flowchart LR
     Client -->|HTTPS| BFE[BFE 数据面]
-    BFE -->|产品级路由规则| AIGW[AI 网关 Cluster]
-    AIGW --> auth[mod_ai_token_auth<br/>鉴权 / 配额]
+    BFE --> findProduct[findProduct\n仅用于识别产品]
+    findProduct --> auth[mod_ai_token_auth<br/>鉴权 / 配额]
     auth --> route[mod_ai_route<br/>AI 路由规则]
     route -->|targets / fallbacks| Backend[后端 AI 服务]
 ```
 
-产品级规则解决“请求是否进入 AI 网关”的问题，AI 路由规则解决“进入网关后送到哪个模型/集群”的问题。二者共同构成 AI 网关的完整路由体系。
+AI 路由规则在 `HandleFoundProduct` 阶段执行，位于 `mod_ai_token_auth` 鉴权之后，决定请求最终访问哪个模型与集群。
 
 ## API-Key、Entity、Global 三级路由表
 
@@ -159,7 +156,7 @@ flowchart LR
 
 这种解耦带来的核心收益包括：职责清晰、配置复用、Cluster 不再暴露 key 明文、BFE 侧配置结构保持不变。删除 Provider 前必须确认无 Cluster 引用；删除 Cluster 前也必须确认未被任何 AI 路由规则引用，防止路由指向不存在的集群。
 
-更详细的数据模型与 AIConf 生成过程可参考 [第九章 Provider 与 Cluster 设计](../design/chapter09-provider-and-cluster.md)。
+更详细的数据模型与 AIConf 生成过程可参考 [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)。
 
 ## BFE 条件表达式在 AI 路由中的应用
 
@@ -190,7 +187,7 @@ req_host_in("api.example.com") && req_body_json_in("model", "gpt-4", false)
 
 ## 请求调度流程
 
-一条 AI 请求从进入 BFE 到最终到达后端，需要经过产品级路由、AI 路由、加权选择、Fallback 降级等多个阶段。完整流程如下图所示：
+一条 AI 请求从进入 BFE 到最终到达后端，需要经过产品线识别、AI 路由表查找、加权选择、Fallback 降级等多个阶段。完整流程如下图所示：
 
 ```mermaid
 flowchart TD
@@ -227,7 +224,7 @@ flowchart TD
 
 本章从原理层面介绍了壬远 AI 网关的路由与调度机制：
 
-- AI 请求路由被拆分为产品级入口路由与 AI 层路由，前者决定请求是否进入网关，后者决定请求最终访问哪个模型与集群；
+- 在 AI 网关模式下，`findProduct()` 仅用于产品线识别和配置上下文加载，传统产品级 BFE 路由规则不参与 Cluster 选择；请求转发目标完全由 AI 路由规则决定；
 - AI 路由表分为 API-Key、Entity、Global 三级，BFE 按 `apikey → entity → global` 的顺序依次匹配，命中即返回；
 - 模型级别通过 `targets` 加权选择实现多集群分流，通过 `fallbacks` 有序降级提升可用性；
 - Provider 与 Cluster 解耦后，Provider 负责后端能力与密钥，Cluster 负责转发策略，控制面通过 name join 生成 BFE 所需的 `AIConf`；
@@ -247,6 +244,6 @@ flowchart TD
 - `bfe/bfe_modules/mod_ai_route/route_table.go`
 - `bfe/bfe_modules/mod_ai_route/route_rule.go`
 - `bfe/bfe_basic/request_ai_route.go`
-- [第九章 Provider 与 Cluster 设计](../design/chapter09-provider-and-cluster.md)
-- [第十章 AI 路由规则设计](../design/chapter10-ai-route-rules.md)
-- [第二十八章 AI 路由模块实现：mod_ai_route](../implementation/chapter28-mod-ai-route.md)
+- [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)
+- [第十一章 AI 路由规则设计](../design/chapter11-ai-route-rules.md)
+- [第三十一章 AI 路由模块实现：mod_ai_route](../implementation/chapter29-mod-ai-route.md)

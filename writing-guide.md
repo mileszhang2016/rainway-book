@@ -47,7 +47,7 @@
    - `ai-gateway-api/main.go` 中的 `stateful.LoadConfig`
    - `bfe/bfe_modules/mod_ai_route/mod_ai_route.go` 中的 `AiRouteConf`
 3. 引用其他章节时，使用相对链接，例如：
-   - [第六章 控制面核心设计：AI Gateway API](./chapter06-control-plane-design.md)
+   - [第六章 控制面核心设计：AI Gateway API](./design/chapter06-control-plane-design.md)
 
 ## 五、图表规范
 
@@ -75,7 +75,7 @@
 
 设计篇、操作篇、实现篇存在前后对应关系，写作时注意交叉引用：
 
-- 第五章（架构设计）→ 第十六章（安装部署）→ 第二十四章（代码组织与启动流程）
-- 第六章（控制面设计）→ 第十七章（控制台基础操作）→ 第二十五章（接口层实现）
-- 第九章（Provider与Cluster设计）→ 第十八、十九章（Provider/Cluster配置）→ 第二十八章（mod_ai_route实现）
-- 第十一章（配额与限流设计）→ 第二十、二十一章（API-Key/限流配置）→ 第二十九、三十章（mod_ai_token_auth / mod_ai_rate_limit实现）
+- 第五章（架构设计）→ 第二十一章（安装部署）→ 第三十一章（代码组织与启动流程）
+- 第六章（控制面设计）→ 第二十一章（控制台基础操作）→ 第三十一章（接口层实现）
+- 第十一章（Provider与Cluster设计）→ 第十八、十九章（Provider/Cluster配置）→ 第三十一章（mod_ai_route实现）
+- 第二十一章（配额与限流设计）→ 第二十、二十一章（API-Key/限流配置）→ 第二十九、三十章（mod_ai_token_auth / mod_ai_rate_limit实现）

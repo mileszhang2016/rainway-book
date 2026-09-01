@@ -1,4 +1,4 @@
-# 第三十章 限流模块实现：mod_ai_rate_limit
+# 第三十一章 限流模块实现：mod_ai_rate_limit
 
 ## 本章目标
 
@@ -11,7 +11,7 @@
 - 掌握模块配置的加载、校验与热加载机制；
 - 了解模块暴露的监控指标与 Prometheus 指标含义。
 
-本章对应设计篇 [第十一章 配额与限流设计](../design/chapter11-quota-and-rate-limit.md) 与操作篇 [第二十一章 限流策略配置](../operation/chapter21-rate-limit-config.md)，聚焦数据面实现细节。
+本章对应设计篇 [第二十一章 配额与限流设计](../design/chapter12-quota-and-rate-limit.md) 与操作篇 [第三十一章 限流策略配置](../operation/chapter22-rate-limit-config.md)，聚焦数据面实现细节。
 
 ## mod_ai_rate_limit 模块职责
 

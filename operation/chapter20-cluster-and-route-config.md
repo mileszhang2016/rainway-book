@@ -1,4 +1,4 @@
-# 第十九章 Cluster 与路由配置
+# 第二十章 Cluster 与路由配置
 
 ## 本章目标
 
@@ -188,7 +188,7 @@ AI 路由规则统一存储在 `route_rules` 表中，面向三个层级：
 - `targets`：目标 Cluster + 模型 + 权重列表，权重之和必须等于 100；
 - `fallbacks`：可选的 Fallback 目标列表。
 
-相比产品级路由规则（负责按 Host/Path 把流量引入 BFE Cluster），AI 路由规则工作在 API-Key 鉴权之后，决定请求最终转发到哪个目标模型与后端 Cluster。两者协同完成从入口到后端的完整分发链路。
+AI 路由规则工作在 API-Key 鉴权之后，决定请求最终转发到哪个目标模型与后端 Cluster。需要特别说明的是，在 AI 网关模式下，BFE 通过独立的 `ServeHTTPForAI()` 路径处理请求；`findProduct()` 仅用于产品线识别和配置上下文加载，传统产品级 BFE 路由规则（`route_basic_rules` / `route_advance_rules` / `route_default_rules`）不参与 AI 请求的 Cluster 选择。
 
 ### Global 路由表
 

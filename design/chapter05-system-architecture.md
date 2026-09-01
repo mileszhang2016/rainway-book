@@ -206,7 +206,7 @@ BFE /reload（热加载）
 6. **热加载**：Conf Agent 调用 BFE 的 `/reload/{module}` 接口，BFE 在不重启的情况下加载新配置。
 7. **生效执行**：后续 AI 请求按照新的策略进行路由、认证、配额和限流。
 
-详细配置导出机制见 [第十三章 配置导出与版本控制设计](./chapter13-config-export-and-version-control.md)。
+详细配置导出机制见 [第十四章 配置导出与版本控制设计](./chapter14-config-export-and-version-control.md)。
 
 ---
 
@@ -271,7 +271,7 @@ BFE /reload（热加载）
 - BFE 在多个可用区部署，Conf Agent 独立拉取配置；
 - Dashboard 可独立部署，也可与 AI Gateway API 同容器运行。
 
-详细部署步骤见 [第十六章 安装部署](../operation/chapter16-installation-and-deployment.md)。
+详细部署步骤见 [第二十一章 安装部署](../operation/chapter17-installation-and-deployment.md)。
 
 ---
 

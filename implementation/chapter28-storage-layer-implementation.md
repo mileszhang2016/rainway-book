@@ -1,4 +1,4 @@
-# 第二十七章 存储层实现：DAO 与 Storage
+# 第二十八章 存储层实现：DAO 与 Storage
 
 ## 本章目标
 
@@ -36,7 +36,7 @@ storage/rdb/
 ├── provider/                   # Provider Storage
 ├── quota/                      # QuotaPlan Storage
 ├── rate_limit_policy/          # RateLimitPolicy Storage
-├── route_conf/                 # 域名 / 产品级路由规则 Storage
+├── route_conf/                 # 域名 / 产品级路由规则 Storage（AI 网关模式下不用于 Cluster 选择）
 ├── route_rules/                # API-Key / Entity / Global 路由规则 Storage
 ├── txn/                        # 事务抽象实现
 └── version_control/            # 配置版本控制 Storage
@@ -339,7 +339,7 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 
 注意：`route_cases` 表在 DDL 中定义，但当前代码中暂无对应 DAO 与 Storage 实现，因此实际由 DAO + Storage 覆盖的表为 24 张。
 
-从映射关系可以看出，Storage 子包的划分依据是业务域而非数据库表数量。例如 `cluster_conf` 子包同时管理 `clusters`、`sub_clusters`、`pools`、`lb_matrices` 四张表，因为这几张表共同服务于集群配置这一业务概念；`route_conf` 子包同时管理 `domains`、`route_basic_rules`、`route_advance_rules`、`route_default_rules`，因为它们共同组成产品级路由规则。这种按业务域聚合的方式，让 Storage 接口更贴近模型层 Manager 的调用需求，避免了 Manager 同时依赖多个细粒度 Storage 的复杂局面。
+从映射关系可以看出，Storage 子包的划分依据是业务域而非数据库表数量。例如 `cluster_conf` 子包同时管理 `clusters`、`sub_clusters`、`pools`、`lb_matrices` 四张表，因为这几张表共同服务于集群配置这一业务概念；`route_conf` 子包同时管理 `domains`、`route_basic_rules`、`route_advance_rules`、`route_default_rules`，因为它们共同组成产品级路由规则（AI 网关模式下不用于 AI 请求的 Cluster 选择，仅用于产品线识别上下文或非 AI 流量场景）。这种按业务域聚合的方式，让 Storage 接口更贴近模型层 Manager 的调用需求，避免了 Manager 同时依赖多个细粒度 Storage 的复杂局面。
 
 ## 事务实现（storage/rdb/txn）
 
@@ -464,6 +464,8 @@ func (s *EntityTypeStorager) CreateEntityType(
 ```
 
 ### 3. 产品级路由规则全量替换：`route_rule.go`
+
+> 说明：以下 Storage 函数负责产品级路由规则（`route_basic_rules` / `route_advance_rules` / `route_default_rules`）的持久化。在 AI 网关模式下，这些规则不用于 AI 请求的 Cluster 选择，仅用于产品线识别上下文或非 AI 流量场景。
 
 ```go
 // storage/rdb/route_conf/route_rule.go

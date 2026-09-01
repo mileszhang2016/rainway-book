@@ -1,4 +1,4 @@
-# 第二十五章 接口层实现：OpenAPI与InnerAPI
+# 第二十六章 接口层实现：OpenAPI与InnerAPI
 
 ## 本章目标
 
@@ -12,7 +12,7 @@
 - 参数绑定、权限校验、统一响应格式在接口层的具体实现；
 - 一个 OpenAPI 接口与一个 InnerAPI 接口的完整 Action 示例。
 
-关于控制面三层架构与 OpenAPI / InnerAPI 职责划分的设计背景，可参阅 [第六章 控制面核心设计：AI Gateway API](../design/chapter06-control-plane-design.md)；关于 InnerAPI 增量导出与版本控制机制，可参阅 [第十三章 配置导出与版本控制设计](../design/chapter13-config-export-and-version-control.md)。
+关于控制面三层架构与 OpenAPI / InnerAPI 职责划分的设计背景，可参阅 [第六章 控制面核心设计：AI Gateway API](../design/chapter06-control-plane-design.md)；关于 InnerAPI 增量导出与版本控制机制，可参阅 [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)。
 
 ---
 
@@ -623,7 +623,7 @@ func exportActionProcess(req *http.Request) (interface{}, error) {
 }
 ```
 
-`APIKeyRuleManager.ConfigExport` 内部会调用 `VersionControlManager.ExportConfig`，计算配置数据的 MD5 签名并与 `config_versions` 表比较：若配置未变化则返回 `Data: nil`，Conf Agent 不会触发 BFE 热加载；若发生变化则返回带新版本号的全量配置。更多细节可参考 [第十三章 配置导出与版本控制设计](../design/chapter13-config-export-and-version-control.md)。
+`APIKeyRuleManager.ConfigExport` 内部会调用 `VersionControlManager.ExportConfig`，计算配置数据的 MD5 签名并与 `config_versions` 表比较：若配置未变化则返回 `Data: nil`，Conf Agent 不会触发 BFE 热加载；若发生变化则返回带新版本号的全量配置。更多细节可参考 [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)。
 
 ---
 
@@ -677,4 +677,4 @@ func exportActionProcess(req *http.Request) (interface{}, error) {
 - `ai-gateway-api/endpoints/openapi_v1/entity_type/create.go`
 - `ai-gateway-api/endpoints/innerapi_v1/mod_api_key/export.go`
 - [第六章 控制面核心设计：AI Gateway API](../design/chapter06-control-plane-design.md)
-- [第十三章 配置导出与版本控制设计](../design/chapter13-config-export-and-version-control.md)
+- [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)

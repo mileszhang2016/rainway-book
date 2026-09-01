@@ -1,4 +1,4 @@
-# 第二十六章 模型层实现：Manager 与 Storager 模式
+# 第二十七章 模型层实现：Manager 与 Storager 模式
 
 ## 本章目标
 

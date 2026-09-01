@@ -1,4 +1,4 @@
-# 第十七章 控制台基础操作
+# 第十八章 控制台基础操作
 
 ## 本章目标
 
@@ -91,7 +91,7 @@ Dashboard 的导航由 `/meta` 接口动态返回，对应 `conf/nav_tree.toml` 
 
 ### 17.3.4 Provider 与 Cluster
 
-Provider（提供商）回答“下游是谁、能访问哪些模型、如何认证、后端在哪里”的问题；Cluster（集群）回答“流量如何转发、用哪些模型、Key 权重如何分配”的问题。二者解耦后，Cluster 通过 `llm_config.provider` 强引用 Provider，而 Provider 可以被多个 Cluster 共享。详细设计动机与数据模型参见 [第九章 Provider 与 Cluster 设计](../design/chapter09-provider-and-cluster.md)。
+Provider（提供商）回答“下游是谁、能访问哪些模型、如何认证、后端在哪里”的问题；Cluster（集群）回答“流量如何转发、用哪些模型、Key 权重如何分配”的问题。二者解耦后，Cluster 通过 `llm_config.provider` 强引用 Provider，而 Provider 可以被多个 Cluster 共享。详细设计动机与数据模型参见 [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)。
 
 ### 17.3.5 Entity 与 API-Key
 
@@ -155,7 +155,7 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 
 ## 17.6 配置版本与变更记录查看
 
-壬远 AI 网关采用基于 MD5 签名与版本号的配置导出机制，详细设计参见 [第十三章 配置导出与版本控制设计](../design/chapter13-config-export-and-version-control.md)。在 Dashboard 中，管理员可以在“全局配置”或“版本管理”入口查看以下信息：
+壬远 AI 网关采用基于 MD5 签名与版本号的配置导出机制，详细设计参见 [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)。在 Dashboard 中，管理员可以在“全局配置”或“版本管理”入口查看以下信息：
 
 - **配置主题（Topic）**：如 `route_rule`、`ai_route`、`mod_api_key_rule` 等；
 - **当前版本号**：格式为 `YYYYMMDDHHMMSS`，例如 `20260102120000`；
@@ -274,5 +274,5 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 - `ai-gateway-api/conf/ai_gateway_api.toml`
 - `ai-gateway-api/conf/nav_tree.toml`
 - [第六章 控制面核心设计：AI Gateway API](../design/chapter06-control-plane-design.md)
-- [第九章 Provider 与 Cluster 设计](../design/chapter09-provider-and-cluster.md)
-- [第十三章 配置导出与版本控制设计](../design/chapter13-config-export-and-version-control.md)
+- [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)
+- [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)

@@ -1,144 +1,20 @@
-# 第八章 API-Key 与认证授权设计
+# 第九章 API-Key 设计
 
 ## 本章目标
 
-AI 网关既要面向内部管理员和开发者提供控制能力，又要面向下游大模型服务传递调用凭证。本章将解决以下问题：
+API-Key 是壬远 AI 网关面向业务方的核心调用凭证，也是后续配额、限流、路由、成本核算等能力的挂载点。通过阅读本章，读者将理解：
 
-- 控制面如何识别请求方身份，并按最小权限原则进行访问控制；
-- 面向业务方的一次性调用凭证（API-Key）如何生成、校验与回收；
-- 业务组织单元 Entity 如何形成层级树，并把模型白名单、配额、限流、路由策略继承给挂载其上的 API-Key；
-- API-Key 与配额、限流、路由规则如何绑定并导出到 BFE 数据面。
+- API-Key 的数据模型与字段含义；
+- API-Key 的生成、校验与完整生命周期；
+- Entity 业务组织单元如何形成层级树，并把模型白名单、配额、限流、路由策略继承给 API-Key；
+- API-Key 与配额、限流、路由规则如何绑定并导出到 BFE 数据面；
+- 数据面最终生效规则的形成过程。
 
-阅读本章后，读者应能理解 AI Gateway API 的认证授权体系、API-Key 与 Entity 的关联继承机制，以及数据面最终生效规则的形成过程。
+---
 
-## 认证授权的整体设计
+## API-Key 的数据模型
 
-`ai-gateway-api` 的认证授权模块位于 `model/iauth`，同时负责 OpenAPI（控制台/第三方集成）与 InnerAPI（BFE / Conf Agent 拉取配置）的访问者身份识别与权限控制。
-
-该模块复用了 BFE 历史代码中 `users` 表同时存储“用户”与“Token”的设计，通过 `type` 字段区分两类访问者：
-
-- `type=0`：普通用户，主要用于 Dashboard 管理员登录、人工运维操作；
-- `type=1`：Token，主要用于程序化调用、Conf Agent / BFE 拉取 InnerAPI。
-
-在业务层，二者分别映射为 `iauth.User` 与 `iauth.Token`，并通过 `Visitor` 结构体统一抽象。`Visitor` 实现 `Loginer` 接口，统一提供 `GetName`、`GetScopes`、`GetType`、`IsAdmin` 方法。后续授权校验只关心 `Visitor`，不关心底层是用户还是 Token。
-
-控制面的 HTTP 请求在进入路由 handler 之前，会先经过中间件链完成认证与产品线上下文注入，流程见下图。
-
-```mermaid
-flowchart TD
-    A[HTTP Request] --> B[MCRecovery]
-    B --> C[MCLogger]
-    C --> D[MCCors]
-    D --> E{Path Prefix}
-    E -->|/open-api/v1| F[McProductProbe]
-    F --> G[McUserProbe]
-    E -->|/inner-api/v1| G
-    G --> H{Endpoint 是否声明 Authorizer?}
-    H -->|是| I[AuthorizeManager.Authorizate]
-    H -->|否| J[Handler 执行]
-    I -->|通过| J
-    I -->|拒绝| K[返回 402 / 认证失败]
-```
-
-`McUserProbe` 读取 `Authorization` Header，按空格切分为 `Type` 和 `Identify`，调用 `AuthenticateManager.Authenticate` 得到 `Visitor` 并写入 context。若 Endpoint 声明了 `Authorizer`，则在子路由上挂载鉴权中间件，调用 `AuthorizeManager.Authorizate` 校验 Feature-Action 权限及产品线绑定。
-
-## 用户、Token 与 Scope 设计
-
-### 用户与 Token 共用表
-
-`users` 表同时存储两类记录，核心字段如下：
-
-| 字段 | 说明 |
-|------|------|
-| `id` | 主键 |
-| `name` | 用户名 / Token 名 |
-| `type` | `0`=用户，`1`=Token |
-| `password` | 用户密码（当前为明文存储） |
-| `ticket` | Session Key 或 Token 值 |
-| `ticket_created_at` | Session Key 创建时间 |
-| `scopes` | 权限作用域，多个用逗号拼接 |
-
-### 四种认证方式
-
-认证层定义了四种认证方式：
-
-```go
-const (
-    AuthTypePassword   = "Password" // 密码登录
-    AuthTypeSessionKey = "Session"  // Session Key 校验
-    AuthTypeToken      = "Token"    // 长期 Token 校验
-    AuthTypeSkip       = "Skip"     // 调试跳过
-)
-```
-
-| 方式 | 请求头示例 | 适用场景 | 是否写入 Session |
-|------|-----------|---------|----------------|
-| `Password` | `Authorization: Password <base64(user:pass)>` | 登录获取 Session Key | 是，生成新 Session Key 并写入 `ticket` |
-| `Session` | `Authorization: Session <session_key>` | 常规 OpenAPI 调用 | 否，仅校验 `ticket` 是否过期 |
-| `Token` | `Authorization: Token <token_value>` | 程序化调用 / InnerAPI | 否，Token 长期有效 |
-| `Skip` | `Authorization: Skip System` | 调试（需 `SkipTokenValidate=true`） | 否，生成伪造 Visitor |
-
-Session Key 由 15 字节随机数经 `base64.URLEncoding` 编码生成，有效期由 `RunTime.SessionExpireInDay` 控制。Token 本质上是 `type=1` 的一条记录，`ticket` 字段即为 Token 值，长期有效。
-
-### Feature-Action 权限模型
-
-权限由 **Feature（功能维度）** 和 **Action（操作维度）** 组合描述：
-
-```go
-type FeatureAuthorition struct {
-    Feature Feature
-    Action  Action
-}
-```
-
-`Feature` 为字符串，例如 `FeatureAPIKey`、`FeatureRoute`、`FeatureToken`。`Action` 使用位掩码：
-
-```go
-const (
-    ActionDeny    Action = 1 << iota // 000001
-    ActionRead                        // 000010
-    ActionReadAll                     // 000010（与 Read 同值）
-    ActionUpdate                      // 000100
-    ActionCreate                      // 001000
-    ActionDelete                      // 010000
-    ActionExport                      // 100000
-)
-```
-
-每个 `xreq.Endpoint` 通过 `Authorizer` 声明所需权限，例如 API-Key 创建接口声明为：
-
-```go
-var APIKeyCreateRoute = &xreq.Endpoint{
-    Path:   "/api-keys",
-    Method: http.MethodPost,
-    Authorizer: iauth.FA(iauth.FeatureAPIKey, iauth.ActionCreate),
-}
-```
-
-`FA(Feature, Action)` 仅校验 Feature-Action；`FAP(Feature, Action)` 额外校验 Visitor 与当前产品线的绑定关系。
-
-全局 `scope2permission` 定义了 Scope 到权限的映射：
-
-| Scope | 含义 | 权限范围 |
-|-------|------|---------|
-| `System` | 系统管理员 | 所有 Feature 的全部 Action |
-| `Support` | 导出/支持类 Token | 仅部分 Feature 拥有 `ActionExport` |
-
-`AuthorizeManager.Authorizate` 执行步骤如下：
-
-1. 从 context 取出 `Visitor`；
-2. 若 `Visitor.IsAdmin()` 为 true，直接放行；
-3. 遍历 `Visitor.GetScopes()`，在 `scope2permission` 中查找对应 Feature 的 Action 位图；
-4. 判断所需 Action 是否被允许；
-5. 若 `authorizer.ValidateProduct == true`，再调用 `IsVisitorProductGranted` 校验产品线绑定关系。
-
-> 注：当前 OpenAPI 已移除 `Product` Scope，用户 `is_admin` 仅支持 `true`，Token `scope` 仅保留 `System` 与 `Support`。`user_products` 表继续保留，供未来多租户扩展。
-
-## API-Key 的生成、校验与生命周期
-
-### 数据模型
-
-API-Key 是面向业务方的实际调用凭证，核心字段如下：
+API-Key 是业务系统调用大模型服务时使用的凭证，其核心字段如下：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -152,7 +28,13 @@ API-Key 是面向业务方的实际调用凭证，核心字段如下：
 | `subnet` | []string | 允许的客户端子网，`["*"]` 表示不限制 |
 | `entity_id` | string | 挂载的 Entity ID，为空表示未挂载 |
 
-### 生成与校验
+这些字段决定了 API-Key 在数据面是否可用、可调用的模型范围、可发起的客户端网络范围，以及是否受配额约束。`key` 字段是业务方实际放入 HTTP 请求头的凭证值，而 `id` 仅用于控制面内部关联。
+
+---
+
+## API-Key 的生成与校验
+
+### 生成规则
 
 创建 API-Key 时，可通过 `key` 参数导入外部已有 Key；若未传入，则由后台生成新的 Key 值。对 `key` 的合法性约束如下：
 
@@ -169,9 +51,21 @@ if param.Key != nil && *param.Key != "" {
 // 生成默认 Key 并绑定 QuotaPlan、RateLimitPolicy、RouteRules
 ```
 
-数据面 BFE 在转发请求时，通过 `mod_ai_token_auth` 模块校验 API-Key：检查 Key 是否有效、是否过期、是否在允许的子网内。校验通过后，再进入配额、限流、路由阶段。
+### 数据面校验
 
-### 生命周期
+数据面 BFE 在转发请求时，通过 `mod_ai_token_auth` 模块校验 API-Key：
+
+1. 从请求头 `Authorization: Bearer <api-key>` 中提取 Key 值；
+2. 检查 Key 是否存在于导出的 API-Key 配置中；
+3. 检查 `enabled` 是否为 true；
+4. 检查 `expired_time` 是否到达；
+5. 检查请求来源 IP 是否在 `subnet` 允许范围内。
+
+校验通过后，再进入配额、限流、路由阶段。任一校验失败都会返回对应的错误响应。
+
+---
+
+## API-Key 的生命周期
 
 API-Key 的生命周期由以下 OpenAPI 接口管理：
 
@@ -190,6 +84,8 @@ API-Key 的生命周期由以下 OpenAPI 接口管理：
 - `enabled=false` 或 `expired_time` 到达后，数据面校验失败，请求被拒绝；
 - 删除 API-Key 时，级联删除其专属的 `quota_plan`、`rate_limit_policy`、`route_rules` 及底层资源（若未被其他对象引用），并通过 `quotaCache.DeleteKeys` 清理对应 Redis Key；
 - 修改 `quota_plan.quota`（单位不变）时保留 `used`，按 `remaining = max(0, 新 quota - used)` 调整；修改 `unit` 或 `unlimited` 时重置 `used=0`。
+
+---
 
 ## Entity 层级树与模型继承
 
@@ -231,7 +127,9 @@ Entity 可以配置 `allow_models` 与 `block_models`，挂载到其上的 API-K
 - `rate_limit_policy_id`：限流策略；
 - `route_rules_id`：路由规则。
 
-这些策略与 API-Key 自身策略共同作用，形成多层策略叠加的效果。下节将说明导出到 BFE 时的合并逻辑。
+这些策略与 API-Key 自身策略共同作用，形成多层策略叠加的效果。
+
+---
 
 ## API-Key 与 Entity 的关联关系
 
@@ -267,6 +165,8 @@ flowchart BT
 - `RateLimitPolicy`；
 - `RouteRules`；
 - `Entity` 摘要（id、name、type）。
+
+---
 
 ## API-Key 与配额、限流、路由规则的绑定
 
@@ -313,22 +213,9 @@ AI 路由导出时，API-Key 按以下优先级绑定路由表：
 
 绑定顺序为 `apikey_xxx` → `entity_xxx`（直接 Entity）→ `entity_<parent>` → …… → `global_default`。BFE 按此顺序匹配，通常先命中 API-Key 级规则，再依次命中各级 Entity 规则，最后命中 Global 兜底规则。
 
+---
+
 ## 关键数据模型示例
-
-### `users` 表
-
-```sql
-CREATE TABLE users (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    name VARCHAR(255) NOT NULL COMMENT '用户名/Token名',
-    type TINYINT NOT NULL DEFAULT 0 COMMENT '0=用户, 1=Token',
-    password VARCHAR(255) DEFAULT NULL COMMENT '用户密码',
-    ticket VARCHAR(255) DEFAULT NULL COMMENT 'Session Key 或 Token 值',
-    ticket_created_at DATETIME DEFAULT NULL,
-    scopes VARCHAR(255) DEFAULT NULL COMMENT '权限作用域，逗号拼接',
-    UNIQUE KEY uk_name_type (name, type)
-);
-```
 
 ### `api_keys` 表
 
@@ -369,21 +256,38 @@ CREATE TABLE entities (
 );
 ```
 
+### `entity_types` 表
+
+```sql
+CREATE TABLE entity_types (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(64) NOT NULL UNIQUE,
+    level INT NOT NULL COMMENT '层级级别，数字越小级别越高',
+    create_time BIGINT NOT NULL,
+    update_time BIGINT NOT NULL
+);
+```
+
+---
+
 ## 本章小结
 
-本章介绍了壬远 AI 网关的认证授权体系与 API-Key 设计：
+本章详细介绍了壬远 AI 网关中最核心的调用凭证——API-Key：
 
-- **认证授权**：`model/iauth` 同时面向 OpenAPI 与 InnerAPI，用户与 Token 共用 `users` 表，通过 `Visitor` 统一抽象，采用 Feature-Action 位掩码权限模型。Session Key 有过期时间，Token 长期有效，调试场景支持 `Skip` 认证。
-- **API-Key 生命周期**：支持生成/导入、启用/禁用、过期、全量/部分更新、删除及配额重置。删除时会级联清理专属配置与 Redis Key。
-- **Entity 层级树**：Entity 按 Entity-Type Level 组织为树，支持模型白名单交集继承、黑名单并集继承，以及配额、限流、路由策略的向上层级合并。
-- **策略绑定**：API-Key 挂载到 Entity 后，数据面导出时会合并 API-Key 自身策略与 Entity 层级策略，形成最终生效的模型列表、多 Redis Key 配额、多限流策略以及多级路由绑定。
+- **数据模型**：`api_keys` 表记录了 Key 值、启用状态、过期时间、模型白名单、子网限制、挂载 Entity 等关键字段；
+- **生成与校验**：支持外部 Key 导入和后台生成，数据面 BFE 在 `mod_ai_token_auth` 中完成有效性、过期、子网等多维度校验；
+- **生命周期**：通过 OpenAPI 完成创建、查询、更新、删除、配额重置，删除时会级联清理专属配置与 Redis Key；
+- **Entity 继承**：API-Key 挂载到 Entity 后，继承 Entity 层级树上的模型白名单（交集）、黑名单（并集）、配额计划、限流策略和路由规则；
+- **策略绑定**：导出到 BFE 时，API-Key 自身策略与 Entity 层级策略合并，形成最终生效的多 Redis Key 配额、多限流策略和多级路由绑定。
 
-理解这些机制，有助于在后续章节中正确配置配额、限流与路由规则，并排查因 Entity 继承导致的权限与策略问题。
+理解 API-Key 的设计，是正确配置配额、限流与路由规则的基础，也是排查数据面权限与策略问题的关键。
+
+---
 
 ## 参考文档
 
-- `ai-gateway-api/design-docs/sys-design/details/认证授权机制.md`
 - `ai-gateway-api/design-docs/sys-design/details/API-Key与Entity关联及模型继承.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/api-keys.md`
-- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/auth.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/entities.md`
+- `ai-gateway-api/model/api_key/`
+- `ai-gateway-api/model/entity/`

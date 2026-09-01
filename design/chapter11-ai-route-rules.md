@@ -1,61 +1,35 @@
-# 第十章 AI 路由规则设计
+# 第十一章 AI 路由规则设计
 
 ## 本章目标
 
-AI 网关需要同时处理两类路由规则：一类负责把公网流量引入网关（产品级 BFE 路由规则），另一类负责在 API-Key 鉴权之后决定请求最终转发到哪个模型与集群（AI 路由规则）。本章将帮助读者：
+在 AI 网关场景下，请求的转发目标完全由 AI 路由规则决定。本章将帮助读者：
 
-- 区分产品级 BFE 路由规则与 AI 路由规则的职责边界；
+- 理解 AI 路由规则在请求处理链路中的位置；
 - 理解 Global / Entity / API-Key 三级 AI 路由表的组织方式；
 - 掌握 `route_rules` 表的数据模型、校验规则与生命周期一致性；
 - 了解 AI 路由规则如何导出到 BFE、绑定顺序与文件格式；
 - 掌握 Fallback 与默认路由的设计与配置方法。
 
-## 产品级 BFE 路由规则与 AI 路由规则的区别
+## AI 路由规则在请求处理链路中的位置
 
-在壬远 AI 网关中，"路由"被拆分为两个层次，分别由控制面（Control Plane）的不同管理器和数据面（Data Plane）的不同模块承载。
+在 AI 网关模式下，BFE 通过独立的 `ServeHTTPForAI()` 路径处理请求。该路径会调用 `findProduct()` 完成产品线识别，供中间件和配置加载使用，但**不会使用传统的产品级 BFE 路由规则来选择目标 Cluster**。请求最终转发到哪个模型与集群，完全由 `mod_ai_route` 模块根据 AI 路由规则决定。
 
-### 产品级路由规则（Product Route Rules）
-
-产品级路由规则是 BFE 原生的入口路由，负责把外部 HTTP 请求映射到某个 BFE Cluster。它只关心流量的第一层分发，不关心调用方身份或目标模型。其匹配维度包括：
-
-- 请求 Host
-- 请求 Path / Path 前缀 / 后缀
-- HTTP Method
-- Header 值
-- BFE 条件表达式（Condition），例如 `req_host_in("api.example.com")`
-- 请求体 JSON 字段，例如 `req_body_json_in("model", "gpt-4", false)`
-
-控制面中对应的管理器位于 `model/iroute_conf/`（`BasicRouteRule`、`AdvanceRouteRule`），导出后生成 BFE 原生的 `host_table.json`、`route_table.json`、`cluster_conf.json`。产品级路由规则决定请求是否进入 AI 网关 Cluster，是 AI 请求链路的起点。
-
-### AI 路由规则（AI Route Rules）
-
-AI 路由规则存储在 `route_rules` 表中，面向 API-Key / Entity / Global 三级，决定命中某条 API-Key 后请求应转发到哪个目标模型与集群。每条规则包含：
+AI 路由规则在 `HandleFoundProduct` 阶段执行，位于 `mod_ai_token_auth` 鉴权之后、`mod_ai_rate_limit` 限流之前。每条规则包含：
 
 - 命中条件 `Cond`；
 - 一个或多个 `targets`（集群 + 模型 + 权重）；
 - 可选的 `fallbacks`（降级目标列表）。
 
-AI 路由规则在 BFE 的 `HandleFoundProduct` 阶段由 `mod_ai_route` 模块执行，发生在 `mod_ai_token_auth` 鉴权之后。它不关心请求从哪个域名进来，只关心 API-Key 绑定的路由表以及请求本身是否满足规则条件。
-
-| 对比维度 | 产品级 BFE 路由规则 | AI 路由规则 |
-|---|---|---|
-| 决策时机 | `findProduct()` 阶段 | `HandleFoundProduct` 回调，鉴权后 |
-| 匹配维度 | Host、Path、Method、Header、BFE 条件表达式 | BFE 条件表达式（以请求体/Header 为主） |
-| 管理粒度 | 产品线（Product） | API-Key / Entity / Global |
-| 输出结果 | 单个 ClusterName | `targets` 列表 + `fallbacks` 列表 |
-| 数据载体 | `model/iroute_conf` | `route_rules` 表 |
-| 导出文件 | `host_table.json`、`route_table.json`、`cluster_conf.json` | `ai_route.json` / `ai_route.data` |
-
 ```mermaid
 flowchart LR
     Client -->|HTTPS| BFE[BFE 数据面]
-    BFE -->|产品级路由规则| AIGW[AI 网关 Cluster]
-    AIGW --> mod_auth[mod_ai_token_auth<br/>鉴权 / 配额]
+    BFE --> findProduct[findProduct\n仅用于识别产品]
+    findProduct --> mod_auth[mod_ai_token_auth<br/>鉴权 / 配额]
     mod_auth --> mod_route[mod_ai_route<br/>AI 路由规则]
     mod_route -->|targets / fallbacks| Backend[后端 AI 服务]
 ```
 
-上图展示了两层路由的协作关系：产品级规则决定请求是否进入 AI 网关；AI 路由规则决定请求最终访问哪个模型与集群。
+上图展示了 AI 网关模式下的请求链路：产品识别仅为中间件和配置上下文服务，真正的转发目标由 AI 路由规则决定。
 
 ## Global / Entity / API-Key 三级 AI 路由表
 
@@ -479,9 +453,9 @@ Global 路由表通常配置一条 `default_t()` 规则作为默认路由，确�
 
 ## 本章小结
 
-本章介绍了壬远 AI 网关的路由规则设计：
+本章介绍了壬远 AI 网关的 AI 路由规则设计：
 
-- 产品级 BFE 路由规则负责流量入口，AI 路由规则负责在 API-Key 鉴权后选择目标模型与集群；
+- 在 AI 网关模式下，请求转发目标完全由 AI 路由规则决定，传统产品级 BFE 路由规则不参与 Cluster 选择；
 - AI 路由表分为 Global、Entity、API-Key 三级，绑定顺序为 API-Key → Entity（自底向上）→ Global；
 - `route_rules` 表通过 `type` 和 `owner` 区分层级，规则以 JSON 数组形式存储；
 - 控制面在保存时校验规则名称、条件、权重与 Fallback，并与 API-Key / Entity 生命周期保持一致；

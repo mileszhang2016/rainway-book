@@ -1,4 +1,4 @@
-# 第二十九章 Token认证与配额模块实现：mod_ai_token_auth
+# 第三十章 Token认证与配额模块实现：mod_ai_token_auth
 
 ## 本章目标
 
@@ -618,5 +618,5 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 - `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`
 - `ai-gateway-api/design-docs/sys-design/details/配额余额同步机制.md`
 - `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`
-- [第十一章 配额与限流设计](../design/chapter11-quota-and-rate-limit.md)
-- [第二十章 API-Key 与配额配置](../operation/chapter20-apikey-and-quota-config.md)
+- [第二十一章 配额与限流设计](../design/chapter12-quota-and-rate-limit.md)
+- [第二十一章 API-Key 与配额配置](../operation/chapter21-apikey-and-quota-config.md)

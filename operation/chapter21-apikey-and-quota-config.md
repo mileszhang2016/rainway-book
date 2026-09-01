@@ -1,4 +1,4 @@
-# 第二十章 API-Key 与配额配置
+# 第二十一章 API-Key 与配额配置
 
 ## 本章目标
 
@@ -598,6 +598,6 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 - `ai-gateway-api/design-docs/sys-design/details/API-Key与Entity关联及模型继承.md`
 - `ai-gateway-api/design-docs/sys-design/details/配额余额同步机制.md`
 - `rainway-book/design/chapter08-auth-and-apikey.md`
-- `rainway-book/design/chapter11-quota-and-rate-limit.md`
+- `rainway-book/design/chapter12-quota-and-rate-limit.md`
 - `ai-gateway-api/model/quotacache/quotacache.go`
 - `ai-gateway-api/model/quota/quota_plan_manager.go`
