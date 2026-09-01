@@ -450,7 +450,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 完整配置示例
 
-以下为一个完整的部门级预算配置：部门拥有 5000 元/月的 RMB 预算，子项目拥有独立的 Token 配额，API-Key 挂载到项目并配置专用限流与路由。
+以下为一个完整的部门级预算配置：部门拥有 5000 元/月的 RMB 预算，子项目与 API-Key 均拥有独立的 RMB 预算，并配置专用限流与路由。
 
 ### 创建部门 Entity
 
@@ -489,8 +489,8 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
     "quota_plan": {
       "unlimited": false,
       "pass_when_no_enough_quota": false,
-      "quota": 100000000,
-      "unit": "total_token",
+      "quota": 3000.00,
+      "unit": "RMB",
       "reset_period": "monthly"
     },
     "rate_limit_policy": {
@@ -523,8 +523,8 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
     "quota_plan": {
       "unlimited": false,
       "pass_when_no_enough_quota": false,
-      "quota": 20000000,
-      "unit": "total_token",
+      "quota": 1000.00,
+      "unit": "RMB",
       "reset_period": "monthly"
     },
     "rate_limit_policy": {
@@ -560,8 +560,8 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 上述配置生效后，该 API-Key 将同时受到：
 
 - 部门级 5000 元/月 RMB 预算控制；
-- 项目级 1 亿 Token/月配额控制；
-- 自身 2000 万 Token/月配额控制；
+- 项目级 3000 元/月 RMB 预算控制；
+- 自身 1000 元/月 RMB 预算控制；
 - 项目级与自身限流策略；
 - 自身路由规则优先、项目级路由规则兜底；
 - 仅允许来自 `10.0.0.0/8` 子网的请求。

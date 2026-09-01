@@ -5,7 +5,7 @@
 通过本章，读者将理解：
 
 - 壬远AI网关如何通过 `QuotaPlan` 为 API-Key 与 Entity 分配 Token 或 RMB 两种单位的配额；
-- 为什么把 **Redis** 作为配额余额的唯一真实来源，以及管理面如何在不维护冷数据副本的情况下查询实时余额；
+- 为什么把 **Redis** 作为配额余额的唯一真实来源，以及管理面如何通过直接读取 Redis 查询实时余额；
 - 自然周、自然月的周期重置逻辑，以及 `last_reset_at` 在重置边界判断中的作用；
 - `RateLimitPolicy` 的 TPM、RPM、并发限制模型，以及策略如何按 Entity 层级向上合并并导出到 BFE；
 - RMB 配额如何结合 Provider 时段模板与 Model 分时段价格实现高峰/空闲差异化计费；
@@ -70,22 +70,10 @@ CREATE TABLE `quota_plans` (
 
 ## Redis 作为余额唯一真实来源
 
-### 核心矛盾
-
-配额消耗发生在请求链路（BFE 数据面实时扣减），需要高并发、低延迟；而管理面（AI Gateway API）需要向 OpenAPI 展示 `used` / `remaining`，又希望数据实时、一致。
-
-早期实现会维护一张 `quota_balances` 冷数据表，并通过定时任务把 Redis 中的剩余量回写到数据库。这种方案的问题在于：
-
-- 定时同步存在延迟，OpenAPI 查到的余额不是实时值；
-- 同步任务本身增加系统复杂度和出错概率；
-- 周期重置时需要同时更新两张表，容易不一致。
-
-### 新架构：Redis 唯一真实来源
-
-当前架构废弃了 `quota_balances` 表，由 Redis 直接作为余额的唯一真实来源：
+配额消耗发生在请求链路（BFE 数据面实时扣减），需要高并发、低延迟；而管理面（AI Gateway API）需要向 OpenAPI 展示 `used` / `remaining`，又希望数据实时、一致。因此，当前架构把 Redis 直接作为配额余额的唯一真实来源：
 
 - Redis 存储当前剩余配额，请求链路直接读写；
-- OpenAPI 查询余额时直接读取 Redis，不再维护冷数据副本；
+- OpenAPI 查询余额时直接读取 Redis；
 - `last_reset_at` 只保存在 `quota_plans` 表中，周期重置只操作这一张表；
 - 手动重置 / 周期重置时，同步更新 Redis 与 `quota_plans.last_reset_at`。
 
@@ -139,7 +127,7 @@ Key 不再拼接 `KeyCreateAt` 时间戳，生命周期与 API-Key / Entity 保�
 - `weekly`：自然周，每周一 00:00:00 重置；
 - `monthly`：自然月，每月 1 日 00:00:00 重置。
 
-`QuotaResetScheduler`（`ai-gateway-api/model/quota/scheduler.go`）每分钟执行一次 `ResetExpiredBalances`，仅对需要重置的计划进行处理，不再执行旧实现中的全量同步。
+`QuotaResetScheduler`（`ai-gateway-api/model/quota/scheduler.go`）每分钟执行一次 `ResetExpiredBalances`，仅对需要重置的计划进行处理。
 
 ### 重置边界判断
 
@@ -586,7 +574,7 @@ Model 价格：
 ## 本章小结
 
 - `QuotaPlan` 支持 `total_token` 与 `RMB` 两种配额单位，分别适用于按 Token 计费和按成本计费场景。RMB 配额在 Redis 内部以 1e-8 元定点整数存储，对外统一按 4 位小数展示。
-- Redis 是配额余额的唯一真实来源，OpenAPI 查询直接读取 Redis，不再维护 `quota_balances` 冷数据表；周期重置与手动重置都通过原子 `IncrBy(delta)` 完成，避免并发覆盖。
+- Redis 是配额余额的唯一真实来源，OpenAPI 查询直接读取 Redis；周期重置与手动重置都通过原子 `IncrBy(delta)` 完成，避免并发覆盖。
 - 周期重置支持 `weekly`（每周一）和 `monthly`（每月 1 日），由 `QuotaResetScheduler` 每分钟触发，基于 `last_reset_at` 判断周期边界；手动重置不更新 `last_reset_at`，避免干扰周期调度。
 - `RateLimitPolicy` 提供 TPM、RPM、并发数三类限制，规则支持具体模型名或 `*` 默认匹配；导出时按 Entity 层级向上合并，生成 `rate_limit_policies.json` 与 `api_key_rl_policy_bindings.json`。
 - 控制面为每条 TPM/RPM 规则生成稳定的 Redis Key（`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`），修改规则名或 `model` 不会导致计数器重置。

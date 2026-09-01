@@ -2,25 +2,26 @@
 
 ## 本章目标
 
-通过本章，读者将掌握壬远 AI 网关（Rainway AI Gateway）Dashboard 的访问方式、界面组织与基础操作流程，理解控制台背后的核心概念（产品、域名、实例池、Provider、Cluster、Entity 等），并能够独立完成首次配置。具体包括：
+通过本章，读者将掌握壬远 AI 网关（Rainway AI Gateway）Dashboard 的访问方式、界面组织与基础操作流程，理解控制台背后的核心概念（AI 网关实例池、模型服务商、AI 业务集群、Entity、API Key、路由表等），并能够独立完成首次配置。具体包括：
 
 - 如何登录 Dashboard 并修改默认账号；
 - 控制台各导航入口的职责与数据对应关系；
 - 用户、Token 与权限 Scope 的管理方式；
-- 全局配置视图与配置版本/变更记录的查看方法；
-- 从创建 Provider 到使流量生效的完整首次配置流程。
+- 控制台通用交互约定（抽屉表单、编辑模式、通知）；
+- 配置版本跟踪机制；
+- 从实例池登记到第一次 curl 调用成功的完整首次配置流程。
 
 ---
 
 ## Dashboard 访问方式与默认账号
 
-Dashboard 是壬远 AI 网关的管理控制台（Admin Console），它以 Web UI 形式调用 AI Gateway API 的 OpenAPI v1 接口，完成策略与配置的可视化管理。在本地或测试环境启动 AI Gateway API 后，默认可通过浏览器访问：
+Dashboard 是壬远 AI 网关的管理控制台（Admin Console），它以 Web UI 形式调用 AI Gateway API 的 OpenAPI v1 接口，完成策略与配置的可视化管理。在本地或测试环境启动 AI Gateway API 后，默认可通过浏览器访问登录页：
 
 ```
-http://api-server:8183/
+http://api-server:8183/login
 ```
 
-其中 `8183` 为 AI Gateway API 的服务端口（ServerPort），可在 `conf/ai_gateway_api.toml` 的 `[Server]` 段落中修改；监控端口（MonitorPort）默认为 `8284`，用于暴露指标与健康检查，不直接提供控制台界面。
+直接访问 `http://api-server:8183/` 未登录时也会重定向到登录页。其中 `8183` 为 AI Gateway API 的服务端口（ServerPort），可在 `conf/ai_gateway_api.toml` 的 `[Server]` 段落中修改；监控端口（MonitorPort）默认为 `8284`，用于暴露指标与健康检查，不直接提供控制台界面。
 
 首次登录时，系统预置管理员账号：
 
@@ -35,67 +36,75 @@ http://api-server:8183/
 
 ## 控制台界面导览
 
-Dashboard 的导航由 `/meta` 接口动态返回，对应 `conf/nav_tree.toml` 中定义的导航树。当前管理员（admin）视角下的主导航包括资源管理、路由管理、消费者管理、用户管理四大类，与 OpenAPI v1 的模块划分基本一致。界面布局通常如下：
+登录成功后，控制台呈现「左侧导航 + 右侧内容区」的布局。导航由 `/meta` 接口动态返回，对应 `conf/nav_tree.toml` 中定义的导航树。当前管理员视角下的主导航包括资源管理、消费者管理、路由管理、用户管理四大类：
 
 ```
-┌─────────────────────────────────────────────┐
-│  Logo / 产品名称                [用户头像 ▼]  │
-├──────────┬──────────────────────────────────┤
-│          │                                  │
-│ 资源管理  │  Provider 管理                   │
-│  · 实例池 │  · Cluster 管理                  │
-│  · Cluster│  · 模型定价管理                   │
-│  · 模型定价│                                  │
-│          ├──────────────────────────────────┤
-│ 路由管理  │  高级路由规则                     │
-│  · 高级规则│                                  │
-│          ├──────────────────────────────────┤
-│ 消费者管理 │  API-Key 管理                    │
-│  · API-Key│  · Entity 管理                   │
-│  · Entity │                                  │
-│          ├──────────────────────────────────┤
-│ 用户管理  │  用户 / Token 管理                │
-│          │                                  │
-└──────────┴──────────────────────────────────┘
+AI 网关
+├─ 资源管理
+│   ├─ AI 网关实例池      数据面转发引擎地址登记
+│   ├─ 模型服务商          实例池、协议、模型与 Keys
+│   ├─ AI 业务集群        引用服务商，配置转发策略
+│   └─ 模型定价           模型价格维护与费用核算
+├─ 消费者管理
+│   ├─ Entity 管理       类型 / 组织（配额、限流、模型访问控制）
+│   └─ API Key 管理      调用凭证签发与治理
+├─ 路由管理
+│   └─ 路由表            Global / Entity / API-Key 路由规则
+└─ 用户管理              控制台账号与 Token（管理员）
 ```
 
 每个导航项对应一组 OpenAPI 资源：
 
 | 导航项 | 对应 OpenAPI 端点 | 主要职责 |
 |--------|-------------------|----------|
-| Provider 管理 | `/providers` | 维护模型提供方、后端实例池、API-Key 明文与模型协议 |
-| Cluster 管理 | `/clusters` | 维护转发集群、LLM 配置、Key 权重与路由策略 |
-| 模型定价管理 | `/model-prices` | 维护模型在不同 provider 与 tier 下的价格 |
-| 高级路由规则 | `/global-route-rules` 等 | 维护 global / entity / api-key 三级路由规则 |
-| API-Key 管理 | `/api-keys` | 创建、启用/禁用、配额绑定与密钥查看 |
-| Entity 管理 | `/entities`、`/entity-types` | 维护组织架构、模型黑白名单、配额与限流策略 |
+| AI 网关实例池 | `/server-data`（导出侧） | 登记数据面 BFE 引擎地址，供控制面下发配置 |
+| 模型服务商 | `/providers` | 维护模型提供方、后端实例池、API-Key 明文与模型协议 |
+| AI 业务集群 | `/clusters` | 维护转发集群、LLM 配置、Key 权重与路由策略 |
+| 模型定价 | `/model-prices` | 维护模型在不同 provider 与 tier 下的价格 |
+| Entity 管理 | `/entity-types`、`/entities` | 维护组织类型、组织架构、模型黑白名单、配额与限流策略 |
+| API Key 管理 | `/api-keys` | 创建、启用/禁用、配额绑定与密钥查看 |
+| 路由表 | `/global-route-rules`、`/route-tables` 等 | 维护 global / entity / api-key 三级路由规则 |
 | 用户管理 | `/auth/users`、`/auth/tokens` | 维护控制台用户与机器 Token |
+
+### 通用交互约定
+
+- **列表页**：搜索区 + 操作按钮 + 表格 + 分页；多数列表支持「20 条/页」切换。
+- **抽屉表单**：创建 / 编辑在右侧抽屉完成，底部「提交 / 取消」（向导类为「下一步 / 上一步」）。
+- **编辑模式**：路由规则等高风险配置需先「进入编辑模式」，改完「本地保存」，再点「提交并生效」（提交后自动退出编辑模式），未提交的修改不影响线上流量。
+- **通知**：操作结果以右上角通知呈现；错误通知（如「数据重复」）不自动消失，点 × 关闭。
 
 ---
 
-## 产品/域名/实例池等基础概念
+## 控制台中的核心概念
 
-控制台中的诸多操作都围绕以下基础概念展开，理解它们是正确使用 Dashboard 的前提。
+控制台中的诸多操作都围绕以下概念展开，理解它们是正确使用 Dashboard 的前提。
 
-### 产品（Product）
+### AI 网关实例池
 
-产品（Product）是壬远 AI 网关中的顶层资源隔离单位，对应数据库中的 `products` 表。历史上它曾用于区分不同业务线，并在中间件 `McProductProbe` 中解析产品线上下文。当前版本中，控制台面向管理员时默认工作在单一产品视图下，后续若扩展多租户能力，产品将成为权限隔离与配置分组的基础。
+「AI 网关实例池」对应数据面 BFE 的引擎地址清单，用于登记哪些 BFE 节点可以从控制面拉取配置。它回答的是“配置要下发给谁”的问题，与 Provider 中的后端实例池（`instance_pool`）含义不同：前者是数据面入口，后者是上游模型服务端点。
 
-### 域名（Domain）
+### 模型服务商（Provider）
 
-域名（Domain）对应 `domains` 表，是流量进入 BFE 数据面的入口标识。控制面在导出 Server Data 配置时，会将域名、基础/高级路由规则与集群配置组装成 BFE 可消费的 `HostTable`、`RouteTable` 与 `ClusterConf`。Dashboard 中的路由规则配置最终都会映射到具体的域名命中条件上。
+「模型服务商」对应 OpenAPI 的 `/providers` 资源，回答“下游是谁、能访问哪些模型、如何认证、后端在哪里”的问题。它持有：
 
-### 实例池（Instance Pool）
+- 后端实例池（`instance_pool`）：真实 AI 服务端点；
+- 模型协议（`model_protocols`）：如 `openai`；
+- 模型列表（`models`）与模型发现端点；
+- 服务鉴权 Key 明文（`keys`）。
 
-实例池（Instance Pool）在 Provider 数据模型中通过 `instance_pool` 字段定义，描述下游 AI 服务的真实后端地址、端口与权重。与早期将实例信息直接写在 Cluster 中不同，当前架构把实例池收敛到 Provider 中，供多个 Cluster 复用。创建或更新 Provider 时，控制面会根据 `instance_pool` 自动生成实例池、子集群并完成绑定；修改 Provider 的实例池时，也会同步刷新引用该 Provider 的所有 Cluster 所生成的实例池。
+多个 Cluster 可以引用同一个 Provider，实现实例池与密钥的复用。
 
-### Provider 与 Cluster
+### AI 业务集群（Cluster）
 
-Provider（提供商）回答“下游是谁、能访问哪些模型、如何认证、后端在哪里”的问题；Cluster（集群）回答“流量如何转发、用哪些模型、Key 权重如何分配”的问题。二者解耦后，Cluster 通过 `llm_config.provider` 强引用 Provider，而 Provider 可以被多个 Cluster 共享。详细设计动机与数据模型参见 [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)。
+「AI 业务集群」对应 OpenAPI 的 `/clusters` 资源，回答“流量如何转发、用哪些模型、Key 权重如何分配”的问题。它通过 `llm_config.provider` 强引用 Provider，并在此之上声明转发模型、Key 权重、超时、健康检查等策略。详细设计动机与数据模型参见 [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)。
 
-### Entity 与 API-Key
+### Entity 组织与 API Key
 
-Entity（实体）用于表达组织架构，例如部门、团队或项目。每个 Entity 拥有独立的模型白名单/黑名单、配额计划（QuotaPlan）、限流策略（RateLimitPolicy）与路由规则。API-Key 则是调用方访问 AI 网关的凭证，可与 Entity 关联以继承其配额与限流策略，也可拥有独立的 api-key 级路由规则。
+「Entity 管理」用于表达组织架构，例如部门、团队或项目。每个 Entity 拥有独立的模型白名单/黑名单、配额计划（QuotaPlan）、限流策略（RateLimitPolicy）与路由规则。「API Key 管理」用于签发调用凭证，API Key 可挂载到 Entity 以继承其配额与限流策略，也可拥有独立的 API-Key 级路由规则。
+
+### 路由表
+
+「路由表」对应 Global / Entity / API-Key 三级路由规则。请求进入数据面后按 **API-Key > Entity > Global** 顺序匹配：先查该 Key 的专属表，未命中再查 Key 挂载组织的表，最后回落 Global。路由规则中的 `cond` 为 BFE 条件表达式，`targets` 指定目标集群与权重，`fallbacks` 指定降级目标。
 
 ---
 
@@ -105,29 +114,40 @@ Dashboard 的用户与权限由 `/auth` 接口族管理，相关定义详见 `ai
 
 ### 用户（User）
 
-用户是登录 Dashboard 的自然人账号，当前版本仅支持管理员用户（`is_admin=true`），即拥有 System 权限。创建用户时需要指定 `user_name`、`password` 与 `is_admin`；密码不能等于用户名或其逆序。管理员可通过 Dashboard 的“用户管理”入口完成新增、删除与密码重置。
+用户是登录 Dashboard 的自然人账号，当前版本仅支持系统管理员角色。创建用户时需要指定用户名、密码与确认密码：
+
+- 用户名最多 64 字符，仅允许字母、数字、点（`.`）、下划线（`_`）、中划线（`-`），不能以点、下划线、中划线开头或结尾；保留名 `admin`、`root`、`system` 不可用。
+- 密码 8–128 字符，不能包含空格，不能与用户名相同或为其逆序。
+
+管理员可通过 Dashboard「用户管理 → 用户」页签完成新增、删除与密码重置。修改自己密码时需要填写原密码，提交成功后自动退出登录；修改他人密码无需原密码。
 
 ### Session Key 与 Token
 
 - **Session Key**：由 `/auth/session-keys` 根据用户名和密码生成，用于 Dashboard 登录后的请求鉴权，格式为 `Authorization: Session {session_key}`。Session 有过期时间，默认由 `SessionExpireInDay` 控制。
-- **Token**：由 `/auth/tokens` 创建，主要用于机器调用或数据面组件（如 Conf Agent、BFE）访问 InnerAPI。Token 分为两种 Scope：
-  - `System`：全部权限，包括全局配置、产品线资源和导出资源；
-  - `Support`：仅导出类资源，供 BFE 数据面模块导出配置。
+- **Token**：由 `/auth/tokens` 创建，是内部程序访问 API Server（管理面 API 服务，非数据面转发入口）的鉴权凭证。Token 分为两种 Scope：
+  - **系统管理（System）**：拥有所有资源的完整管理权限；
+  - **内部支持（Support）**：仅可导出部分资源的数据，适用于内部运维排查、数据备份等只读场景，不可创建、编辑或删除任何资源。
 
 生产环境中，应为 Dashboard 操作人员创建独立用户，为 Conf Agent 等机器客户端创建 `Support` Scope 的专用 Token，避免使用 `System` Token 直接暴露给数据面。
 
 ---
 
-## 全局配置视图
+## 核心模块速查
 
-Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键资源状态，通常包括：
+控制台各模块通过独立的列表页与表单页完成管理。以下是常用模块的入口与职责：
 
-- **路由表（Route Table）**：通过 `/route-tables` 查看 `global`、`entity`、`api_key` 三类路由表的启用状态与所有者；
-- **Global 路由规则**：通过 `/global-route-rules` 查看或编辑全局默认路由，决定未命中其他规则时的流量去向；
-- **Provider / Cluster 列表**：展示已配置的 Provider、Cluster 及其健康状态引用关系；
-- **API-Key / Entity 列表**：展示已发放的 API-Key、关联的 Entity 与配额余额。
+| 模块路径 | 列表页能力 | 关键操作 |
+|----------|-----------|---------|
+| 资源管理 → AI 网关实例池 | 查看已登记的数据面 BFE 地址 | 新增、编辑、删除实例池 |
+| 资源管理 → 模型服务商 | 查看 Provider 列表与引用关系 | 创建 Provider、维护实例池 / 模型 / Keys |
+| 资源管理 → AI 业务集群 | 查看 Cluster 列表及所属服务商 | 创建 Cluster、配置转发策略、Key 权重 |
+| 资源管理 → 模型定价 | 查看模型价格列表 | 导入 / 编辑模型价格、维护 Provider 时段模板 |
+| 消费者管理 → Entity 管理 | 查看 Entity 类型与组织树 | 创建类型 / 组织、配置配额 / 限流 / 模型访问控制 |
+| 消费者管理 → API Key 管理 | 查看 API Key 列表及挂载组织 | 创建 Key、重置配额、查看密钥 |
+| 路由管理 → 路由表 | 查看 Global / Entity / API-Key 三级路由表 | 启用 / 禁用路由表、编辑路由规则 |
+| 用户管理 | 查看控制台用户与 Token | 创建用户、创建 Token、修改密码 |
 
-全局路由规则示例（JSON 视图）如下：
+路由规则示例（JSON 视图）如下：
 
 ```json
 {
@@ -149,68 +169,90 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 }
 ```
 
-其中 `cond` 为 BFE 条件表达式，`targets` 中同一规则的权重之和必须等于 100，`fallbacks` 用于指定降级目标。
+其中 `cond` 为 BFE 条件表达式，`targets` 中同一规则的权重之和必须等于 100，`fallbacks` 用于指定降级目标。路由规则编辑需先进入编辑模式，本地保存后再提交生效。
 
 ---
 
-## 配置版本与变更记录查看
+## 配置版本跟踪机制
 
-壬远 AI 网关采用基于 MD5 签名与版本号的配置导出机制，详细设计参见 [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)。在 Dashboard 中，管理员可以在“全局配置”或“版本管理”入口查看以下信息：
+壬远 AI 网关采用基于 MD5 签名与版本号的配置导出机制，详细设计参见 [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)。控制面为每类配置主题（Topic）维护当前版本号与签名，例如 `route_rule`、`ai_route`、`mod_api_key_rule` 等：
 
-- **配置主题（Topic）**：如 `route_rule`、`ai_route`、`mod_api_key_rule` 等；
 - **当前版本号**：格式为 `YYYYMMDDHHMMSS`，例如 `20260102120000`；
 - **MD5 签名**：对配置内容（版本号置零后）计算得出的签名；
-- **最近变更时间**：签名变化即视为一次有效配置变更；
-- **与上一版本的差异**：部分视图支持对比两次导出之间的配置差异。
+- **最近变更时间**：签名变化即视为一次有效配置变更。
 
-该机制保证：若配置内容未发生变化，Conf Agent 拉取时返回 `Data: null`，避免无意义的热加载；一旦内容变化，控制面会生成新的版本号并返回全量配置，BFE 据此完成热更新。
+该机制保证：若配置内容未发生变化，Conf Agent 拉取时返回 `Data: null`，避免无意义的热加载；一旦内容变化，控制面会生成新的版本号并返回全量配置，BFE 据此完成热更新。配置版本信息主要通过 InnerAPI 暴露给 Conf Agent 与运维排查工具，Dashboard 当前重点面向资源管理，版本详情可参考控制面日志或 InnerAPI 导出接口。
 
 ---
 
 ## 通过 Dashboard 进行首次配置的完整流程
 
-以下是一个从空环境到流量可转发的最小配置流程，适用于首次使用 Dashboard 的读者。
+以下是一个从空环境到第一次调用成功的最小配置流程，对应控制台真实导航入口。更详细的字段说明与截图可参考 `ai-gateway-web/docs/zh-cn/11-scenarios.md`。
 
 ### 步骤 1：登录并修改默认密码
 
-使用默认账号 `admin/admin` 登录后，进入“用户管理”，将 `admin` 密码修改为强密码，并根据团队需要新建其他管理员账号。
+使用默认账号 `admin/admin` 登录后，进入「用户管理 → 用户」，将 `admin` 密码修改为强密码，并根据团队需要新建其他管理员账号。
 
-### 步骤 2：创建 Provider
+### 步骤 2：确认 AI 网关实例池
 
-进入“Provider 管理”，点击创建，填写：
+进入「资源管理 → AI 网关实例池」，确认已登记数据面 BFE 引擎地址。单机部署时通常已有一条默认记录；若为空，点击编辑新增一行，填写 BFE 所在机器的 IP 与端口（默认 `8080`）。
 
-- `name`：Provider 唯一标识，例如 `deepseek`；
-- `model_endpoint`：模型发现端点，默认 `https://api.deepseek.com/v1/models`；
-- `models`：支持的模型列表，例如 `["deepseek-chat"]`；
-- `keys`：后端认证 key 的明文，例如 `{ "name": "key-primary", "key": "sk-..." }`；
-- `instance_pool`：后端实例，例如 `{ "addr": "api.deepseek.com", "port": 443, "weight": 100 }`；
-- `model_protocols`：协议类型，例如 `["openai"]`。
+> 注意：此处登记的是数据面转发引擎地址，不是后端模型服务地址。
 
-创建成功后，控制面会自动根据 `instance_pool` 生成实例池和子集群。
+### 步骤 3：创建模型服务商
 
-### 步骤 3：创建 Cluster
+进入「资源管理 → 模型服务商」，点击「创建服务商」：
 
-进入“Cluster 管理”，创建 Cluster 并引用上一步的 Provider：
+- 名称：Provider 唯一标识，例如 `demo-provider`；
+- 实例池：后端模型服务的 IP / 端口 / 权重，例如 `172.19.1.187:13801`；
+- 模型协议：如 `openai`；
+- 服务鉴权 Keys：若后端需要鉴权则填写 Key 名称与明文；
+- 模型列表：点击「获取」拉取可用模型并选择，例如 `doubao-pro-32k`。
 
-- `name`：Cluster 唯一标识，例如 `deepseek-cluster`；
-- `llm_config.provider`：选择 `deepseek`；
-- `llm_config.models`：选择该 Cluster 可转发的模型子集；
-- `llm_config.keys`：引用 Provider 中的 key 并设置权重，权重之和须为 100；
-- `basic`、`sticky_sessions`、`passive_health_check`：按需调整，未传时使用 AI 网关场景默认值。
+创建成功后，控制面会自动根据实例池生成后端实例池和子集群。
 
-### 步骤 4：配置 Global 路由规则
+### 步骤 4：创建 AI 业务集群
 
-进入“高级路由规则”或“Global 路由规则”，启用默认规则并指定转发目标为 `deepseek-cluster`。例如：
+进入「资源管理 → AI 业务集群」，点击「创建集群」，按向导分步完成：
+
+1. **基础配置**：填写集群名称、协议、是否启用会话保持；
+2. **超时和重传**：通常保持默认值；
+3. **被动健康检查**：通常保持默认；
+4. **所属服务商与模型**：选择上一步创建的 Provider，并勾选允许转发的模型；
+5. **Key 权重**：引用 Provider 中的 Key 并设置权重，权重之和须为 100。
+
+提交后列表出现新集群即表示创建成功。
+
+### 步骤 5：创建 Entity 组织（可选）
+
+如需按组织统一配置配额、限流或模型访问控制，进入「消费者管理 → Entity 管理」：
+
+- 先创建 Entity 类型（如 `team`）；
+- 再创建 Entity 组织（如 `dev-team`），并绑定配额计划、限流策略与模型黑白名单。
+
+### 步骤 6：签发 API Key
+
+进入「消费者管理 → API Key 管理」，点击「创建」：
+
+- 名称：API Key 标识；
+- 所属组织：选择步骤 5 中创建的 Entity（可选）；
+- 过期时间、允许子网、允许模型等按需填写。
+
+创建成功后，Dashboard 会展示该 API Key 的明文，请务必妥善保存，后续无法再次查看完整密钥。
+
+### 步骤 7：配置 API-Key 路由规则
+
+进入「路由管理 → 路由表」，找到该 API Key 对应的 `apikey` 路由表，进入编辑模式并添加规则。例如：
 
 ```json
 {
   "enabled": true,
   "rules": [
     {
-      "name": "default-to-deepseek",
-      "cond": "default_t()",
+      "name": "default-to-demo",
+      "cond": "req_path_prefix_in(\"/\", false)",
       "targets": [
-        { "cluster_name": "deepseek-cluster", "model": "", "weight": 100 }
+        { "cluster_name": "demo-cluster", "model": "", "weight": 100 }
       ],
       "fallbacks": []
     }
@@ -218,17 +260,21 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 }
 ```
 
-### 步骤 5：创建 API-Key（可选但推荐）
+本地保存后点击「提交并生效」，未提交前不会影响线上流量。
 
-进入“API-Key 管理”，创建供客户端调用的 API-Key，并可选择关联 Entity 以继承配额与限流策略。创建完成后，Dashboard 会展示该 API-Key 的密钥，请务必妥善保存。
-
-### 步骤 6：验证配置生效
+### 步骤 8：验证配置生效
 
 完成以上步骤后，可通过以下方式验证：
 
-1. 在 Dashboard 的“版本管理”中查看 `ai_route`、`route_rule` 等 Topic 的版本号是否已更新；
-2. 触发 Conf Agent 拉取或等待其定时轮询，确认 BFE 已完成热加载；
-3. 使用 curl 或客户端发送请求，验证流量是否按 Global 规则转发到 `deepseek-cluster`。
+1. 触发 Conf Agent 拉取或等待其定时轮询，确认 BFE 已完成热加载；
+2. 使用 curl 发送请求，验证流量是否按规则转发到目标集群：
+
+```bash
+curl -H "Authorization: <API Key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"doubao-pro-32k","messages":[{"role":"user","content":"hello"}]}' \
+  http://<bfe-address>:8080/v1/chat/completions
+```
 
 ---
 
@@ -237,13 +283,13 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 在使用 Dashboard 进行日常运维时，应注意以下事项：
 
 1. **默认账号安全**：`admin/admin` 仅用于首次登录，生产环境必须立即修改密码并限制访问来源。
-2. **权限模型现状**：当前版本用户只有 `System` 权限，暂不支持非管理员用户。若未来版本引入 `Support` 等更多角色，应按最小权限原则分配。
-3. **Token 管理**：为 Conf Agent 或自动化脚本创建 Token 时，优先使用 `Support` Scope，避免使用 `System` Token 进行只读导出操作。
-4. **Provider 变更的级联影响**：修改 Provider 的 `instance_pool`、`keys` 或 `models` 会触发引用它的 Cluster 同步更新；删除 Provider 前必须确保无 Cluster 引用，否则将返回 `409 Conflict`。
-5. **Cluster 删除的引用检查**：删除 Cluster 前，系统会检查其是否被 Global / Entity / API-Key 路由规则引用；若被引用，需先解除引用或修改规则。
+2. **权限模型现状**：当前版本控制台用户固定为系统管理员角色；Token 分为 `System`（完整管理权限）与 `Support`（只读导出权限）。为 Conf Agent 或自动化脚本创建 Token 时，优先使用 `Support` Scope。
+3. **Provider 变更的级联影响**：修改 Provider 的实例池、Keys 或模型列表会触发引用它的 Cluster 同步更新；删除 Provider 前必须确保无 Cluster 引用，否则将返回 `409 Conflict`。
+4. **Cluster 删除的引用检查**：删除 Cluster 前，系统会检查其是否被 Global / Entity / API-Key 路由规则引用；若被引用，需先解除引用或修改规则。
+5. **路由规则编辑模式**：路由表配置需先「进入编辑模式」，本地保存后再「提交并生效」。未提交的修改不影响线上流量，提交后才会生成新版本并触发 Conf Agent 拉取。
 6. **配置生效延迟**：Dashboard 中的修改写入 MySQL 后，需经 Conf Agent 拉取并触发 BFE 热加载才能生效。不要期望配置保存后立即在数据面生效。
 7. **版本号变化才代表真实变更**：即使多次点击保存，只要配置内容的 MD5 签名未变，`config_versions` 中的版本号就不会增加，数据面也不会重新加载。
-8. **API-Key 明文只显示一次**：创建 API-Key 时，Dashboard 通常只会在创建成功后展示一次密钥，后续无法再次查看完整明文，请妥善保管。
+8. **API-Key 明文只显示一次**：创建 API Key 时，Dashboard 通常只会在创建成功后展示一次密钥，后续无法再次查看完整明文，请妥善保管。
 
 ---
 
@@ -251,14 +297,14 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 
 本章介绍了壬远 AI 网关 Dashboard 的基础操作。主要内容包括：
 
-- Dashboard 默认通过 `http://api-server:8183/` 访问，初始账号为 `admin/admin`；
-- 控制台导航由 `/meta` 动态返回，覆盖资源管理、路由管理、消费者管理与用户管理四大模块；
-- 产品、域名、实例池、Provider、Cluster、Entity、API-Key 是控制台中的核心概念，理解它们的职责与引用关系是正确配置的前提；
+- Dashboard 默认通过 `http://api-server:8183/login` 访问，初始账号为 `admin/admin`；
+- 控制台导航为「左侧导航 + 右侧内容区」，覆盖资源管理、消费者管理、路由管理、用户管理四大模块；
+- AI 网关实例池、模型服务商、AI 业务集群、模型定价、Entity 组织、API Key、路由表是控制台中的核心概念，理解它们的职责与引用关系是正确配置的前提；
+- 控制台采用抽屉表单、列表页、编辑模式等通用交互，路由规则需先本地保存再提交生效；
 - 用户、Session Key、Token 构成 Dashboard 与 API 的鉴权体系，Token 分为 `System` 与 `Support` 两种 Scope；
-- 全局配置视图可纵览路由表、Global 路由规则与各类资源；
-- 配置版本基于 MD5 签名与 `YYYYMMDDHHMMSS` 版本号实现增量同步；
-- 首次配置应按照“Provider → Cluster → Global 路由规则 → API-Key → 验证生效”的顺序进行；
-- 日常运维需注意默认账号安全、级联引用检查、配置生效延迟与 Token 最小权限原则。
+- 配置版本基于 MD5 签名与 `YYYYMMDDHHMMSS` 版本号实现增量同步，主要暴露给 InnerAPI 与 Conf Agent；
+- 首次配置应按照“实例池 → 模型服务商 → AI 业务集群 → Entity（可选） → API Key → 路由规则 → curl 验证”的顺序进行；
+- 日常运维需注意默认账号安全、级联引用检查、路由规则编辑模式、配置生效延迟与 Token 最小权限原则。
 
 掌握本章内容后，读者即可在 Dashboard 中完成壬远 AI 网关的初始化和基础管理操作，为后续章节中 Provider、Cluster、API-Key、限流等专项配置打下基础。
 
@@ -273,6 +319,9 @@ Dashboard 的“全局配置视图”帮助管理员纵览当前系统的关键�
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/clusters.md`
 - `ai-gateway-api/conf/ai_gateway_api.toml`
 - `ai-gateway-api/conf/nav_tree.toml`
+- `ai-gateway-web/docs/zh-cn/00-README.md`
+- `ai-gateway-web/docs/zh-cn/02-overview.md`
+- `ai-gateway-web/docs/zh-cn/11-scenarios.md`
 - [第六章 控制面核心设计：AI Gateway API](../design/chapter06-control-plane-design.md)
 - [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)
 - [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)

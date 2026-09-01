@@ -197,7 +197,7 @@ OpenAPI 层面额外要求：
 - `model` 若不为空，必须是该集群 `llm_config.models` 中已配置的模型；
 - 同一 `targets` 数组内 `(cluster_name, model)` 组合不能重复。
 
-> 注意：当前保存阶段并未强制对 `cond` 做 BFE 表达式语法校验，建议在持久化前调用 `RouteRuleManager.ExpressionVerify` 进行校验，避免下发到 BFE 后解析失败。
+> 注意：保存阶段会通过 `validate.ConditionExpression` 对 `cond` 做 BFE 表达式语法校验（内部调用 `condition.Build`），语法错误的表达式无法写入数据库。Dashboard 或 `RouteRuleManager.ExpressionVerify` 也提供了同样的前置校验能力。
 
 ### 生命周期一致性
 

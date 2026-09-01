@@ -121,7 +121,7 @@ graph TD
 
 - **QuotaPlan 配额计划**：支持 `unit = total_token` 与 `unit = RMB` 两种单位，可配置总量、重置周期（`weekly`/`monthly`/`never`）以及余额不足时是否放行。RMB 配额内部精度为 8 位小数，对外统一按 4 位小数展示，配合 `model-prices` 数据实现成本核算。
 - **RateLimitPolicy 限流策略**：支持 TPM、RPM 与最大并发数限制，可绑定到 API-Key 或 Entity，并与 Entity 层级向上递归合并，实现组织层面的统一限流。
-- **Redis 作为余额唯一真实来源**：请求链路直接对 `QUOTA_<key>` 做原子扣减，管理面查询余额时直接读取 Redis，不再维护 `quota_balances` 冷数据副本。周期重置通过 `IncrBy(delta)` 原子调整剩余量，避免并发场景下 `SET` 操作覆盖刚刚扣减的计数。
+- **Redis 作为余额唯一真实来源**：请求链路直接对 `QUOTA_<key>` 做原子扣减，管理面查询余额时直接读取 Redis。周期重置通过 `IncrBy(delta)` 原子调整剩余量，避免并发场景下 `SET` 操作覆盖刚刚扣减的计数。
 
 | 需求 | AI 网关机制 | 关键配置 |
 |------|------------|---------|

@@ -269,7 +269,7 @@ flowchart LR
     C -- 有变化 --> E[返回新配置 + 新版本]
     E --> F[file_store 写入新版本目录]
     F --> G[切换 symlink mod_xxx]
-    G --> H[trigger 调用 BFE /reload/{module}]
+    G --> H[trigger 调用 BFE /reload/模块名]
     H --> I[BFE 热加载生效]
 ```
 

@@ -6,7 +6,7 @@
 
 - 准备 AI Gateway 运行所需的硬件、软件与依赖环境。
 - 通过源码编译出可执行二进制并完成本地启动。
-- 初始化 MySQL 或 SQLite 数据库，配置最小可运行的控制面参数。
+- 初始化 MySQL 或 SQLite 数据库，配置 Redis 依赖与最小可运行的控制面参数。
 - 构建 Docker 镜像并在容器环境中运行 AI Gateway API。
 - 在 Kubernetes 集群中部署控制面与数据面组件。
 - 理解 AI Gateway API、BFE 与 Conf Agent 的启动顺序与协作关系。
@@ -53,9 +53,9 @@ flowchart LR
 |---|---|---|
 | Go | 1.22 或更高 | 源码编译需要 |
 | MySQL | 8.0 | 生产环境推荐；亦支持 SQLite |
-| Redis | 6.2 | 会话与缓存 |
+| Redis | 6.2 | 配额余额、限流计数、会话缓存等运行时状态 |
 
-MySQL 用于持久化存储 API 配置、租户、路由、证书、API-Key 等核心数据。Redis 用于会话缓存和限流计数等运行时状态。在单机验证场景中，可以使用 SQLite 替代 MySQL，但 SQLite 不支持高并发写入，请勿用于生产环境。
+MySQL 用于持久化存储 API 配置、租户、路由、证书、API-Key 等核心数据。Redis 是 AI 网关运行时的关键依赖：配额余额、RPM/TPM 限流计数、会话缓存等高频状态都直接读写 Redis。在单机验证场景中，可以使用 SQLite 替代 MySQL，但 SQLite 不支持高并发写入，请勿用于生产环境；Redis 不建议用 SQLite 替代。
 
 ### 数据面 BFE
 
@@ -253,6 +253,14 @@ RecordSQL          = false
 SessionExpireInDay = 10
 StaticFilePath     = "./static"
 Debug              = false
+
+[RedisConf]
+# Redis 逻辑名，需在 name_conf.data 中解析为真实地址
+Bns            = "example.redis.cluster"
+ConnectTimeout = 10
+ReadTimeout    = 5
+WriteTimeout   = 5
+MaxIdle        = 10
 ```
 
 ### 关键配置项说明
@@ -263,11 +271,34 @@ Debug              = false
 | `[Server]` | `MonitorPort` | 监控端口，默认 8284 |
 | `[Loggers.access]` | `LogLevel` | 访问日志级别 |
 | `[Databases.bfe_db]` | `Addr`、`User`、`Passwd` | 数据库连接 |
+| `[RedisConf]` | `Bns` | Redis 逻辑名，由 `name_conf.data` 解析为真实地址 |
+| `[RedisConf]` | `ConnectTimeout`、`ReadTimeout`、`WriteTimeout` | Redis 连接与读写超时（毫秒） |
 | `[Depends]` | `NavTreeFile`、`I18nDir` | 导航与国际化路径，支持 `${conf_dir}` 变量 |
 | `[RunTime]` | `StaticFilePath` | Dashboard 静态资源路径 |
 | `[RunTime]` | `SkipTokenValidate` | 调试用途，生产环境必须设为 `false` |
 
 在实际部署时，建议将配置文件纳入版本控制进行管理，但应通过环境变量或 Secret 注入数据库密码等敏感信息，避免在配置文件中直接写入明文密码。详细参数说明请参考 `ai-gateway-api/docs/zh_cn/config_param.md`。
+
+### Redis 地址解析
+
+`[RedisConf].Bns` 填写的是 Redis 逻辑名，真实地址需要在 `conf/name_conf.data` 中配置。该文件采用 BFE 命名服务格式：
+
+```json
+{
+    "Version": "init version",
+    "Config": {
+        "example.redis.cluster": [
+            {
+                "Host": "127.0.0.1",
+                "Port": 6379,
+                "Weight": 10
+            }
+        ]
+    }
+}
+```
+
+启动时，AI Gateway API 根据 `Bns` 查找 `name_conf.data` 中对应的主机列表，建立 Redis 连接。如果 Redis 使用集群或哨兵模式，可在此配置多个地址并分配权重；生产环境建议配合 Redis 密码与 TLS 连接，并通过网络策略限制访问源。
 
 ## Docker 镜像构建与容器部署
 
@@ -365,7 +396,16 @@ data:
     SessionExpireInDay = 10
     StaticFilePath     = "./static"
     Debug              = false
+
+    [RedisConf]
+    Bns            = "example.redis.cluster"
+    ConnectTimeout = 10
+    ReadTimeout    = 5
+    WriteTimeout   = 5
+    MaxIdle        = 10
 ```
+
+同时需要在 ConfigMap 中挂载 `name_conf.data`，将 `example.redis.cluster` 解析到实际 Redis 地址。
 
 ### Deployment
 
@@ -631,12 +671,13 @@ chmod -R 755 log conf static
 
 ### 7. Redis 连接失败
 
-**现象**：登录后提示会话异常或无法保持登录状态。
+**现象**：登录后提示会话异常、配额余额不更新、限流策略不生效，或日志中出现 Redis 连接错误。
 
 **排查步骤**：
 
 - 检查 Redis 服务是否启动并监听正确端口。
-- 确认 `ai_gateway_api.toml` 中 Redis 连接配置正确。
+- 确认 `ai_gateway_api.toml` 中 `[RedisConf]` 配置正确，特别是 `Bns` 逻辑名。
+- 确认 `conf/name_conf.data` 中存在 `Bns` 对应的地址映射，且 `Host` / `Port` 与实际 Redis 实例一致。
 - 测试 Redis 连通性：
 
 ```bash
@@ -647,10 +688,10 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 
 本章系统介绍了壬远 AI 网关的安装部署流程：
 
-- 控制面依赖 Go 1.22、MySQL 8 与 Redis 6.2，数据面 BFE 与 Conf Agent 需同机部署。
+- 控制面依赖 Go 1.22、MySQL 8 与 Redis 6.2；Redis 用于配额余额、限流计数和会话缓存，是运行时关键依赖。数据面 BFE 与 Conf Agent 需同机部署。
 - 使用 `make` 即可完成 AI Gateway API 的源码编译与打包。
 - 数据库支持 MySQL 与 SQLite，生产环境推荐使用 MySQL，并设置字符集为 `utf8mb4`。
-- 最小可运行配置只需调整数据库连接信息，其他配置项可保持默认值。
+- 最小可运行配置需调整数据库连接与 Redis 逻辑名；Redis 真实地址通过 `name_conf.data` 解析。
 - 可通过 `make docker` 构建容器镜像，并采用 Kubernetes Deployment、Service 与 DaemonSet 进行集群化部署。
 - 多组件启动顺序为：数据库初始化 → AI Gateway API → BFE → Conf Agent，确保数据面能够及时获得控制面下发的最新配置。
 - 常见部署问题主要集中于数据库连接、静态资源挂载、Conf Agent 通信、TLS 配置关联检查、端口冲突与 Redis 连接失败。

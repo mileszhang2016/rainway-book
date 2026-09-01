@@ -7,7 +7,7 @@ AI 网关每天需要把成千上万条请求准确地送达到正确的模型�
 - 理解 AI 路由规则在请求处理链路中的位置；
 - 掌握 API-Key / Entity / Global 三级路由表的优先级与绑定顺序；
 - 理解模型级别的加权选择与 Fallback 降级机制；
-- 了解 Provider 与 Cluster 解耦后各自承担的职责；
+- 了解 Provider 与 Cluster 各自承担的职责；
 - 认识 BFE 条件表达式在 AI 路由中的典型用法；
 - 跟踪一条 AI 请求从接入到转发的完整调度流程。
 
@@ -120,11 +120,9 @@ flowchart TD
 
 在实际配置中，Fallback 通常指向成本更低或容量更充裕的集群，以便在主目标异常时快速承接流量。例如主目标是 `gpt-4`，fallback 可以是 `gpt-3.5-turbo`。
 
-## Provider 与 Cluster 的解耦
+## Provider 与 Cluster 的职责划分
 
-在 AI 网关的控制面中，**Provider（提供商）**与 **Cluster（集群）**是两个独立的概念。Provider 回答“下游是谁、能访问哪些模型、后端在哪里、密钥是什么”；Cluster 回答“流量如何转发、用哪些模型、Key 权重如何分配”。
-
-解耦前的 `/clusters` 资源同时承担了两类职责，导致同一 provider 被多个 cluster 引用时，`instance_pool`、`keys`、`model_endpoint` 需要重复配置，且 cluster 接口暴露 API-Key 明文。解耦后：
+在 AI 网关的控制面中，**Provider（提供商）**与 **Cluster（集群）**是两个独立的概念。Provider 回答“下游是谁、能访问哪些模型、后端在哪里、密钥是什么”；Cluster 回答“流量如何转发、用哪些模型、Key 权重如何分配”。当前设计将两者拆分为独立资源：
 
 - Provider 成为 API-Key 明文的唯一持有者；
 - Cluster 通过 `llm_config.provider` 引用 Provider，通过 `llm_config.keys` 按 `name` 引用 Key 并设置权重；
@@ -183,7 +181,7 @@ req_host_in("api.example.com") && req_body_json_in("model", "gpt-4", false)
 
 条件表达式在配置加载阶段被编译为内部可执行对象，请求处理时只做匹配判断，因此规则数量较多时也不会显著增加单次请求的 CPU 开销。但过于复杂的组合条件或大量基于请求体 JSON 的匹配，仍可能带来一定的解析成本，建议在生产环境中对高频规则做优先级排序，把命中率高的规则放在前面。
 
-当前控制面在保存阶段未强制对 `Cond` 做 BFE 表达式语法校验，因此建议通过 `RouteRuleManager.ExpressionVerify` 等工具提前校验，避免下发到 BFE 后解析失败。
+控制面在保存阶段会通过 `validate.ConditionExpression` 对 `Cond` 做 BFE 表达式语法校验（内部调用 `condition.Build`），语法错误的表达式会在写入数据库前返回参数错误。`RouteRuleManager.ExpressionVerify` 也提供了同样的校验能力，可在 Dashboard 或本地提前验证表达式是否合法。
 
 ## 请求调度流程
 
@@ -227,7 +225,7 @@ flowchart TD
 - 在 AI 网关模式下，`findProduct()` 仅用于产品线识别和配置上下文加载，传统产品级 BFE 路由规则不参与 Cluster 选择；请求转发目标完全由 AI 路由规则决定；
 - AI 路由表分为 API-Key、Entity、Global 三级，BFE 按 `apikey → entity → global` 的顺序依次匹配，命中即返回；
 - 模型级别通过 `targets` 加权选择实现多集群分流，通过 `fallbacks` 有序降级提升可用性；
-- Provider 与 Cluster 解耦后，Provider 负责后端能力与密钥，Cluster 负责转发策略，控制面通过 name join 生成 BFE 所需的 `AIConf`；
+- 当前设计中 Provider 与 Cluster 相互独立：Provider 负责后端能力与密钥，Cluster 负责转发策略，控制面通过 name join 生成 BFE 所需的 `AIConf`；
 - BFE 条件表达式是 AI 路由规则的核心匹配手段，常用 `req_body_json_in`、`req_header_value_in`、`default_t()` 等函数；
 - 完整请求调度流程涉及 `mod_ai_token_auth`、`mod_ai_rate_limit`、`mod_ai_route` 与 `ServeHTTPForAI` 的协同，模块顺序与请求体可回退性是实现 Fallback 的关键。
 

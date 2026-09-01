@@ -9,8 +9,7 @@
 - BFE 热加载的触发方式与监控端口机制；
 - 如何查看当前生效的配置版本；
 - 配置异常时的版本回滚操作；
-- AI Gateway API、Dashboard、Conf Agent 等组件升级时的注意事项；
-- 灰度发布与分批升级的建议做法。
+- AI Gateway API、Dashboard、Conf Agent 等组件升级时的注意事项。
 
 ---
 
@@ -28,7 +27,7 @@ flowchart LR
     F -- 否 --> G[跳过本次更新]
     F -- 是 --> H[file_store 写入新版本目录]
     H --> I[切换 symlink mod_xxx]
-    I --> J[trigger 调用 BFE /reload/{module}]
+    I --> J[trigger 调用 BFE /reload/模块名]
     J --> K[BFE 加载新配置]
 ```
 
@@ -261,47 +260,6 @@ ConfTaskHeaders = {"Authorization" = "Token {Token}"}
 
 ---
 
-## 灰度发布建议
-
-配置变更或版本升级不应一次性全量下发，否则一旦新配置存在问题，会影响全部流量。建议采用以下灰度策略：
-
-### 1. 按 BFE 集群灰度
-
-`gslb.<bfe_cluster>` 主题天然按 BFE 集群名区分版本线。可先将变更应用到部分 BFE 集群，观察错误率、延迟、配额消耗等指标，确认无误后再推广到其他集群。
-
-### 2. 按节点分批升级
-
-对于 AI Gateway API 或 Conf Agent 的程序升级，可按节点分批进行：
-
-- 先升级 1 台 Conf Agent 所在节点，观察日志与热加载结果；
-- 确认无误后，以 10%、30%、100% 的节奏逐步扩大范围；
-- 每批升级后执行关键接口探测，例如：
-
-```bash
-curl -H "Authorization: Token <token>" \
-     "http://127.0.0.1:8183/inner-api/v1/configs/mod-api-key"
-```
-
-### 3. 配置变更后的观察窗口
-
-Conf Agent 的轮询周期默认为 5 秒，意味着配置下发到 BFE 生效通常有数秒延迟。建议：
-
-- 在 Dashboard 保存配置后等待至少 2-3 个轮询周期；
-- 通过 BFE 监控端口或 Conf Agent 日志确认版本号已更新；
-- 使用测试流量验证关键路由、API-Key 认证、限流规则是否按预期工作。
-
-### 4. 回滚预案
-
-灰度期间应预先确定回滚触发条件，例如：
-
-- 错误率较基线上升超过阈值；
-- 特定模型或 API-Key 请求失败率异常；
-- 配额或限流行为与预期不符。
-
-一旦触发，立即停止扩大灰度范围，并按 23.5 节步骤回滚异常节点。
-
----
-
 ## 完整操作示例
 
 以下演示从 Dashboard 修改 API-Key 配额到 BFE 热加载生效，再到回滚的完整操作。
@@ -363,7 +321,6 @@ ls -l mod_ai_token_auth
 - 生效版本可通过 Conf Agent 日志、软链接指向或配置文件中的 `version` 字段查看。
 - 版本回滚可利用 Conf Agent 保留的历史版本目录手动切换软链接并重新加载，无需重启 BFE。
 - 升级时需按顺序执行数据库迁移、AI Gateway API 替换、Dashboard 升级与 Conf Agent 配置检查，并注意鉴权头与配置字段的兼容性。
-- 灰度发布建议按 BFE 集群或节点分批进行，配合观察窗口与回滚预案，降低变更风险。
 
 ---
 

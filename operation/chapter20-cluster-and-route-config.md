@@ -256,9 +256,9 @@ AI 路由规则的 `Cond` 字段使用 BFE 条件表达式语法。常见表达�
 | 按请求体 JSON 字段 | `req_body_json_in("model", "gpt-4", false)` |
 | 多条件组合 | `req_host_in("api.example.com") && req_body_json_in("model", "gpt-4", false)` |
 
-> 注意：保存阶段控制面仅校验表达式非空，**不会校验语法**。语法错误的表达式下发到 BFE 后会导致解析失败。建议在 Dashboard 或调用 `RouteRuleManager.ExpressionVerify` 完成校验后再保存。
+> 注意：保存阶段控制面除校验表达式非空外，还会通过 `validate.ConditionExpression` 对表达式做 BFE 语法校验（内部调用 `condition.Build`），语法错误的表达式无法写入数据库。Dashboard 通常也提供“条件表达式校验”按钮，便于在表单中提前验证。
 
-在 Dashboard 中，通常提供“条件表达式校验”按钮，点击后系统会返回表达式是否合法。若使用 OpenAPI 直接管理，可在本地先用 BFE 的条件表达式解析工具验证，再写入控制面。
+若使用 OpenAPI 直接管理，控制面会在写入前完成校验；如需在本地提前验证，也可调用 `RouteRuleManager.ExpressionVerify` 或直接使用 BFE 的条件表达式解析工具。
 
 常用校验建议：
 
