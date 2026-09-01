@@ -12,7 +12,7 @@
 
 ## AI 路由规则在请求处理链路中的位置
 
-在 AI 网关模式下，BFE 通过独立的 `ServeHTTPForAI()` 路径处理请求。该路径会调用 `findProduct()` 完成产品线识别，供中间件和配置加载使用，但**不会使用传统的产品级 BFE 路由规则来选择目标 Cluster**。请求最终转发到哪个模型与集群，完全由 `mod_ai_route` 模块根据 AI 路由规则决定。
+在 AI 网关模式下，BFE 通过独立的 `ServeHTTPForAI()` 路径处理请求。该路径仍会调用 `findProduct()`，但与传统 BFE 按 hostname 匹配产品不同，AI 网关场景下 host table 配置了默认产品线（`defaultProduct`，对应控制面 `AIRouteInnerProductName`），因此 `findProduct()` 会回退到该默认产品，仅用于加载该产品线下的模块配置上下文；**不会使用传统的产品级 BFE 路由规则来选择目标 Cluster**。请求最终转发到哪个模型与集群，完全由 `mod_ai_route` 模块根据 AI 路由规则决定。
 
 AI 路由规则在 `HandleFoundProduct` 阶段执行，位于 `mod_ai_token_auth` 鉴权之后、`mod_ai_rate_limit` 限流之前。每条规则包含：
 
@@ -23,13 +23,13 @@ AI 路由规则在 `HandleFoundProduct` 阶段执行，位于 `mod_ai_token_auth
 ```mermaid
 flowchart LR
     Client -->|HTTPS| BFE[BFE 数据面]
-    BFE --> findProduct[findProduct\n仅用于识别产品]
+    BFE --> findProduct[findProduct\n回退到默认产品线]
     findProduct --> mod_auth[mod_ai_token_auth<br/>鉴权 / 配额]
     mod_auth --> mod_route[mod_ai_route<br/>AI 路由规则]
     mod_route -->|targets / fallbacks| Backend[后端 AI 服务]
 ```
 
-上图展示了 AI 网关模式下的请求链路：产品识别仅为中间件和配置上下文服务，真正的转发目标由 AI 路由规则决定。
+上图展示了 AI 网关模式下的请求链路：产品识别回退到默认产品线，仅为中间件和配置上下文服务，真正的转发目标由 AI 路由规则决定。
 
 ## Global / Entity / API-Key 三级 AI 路由表
 

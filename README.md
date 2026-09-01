@@ -28,11 +28,11 @@ v0.5.0 包含以下组件版本：
 - [第四章 AI网关的路由与调度原理](./principle/chapter04-routing-and-scheduling.md)
 
 ### 设计篇
-- [第五章 壬远AI网关架构设计](./design/chapter05-system-architecture.md)
+- [第五章 壬远AI网关架构与核心概念](./design/chapter05-system-architecture.md)
 - [第六章 控制面核心设计：AI Gateway API](./design/chapter06-control-plane-design.md)
 - [第七章 数据面转发设计：BFE](./design/chapter07-data-plane-design.md)
 - [第八章 认证授权设计](./design/chapter08-auth-design.md)
-- [第九章 API-Key设计](./design/chapter09-apikey-design.md)
+- [第九章 Entity 与 API-Key 设计](./design/chapter09-apikey-design.md)
 - [第十章 Provider与Cluster设计](./design/chapter10-provider-and-cluster.md)
 - [第十一章 AI路由规则设计](./design/chapter11-ai-route-rules.md)
 - [第十二章 配额与限流设计](./design/chapter12-quota-and-rate-limit.md)

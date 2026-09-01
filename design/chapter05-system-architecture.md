@@ -1,4 +1,4 @@
-# 第五章 壬远AI网关架构设计
+# 第五章 壬远AI网关架构与核心概念
 
 ## 本章目标
 
@@ -73,6 +73,57 @@ OpenAI、DeepSeek、Anthropic、Google Gemini 等模型服务商的 API 协议�
 - **配置变更不影响转发稳定性**：控制面升级、重启或出现故障时，数据面可以继续基于本地缓存配置进行转发。
 - **数据面无状态化**：BFE 和 Conf Agent 不保存持久化业务数据，便于水平扩展。
 - **配置分发可靠**：Conf Agent 通过版本号比对实现增量同步，降低网络开销。
+
+---
+
+## 核心概念
+
+在使用壬远AI网关之前，需要先理解以下关键概念。它们贯穿控制台操作、API 调用、配置导出与数据面转发各个环节。
+
+| 概念 | 英文 | 一句话说明 |
+|---|---|---|
+| AI 网关实例池 | Server Data | 登记数据面 BFE 引擎地址，控制面据此知道配置要下发给谁 |
+| 模型服务商 | Provider | 描述一个模型服务提供方，包括协议类型、后端实例池、模型列表与认证密钥 |
+| AI 业务集群 | Cluster | 流量实际转发的后端集群，通过引用 Provider 声明其上游能力 |
+| 组织 | Entity | 表达部门、团队或项目等组织架构，是配额、限流、模型访问控制与路由规则的挂载点 |
+| API 调用凭证 | API-Key | 业务系统调用数据面转发入口时使用的身份凭证，可挂载到 Entity 继承策略 |
+| 路由表 | Route Table | 按 Global / Entity / API-Key 三级组织的路由规则，决定请求转发到哪个 Cluster |
+| 配额计划 | Quota Plan | 按 RMB 或 Token 为 Entity / API-Key 设置预算上限 |
+| 限流策略 | Rate Limit Policy | 按 RPM / TPM / 并发等维度限制请求速率 |
+
+### AI 网关实例池
+
+「AI 网关实例池」对应数据面 BFE 的引擎地址清单，用于登记哪些 BFE 节点可以从控制面拉取配置。它回答的是“配置要下发给谁”的问题，与 Provider 中的后端实例池（`instance_pool`）含义不同：前者是数据面入口，后者是上游模型服务端点。
+
+### 模型服务商（Provider）
+
+「模型服务商」对应 OpenAPI 的 `/providers` 资源，回答“下游是谁、能访问哪些模型、如何认证、后端在哪里”的问题。它持有：
+
+- 后端实例池（`instance_pool`）：真实 AI 服务端点；
+- 模型协议（`model_protocols`）：如 `openai`、`anthropic`；
+- 模型列表（`models`）与模型发现端点；
+- 服务鉴权 Key 明文（`keys`）。
+
+多个 Cluster 可以引用同一个 Provider，实现实例池与密钥的复用。
+
+### AI 业务集群（Cluster）
+
+「AI 业务集群」对应 OpenAPI 的 `/clusters` 资源，回答“流量如何转发、用哪些模型、Key 权重如何分配”的问题。它通过 `llm_config.provider` 强引用 Provider，并在此之上声明转发模型、Key 权重、超时、健康检查等策略。详细设计动机与数据模型参见 [第十章 Provider 与 Cluster 设计](./chapter10-provider-and-cluster.md)。
+
+### 组织（Entity）与 API-Key
+
+「Entity」用于表达组织架构，例如部门、团队或项目。每个 Entity 拥有独立的模型白名单/黑名单、配额计划（QuotaPlan）、限流策略（RateLimitPolicy）与路由规则。Entity 通过 `parent_id` 字段自底向上形成层级树，其类型由 `entity_types` 表定义，挂载到其上的 API-Key 会继承 Entity 层级的模型策略与配额/限流/路由策略。详细设计参见 [第九章 Entity 与 API-Key 设计](./chapter09-apikey-design.md) 中的“Entity 层级树与模型继承”。
+
+「API-Key」是业务系统调用数据面转发入口时使用的身份凭证。API-Key 可挂载到 Entity 以继承其配额与限流策略，也可拥有独立的 API-Key 级路由规则。详细设计参见 [第八章 认证授权设计](./chapter08-auth-design.md) 与 [第九章 Entity 与 API-Key 设计](./chapter09-apikey-design.md)。
+
+### 路由表
+
+「路由表」对应 Global / Entity / API-Key 三级路由规则。请求进入数据面后按 **API-Key > Entity > Global** 顺序匹配：先查该 Key 的专属表，未命中再查 Key 挂载组织的表，最后回落 Global。路由规则中的 `cond` 为 BFE 条件表达式，`targets` 指定目标集群与权重，`fallbacks` 指定降级目标。详细设计参见 [第十一章 AI 路由规则设计](./chapter11-ai-route-rules.md)。
+
+### 配额与限流
+
+- **配额计划（Quota Plan）**：为 Entity 或 API-Key 设置预算上限，支持按 RMB 或 Token 维度核算成本。详细设计参见 [第十二章 配额与限流设计](./chapter12-quota-and-rate-limit.md)。
+- **限流策略（Rate Limit Policy）**：按 RPM / TPM / 并发等维度限制请求速率，防止单点流量冲垮后端或耗尽预算。详细设计参见 [第十二章 配额与限流设计](./chapter12-quota-and-rate-limit.md)。
 
 ---
 

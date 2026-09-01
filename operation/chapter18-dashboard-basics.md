@@ -77,34 +77,21 @@ AI 网关
 
 ## 控制台中的核心概念
 
-控制台中的诸多操作都围绕以下概念展开，理解它们是正确使用 Dashboard 的前提。
+控制台中的诸多操作都围绕以下概念展开：AI 网关实例池、Provider（模型服务商）、Cluster（AI 业务集群）、Entity（组织）、API-Key、路由表、配额计划与限流策略。
 
-### AI 网关实例池
+这些概念的完整定义、相互关系与设计动机已在 [第五章 壬远AI网关架构与核心概念](../design/chapter05-system-architecture.md#核心概念) 中统一介绍。本节仅说明它们在 Dashboard 中的对应入口：
 
-「AI 网关实例池」对应数据面 BFE 的引擎地址清单，用于登记哪些 BFE 节点可以从控制面拉取配置。它回答的是“配置要下发给谁”的问题，与 Provider 中的后端实例池（`instance_pool`）含义不同：前者是数据面入口，后者是上游模型服务端点。
+| 控制台导航项 | 对应概念 | 说明 |
+|---|---|---|
+| 资源管理 → AI 网关实例池 | AI 网关实例池 | 登记数据面 BFE 引擎地址 |
+| 资源管理 → 模型服务商 | Provider | 维护模型提供方、后端实例池、模型协议与认证密钥 |
+| 资源管理 → AI 业务集群 | Cluster | 引用 Provider，配置转发策略、Key 权重与超时 |
+| 资源管理 → 模型定价 | Model Price | 维护模型在不同 Provider 与时段下的单价 |
+| 消费者管理 → Entity 管理 | Entity | 维护组织架构、配额、限流与模型访问控制 |
+| 消费者管理 → API Key 管理 | API-Key | 签发调用凭证并绑定到 Entity |
+| 路由管理 → 路由表 | Route Table | 维护 Global / Entity / API-Key 三级路由规则 |
 
-### 模型服务商（Provider）
-
-「模型服务商」对应 OpenAPI 的 `/providers` 资源，回答“下游是谁、能访问哪些模型、如何认证、后端在哪里”的问题。它持有：
-
-- 后端实例池（`instance_pool`）：真实 AI 服务端点；
-- 模型协议（`model_protocols`）：如 `openai`；
-- 模型列表（`models`）与模型发现端点；
-- 服务鉴权 Key 明文（`keys`）。
-
-多个 Cluster 可以引用同一个 Provider，实现实例池与密钥的复用。
-
-### AI 业务集群（Cluster）
-
-「AI 业务集群」对应 OpenAPI 的 `/clusters` 资源，回答“流量如何转发、用哪些模型、Key 权重如何分配”的问题。它通过 `llm_config.provider` 强引用 Provider，并在此之上声明转发模型、Key 权重、超时、健康检查等策略。详细设计动机与数据模型参见 [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)。
-
-### Entity 组织与 API Key
-
-「Entity 管理」用于表达组织架构，例如部门、团队或项目。每个 Entity 拥有独立的模型白名单/黑名单、配额计划（QuotaPlan）、限流策略（RateLimitPolicy）与路由规则。「API Key 管理」用于签发调用凭证，API Key 可挂载到 Entity 以继承其配额与限流策略，也可拥有独立的 API-Key 级路由规则。
-
-### 路由表
-
-「路由表」对应 Global / Entity / API-Key 三级路由规则。请求进入数据面后按 **API-Key > Entity > Global** 顺序匹配：先查该 Key 的专属表，未命中再查 Key 挂载组织的表，最后回落 Global。路由规则中的 `cond` 为 BFE 条件表达式，`targets` 指定目标集群与权重，`fallbacks` 指定降级目标。
+理解这些概念是正确使用 Dashboard 的前提，建议在阅读本章前先浏览第五章的“核心概念”节。
 
 ---
 
