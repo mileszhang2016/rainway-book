@@ -8,7 +8,7 @@ Through this chapter, readers will understand:
 - How API-Keys, as the direct credential of the request path, are stored in the Control Plane, inherit policies through Entities, and are validated in the Data Plane;
 - The Control Plane authentication/authorization model (Visitor, Scope, Feature-Action) and how it integrates with the OpenAPI / InnerAPI;
 - Key configuration points for TLS/HTTPS on both the Control Plane and the Data Plane;
-- How access-log audit fields support security incident tracing and billing reconciliation;
+- How access-log audit fields and Control Plane operation logs support security incident tracing and billing reconciliation;
 - The cleanup triggers for Quota Keys and Rate-Limit Keys in Redis, and practices for protecting sensitive data;
 - How rate limiting and quota act as security defenses against abuse and runaway costs;
 - How model allowlists and blocklists are inherited at the Entity hierarchy;
@@ -249,6 +249,12 @@ By centrally collecting access logs, the security team can identify abnormal cal
 - Specific IP ranges triggering `QUOTA_EXHAUSTED` in large numbers;
 - A model receiving many requests while most of them return `MODEL_NOT_ALLOWED`.
 
+### Control Plane Operation Log Auditing
+
+In addition to Data Plane access logs, the Control Plane persistently audits write operations in configuration domains such as Entity, API-Key, Provider, and certificates through the Operation Log module (`model/ioperlog`). It records the operator, action, resource type and name, change summary (`change_summary`), request path, client IP, and other fields into the `operation_logs` table, and supports paginated queries via `GET /open-api/v1/operation-logs` (`endpoints/openapi_v1/operation_log/list.go`). This endpoint requires the read permission of `FeatureOperationLog`, and sensitive fields are masked.
+
+Operation logs and access logs are complementary: the former answers "who changed which configuration in the Control Plane", while the latter answers "which requests were rejected in the Data Plane"; together they can fully reconstruct the operation chain and impact scope of a security incident.
+
 ---
 
 ## Redis Key Cleanup and Sensitive Data Protection
@@ -418,7 +424,7 @@ Combined with the Entity hierarchy, `block_models: ["gpt-4-32k"]` can be set at 
 - Rainway AI Gateway adopts the defense-in-depth principle; security mechanisms cover the transport layer, the authentication/authorization layer, the request admission layer, and the policy enforcement layer.
 - The API-Key is the direct credential of the request path; it should be transported over HTTPS and combined with Entity inheritance for organization-level policy control.
 - The Control Plane uses the Visitor abstraction and the Feature-Action permission model, and supports four authentication methods — Password, Session, Token, and Skip; `SkipTokenValidate` must be disabled in production.
-- The Data Plane BFE outputs structured error responses and access log fields, supporting security auditing, anomaly detection, and billing reconciliation.
+- The Data Plane BFE outputs structured error responses and access log fields, supporting security auditing, anomaly detection, and billing reconciliation; the Control Plane operation logs persistently record configuration write operations and can be audited via `GET /open-api/v1/operation-logs`.
 - Quota Keys and Rate-Limit Keys in Redis are actively cleaned up when an API-Key / Entity is deleted or a policy changes, avoiding the security risks of residual data.
 - Rate limiting and quota are key defenses against API-Key leakage, abuse, and runaway costs, and support multi-level inheritance from API-Keys and Entities.
 - IP subnet control, API-Key authentication, model allowlists/blocklists, and quota/rate limiting together form the security barrier for request admission, intercepting layer by layer in the order "IP allowlist → API-Key authentication → model allowlist/blocklist → quota/rate limit".

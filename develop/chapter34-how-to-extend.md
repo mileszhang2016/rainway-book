@@ -53,6 +53,7 @@ cd test/integration && go test -v -count=1 ./tests/...
 | `ai-gateway-api/` | `storage/rdb/` | MySQL/SQLite DAO 实现 |
 | `ai-gateway-api/` | `design-docs/` | API 定义、系统设计、变更说明 |
 | `bfe/` | `bfe_modules/` | 数据面模块 |
+| `bfe/` | `bfe_model_protocol/` | 协议适配层：按协议组织的适配器（认证注入、usage 提取、错误归一） |
 | `bfe/` | `bfe_module/` | 模块框架与回调点定义 |
 | `bfe/` | `bfe_config/` | 配置加载器 |
 | `conf-agent/` | `conf_reload/prober/` | 从控制面拉取配置 |
@@ -474,7 +475,9 @@ func (m *ModuleAiRoute) loadRouteRuleConf(query url.Values) error {
 
 ## 场景四：扩展 Provider 协议支持
 
-Provider 协议扩展是 AI 网关特有的场景，通常需要同时修改控制面的协议校验、模型发现，以及数据面的鉴权方式、请求/响应转换。
+Provider 协议扩展是 AI 网关特有的场景。数据面的协议知识（认证注入、补充头、usage 提取、错误归一）收敛在协议适配层 `bfe/bfe_model_protocol/` 的按协议组织的适配器中，新增协议的改动面大幅缩小；控制面仍需同步放开协议枚举与模型发现解析规则。
+
+首先需要明确概念边界：**model_protocol（协议知识维度）≠ provider（用户自定义 cluster 级实体）**。provider 由控制面管理，承载名称、key 池、价格表、地址等用户自定义信息；model_protocol 描述认证头如何注入、补充什么版本头、usage 字段长什么样。OpenAI 兼容生态中的 Groq、DeepSeek、OpenRouter 等品牌都走 `openai` 协议，接入这类 provider **零代码改动**，只需在 cluster 配置 `model_protocols: ["openai"]`（通常由控制面在创建 Provider 时自动携带），无需新建适配器。
 
 ```mermaid
 flowchart LR
@@ -579,73 +582,112 @@ func newAIConf(llmConfig *LLMConfig, modelTable *cluster_conf.ModelTable,
 
 ### 数据面请求/响应转换
 
-数据面在 `bfe_basic/request_ai_basic.go` 中根据请求路径和头推断协议风格：
+数据面的协议识别位于 `bfe/bfe_model_protocol/detect.go`，`bfe_basic.DetectAuthStyle` 与 `GetApiKey` 保留原签名并委托给它：
 
 ```go
-// bfe/bfe_basic/request_ai_basic.go
-func DetectAuthStyle(req *Request) string {
-    path := req.HttpRequest.URL.Path
-    if strings.HasPrefix(path, "/v1/messages") {
-        return AuthStyleAnthropic
-    }
-    if req.HttpRequest.Header.Get("x-api-key") != "" &&
-        req.HttpRequest.Header.Get("Authorization") == "" {
-        return AuthStyleAnthropic
-    }
-    return AuthStyleOpenAI
+// bfe/bfe_model_protocol/detect.go
+func DetectProtocol(req *bfe_http.Request) string {
+	if req == nil || req.URL == nil {
+		return ProtocolUnknown
+	}
+
+	path := req.URL.Path
+	if strings.HasPrefix(path, "/v1/messages") {
+		return ProtocolAnthropic
+	}
+
+	// 有 x-api-key 且无 Authorization 视为 Anthropic 风格
+	if req.Header.Get("x-api-key") != "" &&
+		req.Header.Get("Authorization") == "" {
+		return ProtocolAnthropic
+	}
+
+	return ProtocolOpenAI
 }
 ```
 
-转发前，`bfe_server/reverseproxy.go` 的 `doSingleAIForward` 会校验 cluster 是否支持该协议，并执行协议相关的头注入：
+转发前，`bfe_server/reverseproxy.go` 的 `doSingleAIForward` 会按请求的 `AuthStyle` 取协议适配器，校验 cluster 是否支持该协议，并通过适配器完成认证头与补充头注入：
 
 ```go
 // bfe/bfe_server/reverseproxy.go
+adapter := modelprotocol.Get(aiMeta.AuthStyle)
+
 if cluster.AIConf != nil && !clusterSupportsAuthStyle(cluster.AIConf.ModelProtocols, aiMeta.AuthStyle) {
-    err := bfe_basic.NewAiError(
-        bfe_basic.CodeProviderProtocolMismatch,
-        bfe_basic.TypeInvalidRequestError,
-        fmt.Sprintf("request protocol %s not supported by cluster provider", aiMeta.AuthStyle),
-    )
-    return err.CreateErrorResponse(basicReq), closeAfterReply, nil, bodyModel
+	err := bfe_basic.NewAiError(
+		bfe_basic.CodeProviderProtocolMismatch,
+		bfe_basic.TypeInvalidRequestError,
+		fmt.Sprintf("request protocol %s not supported by cluster provider (model_protocols=%v)",
+			aiMeta.AuthStyle, cluster.AIConf.ModelProtocols),
+	)
+	return err.CreateErrorResponse(basicReq), closeAfterReply, nil, bodyModel
 }
 
+// 认证头注入：openai 适配器写 Authorization: Bearer，anthropic 适配器写 x-api-key
 if selectedKey.Key != "" {
-    mod_ai_token_auth.SetApiKey(outreq, selectedKey.Key, aiMeta.AuthStyle)
+	if err := adapter.InjectAuth(outreq, selectedKey.Key); err != nil {
+		log.Logger.Warn("doSingleAIForward: inject auth failed: %v", err)
+	}
 }
 
-if aiMeta.AuthStyle == bfe_basic.AuthStyleAnthropic {
-    if outreq.Header.Get("anthropic-version") == "" {
-        outreq.Header.Set("anthropic-version", "2023-06-01")
-    }
+// 补充头注入：如 anthropic-version，请求显式携带时优先
+for k, v := range adapter.ExtraHeaders() {
+	if outreq.Header.Get(k) == "" {
+		outreq.Header.Set(k, v)
+	}
 }
 ```
 
-响应侧，`mod_ai_token_auth` 中的 `UpdateCtxByUsage` 负责从后端响应中提取 token 使用量，不同协议的 usage 字段路径不同：
+注意 `doSingleAIForward` 不再 import `mod_ai_token_auth`；`mod_ai_token_auth.SetApiKey` 保留原签名，内部同样委托给 `adapter.InjectAuth`。
+
+响应侧，`mod_ai_token_auth` 中的 `UpdateCtxByUsage` 按已识别协议选择适配器的 usage 字段链（`ExtractUsageFields`），后续累加与归一逻辑保持不变：
 
 ```go
 // bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go
 func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
-    used = gjson.GetBytes(data, "usage.total_tokens").Int()
-    prompt = gjson.GetBytes(data, "usage.prompt_tokens").Int()
-    completion = gjson.GetBytes(data, "usage.completion_tokens").Int()
-    // Claude fallback
-    if prompt == 0 && completion == 0 {
-        prompt = gjson.GetBytes(data, "usage.input_tokens").Int()
-        completion = gjson.GetBytes(data, "usage.output_tokens").Int()
-    }
+	fields := modelprotocol.Get(ctx.aiBasicInfo.AuthStyle).ExtractUsageFields(data)
+	used := fields.UsedQuota
+	prompt := fields.PromptTokens
+	completion := fields.CompletionTokens
+	// ... cache_read/cache_write、audio、image、video 等字段同法取出，
+	// used>0 / else if prompt>0... 的累加分支逐行保留（写 bfe_basic.TokenUsage）
 }
 ```
 
-新增协议时，通常需要：
+流式响应侧，`mod_body_process` 的 `SSEEvent/RawEvent.GetQuotaUsage` 经共享 helper `extractUsageFields` 组合适配器字段链（openai 链优先，prompt/completion 全零时回落 anthropic 链），`isguess` / `EstimateContentToken` 逻辑保持不变。
 
-1. 在 `ValidModelProtocols` 中注册；
-2. 在 `modelProtocolParsers` 中补充模型发现解析规则；
-3. 在 `BuildAuthHeader` 中补充鉴权头；
-4. 在 `DetectAuthStyle` 中识别请求协议；
-5. 在 `doSingleAIForward` 中补充协议特有的请求转换（路径、头、体字段）；
-6. 在 `UpdateCtxByUsage` 或 `mod_body_process` 中补充 usage 提取逻辑；
-7. 更新 `model/icluster_conf/cluster.go` 导出逻辑，确保 `ModelProtocols` 正确下发；
-8. 补充单元测试与集成测试（参考 `bfe/tests/integration/implementation/scenario-SC06-claude-protocol-support/`）。
+### 新增一种模型协议的步骤
+
+以接入 gemini 协议为例，数据面框架代码（reverseproxy / mod_body_process / mod_ai_token_auth）**零修改**，只需三步：
+
+1. `bfe/bfe_model_protocol/utils/protocol.go` 增加 `ProtocolGemini` 常量；
+2. 新建 `bfe/bfe_model_protocol/gemini/` 适配器包，实现 `ProtocolAdapter` 接口：`InjectAuth`（如 `x-goog-api-key` 注入）、`ExtraHeaders`、`ExtractUsageFields`（`promptTokenCount` / `candidatesTokenCount` / `cachedContentTokenTokenCount` 提取与归一）；
+3. `detect.go` 增加一条识别规则（如按 `x-goog-api-key` header 识别）；
+4. `registry.go` 的 `init()` 增加一行 `Register(gemini.New())`。
+
+随后按需补充：
+
+5. 需要按错误体定制降级语义时，实现 `ErrorNormalizer`（`shouldTriggerFallback` 中的挂钩已就位，默认实现恒返回 `nil`，保持状态码白名单行为）；
+6. 控制面（ai-gateway-api）在 `model/iprovider/provider.go` 的 `ValidModelProtocols` 中放开 `model_protocols` 枚举约束，并在 `model/iprovider/discover.go` 的 `modelProtocolParsers` 中补充模型发现解析规则。
+
+控制面导出到 BFE 的 `cluster_conf.AIConf.ModelProtocols` 在 `model/icluster_conf/cluster.go` 中完成（`newAIConf` 直接透传 Provider 的协议列表），无需为每个协议修改导出逻辑：
+
+```go
+// ai-gateway-api/model/icluster_conf/cluster.go
+func newAIConf(llmConfig *LLMConfig, modelTable *cluster_conf.ModelTable,
+    providerKeys []iprovider.ProviderKey, providerModelProtocols []string) *cluster_conf.AIConf {
+    aiConf := &cluster_conf.AIConf{
+        Type:           0,
+        ModelMapping:   convertToBFEModelMapping(llmConfig.ModelMappings),
+        Keys:           []cluster_conf.AIKey{},
+        ModelProtocols: providerModelProtocols,
+    }
+    // ...
+}
+```
+
+另外注意：`bfe_server/bfe_confdata_load.go` 在启动（`InitDataLoad`）与热加载（`serverDataConfReload`）时会校验每个 cluster 的 `AIConf.ModelProtocols` 只含注册表已知协议，新协议必须先完成注册表注册，否则配置加载将失败。
+
+补充单元测试与集成测试时可参考 `bfe/bfe_model_protocol/` 下既有适配器的 `*_test.go` 与 `bfe/tests/integration/implementation/scenario-SC06-claude-protocol-support/`。
 
 ## 本章小结
 
@@ -654,7 +696,7 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 - **OpenAPI 扩展**遵循“接口层 → 模型层 → 存储层”的顺序，使用 `xreq.Endpoint` 注册路由，使用 `itxn.TxnStorager` 管理事务，使用手写 mock 保证模型层单测覆盖率。
 - **BFE 模块扩展**需要实现 `bfe_module.BfeModule`，在正确的回调点注册处理函数，并在 `bfe_modules/bfe_modules.go` 中维护模块顺序。
 - **InnerAPI 配置导出主题扩展**需要同时在控制面实现 `ConfigGenerator`、在 Conf Agent 增加 `NormalFileTask`、在 BFE 模块中实现热加载回调，三者通过版本号与 `/reload/<module>` 接口联动。
-- **Provider 协议扩展**贯穿控制面的协议校验/模型发现、数据面的鉴权风格检测、请求/响应转换以及 usage 提取，是最典型的跨仓库改动。
+- **Provider 协议扩展**需要区分 model_protocol 与 provider：新增 OpenAI 兼容 provider 零代码、仅需配置 `model_protocols: ["openai"]`；新增一种协议则在 `bfe_model_protocol` 中加一个适配器包、一条识别规则和一行注册（`detect.go` + 适配器 + `registry.go`），并在控制面放开协议枚举与模型发现解析规则。
 
 无论哪种场景，都建议先按 `ai-gateway-api/design-docs/README.md` 的六步变更法完成设计文档，再动手编码，并保持设计文档、代码、测试三者同步。
 
@@ -666,6 +708,7 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 - `ai-gateway-api/design-docs/README.md`
 - `bfe/AGENTS.md`
 - `bfe/CONTRIBUTING.md`
+- `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
 - `conf-agent/AGENTS.md`
 - [第三十一章 接口层实现：OpenAPI与InnerAPI](../implementation/chapter26-endpoints-implementation.md)
 - [第三十一章 AI路由模块实现：mod_ai_route](../implementation/chapter29-mod-ai-route.md)

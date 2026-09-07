@@ -170,6 +170,26 @@ The `replace` mode first clears the `model_prices` table and then writes the new
 
 > Note: the `provider` field of `/model-prices` serves only as a price-aggregation identifier and no longer enforces a reference to an existing `/providers`. Therefore, prices can be imported first and the Provider created later; the two are maintained independently.
 
+### Price Fields and Billing Modes for Image Input and Video Generation
+
+The `ModelTable` in the BFE Data Plane cluster_conf (which includes two levels of price tables, global `Prices` and `TierPrices`; in the initial phase only `peak` is supported as a tier name) includes two price fields for image input and video generation, configurable in both `prices` and `tier_prices`:
+
+| Field | Applicable Mode | Description |
+|-------|----------------|-------------|
+| `input_cost_per_image_token` | `image_generation` | Unit price for image input tokens; added on top of the per-image fee `output_cost_per_image` |
+| `output_cost_per_video` | `video_generation` | Unit price per generated video, billed by the number of videos generated |
+
+Two more billing modes (modes) are supported:
+
+| mode | Billing Method |
+|------|---------------|
+| `responses` | Billed like chat, i.e., token billing with `input_cost_per_token` / `output_cost_per_token` and related fields (the `/v1/responses` path is recognized as this mode) |
+| `video_generation` | Cost = `VideoCount × output_cost_per_video` (the `/v1/video/generations` path is recognized as this mode) |
+
+For `video_generation` mode, BFE pre-reads the `n` field of the request body as a fallback for the generation count during the authentication phase: if the field is missing or invalid, it is billed as 1 to avoid under-billing; `video_count` in the response `usage` takes precedence as the final count. Correspondingly, usage statistics include the `image_input_tokens` and `video_count` fields, which map to the access log fields `ai_image_input_tokens` (786) and `ai_video_count` (787) respectively (bfe-access-pb v0.3.5).
+
+Implementation references: `ModelPrice` and the price field constants in `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`, `DetectModeFromPath` in `bfe/bfe_basic/request_ai_basic.go`, and `calcVideoGenerationCost` / `calcResponsesCost` in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`. See `bfe/docs/zh_cn/sys_design/rmb_quota.md` for the complete billing semantics.
+
 ## The Relationship Between Provider and Cluster
 
 A Provider and a Cluster are linked by a strong reference via `cluster.llm_config.provider`. The recommended configuration order is:
@@ -298,7 +318,7 @@ A Cluster does not declare `instance_pool`, `model_endpoint`, or `provider_type`
 
 The Provider is the core resource in the Control Plane of the Rainway AI Gateway for describing downstream model providers. After the responsibilities of Provider and Cluster are separated, the Cluster focuses on forwarding policies while the Provider focuses on access information, improving configuration reusability, security, and maintainability.
 
-Key points of this chapter: the data model and field meanings of the Provider; the flows for creating and updating Providers via the Dashboard and OpenAPI; the configuration methods and constraints of the model endpoint, model list, and Provider Keys; using the stateless model discovery tool `/providers/tools/discover-models`; the impact of the `openai` and `anthropic` protocols on authentication headers, version headers, usage parsing, and protocol matching; the process and caveats of batch-importing model pricing via `model-list.yaml`; the strong reference relationship between Provider and Cluster and the synchronization and conflict handling during changes; and troubleshooting ideas for common issues plus configuration examples.
+Key points of this chapter: the data model and field meanings of the Provider; the flows for creating and updating Providers via the Dashboard and OpenAPI; the configuration methods and constraints of the model endpoint, model list, and Provider Keys; using the stateless model discovery tool `/providers/tools/discover-models`; the impact of the `openai` and `anthropic` protocols on authentication headers, version headers, usage parsing, and protocol matching; the process and caveats of batch-importing model pricing via `model-list.yaml`; the price fields for image input tokens and per-video billing, and the `responses` and `video_generation` billing modes; the strong reference relationship between Provider and Cluster and the synchronization and conflict handling during changes; and troubleshooting ideas for common issues plus configuration examples.
 
 Properly planning the separation of Provider and Cluster is an important prerequisite for subsequent route rules, API-Key quotas, and rate limiting policies to take effect. It is recommended that in production you first maintain Providers and model prices in a unified way, and then create Clusters for different business lines as needed. Regularly comparing the provider lists returned by `/providers` and `/model-prices/actions/get-providers` helps promptly detect and backfill cases where price records drift from actual Providers, ensuring accurate cost accounting.
 

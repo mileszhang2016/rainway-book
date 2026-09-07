@@ -128,6 +128,18 @@ ConfFileName    = "token_rule.data"
 
 After receiving the reload request, BFE re-reads the configuration file of the corresponding module and updates the rule table in memory. Since the reload process does not involve restarting the process, existing connections are not interrupted.
 
+### tls_conf Versioned Hot Reload and Client CA/CRL Relocation
+
+Conf Agent distributes TLS configuration using a "versioned directory + symbolic link" approach: it writes the new configuration (including complete copies of the `client_ca` and `client_crl` directories) into a versioned directory `tls_conf_<version>`, then first calls `GET /reload/tls_conf?path=tls_conf_<version>` so that BFE performs a full load validation of this self-contained configuration unit **before** the symbolic link is switched. Only after BFE returns success does Conf Agent switch the `tls_conf` symlink and clean up expired versions.
+
+`TLSConfReload` relocates every dependency of the versioned directory (`server_cert_conf` / `tls_rule_conf` and the client CA/CRL base directories) into the directory given by `path` together: if the client CA/CRL base directories were still read from the activated directory `<confRoot>/tls_conf/client_ca|crl`, a change involving a client CA that exists only in the version directory but not in the activated one would fail the reload at the `ClientCALoad` stage with "CA file not found". Conf Agent would therefore be unable to complete the switch, and subsequent reloads would fail again for the same reason. The relocation is thus a necessary condition for the self-contained validation of the version directory.
+
+The relocation logic (see `TLSConfReload` / `tlsConfLoad` in `bfe/bfe_server/bfe_confdata_load.go`):
+
+- When `ClientCABaseDir` / `ClientCRLBaseDir` are located under `<confRoot>/tls_conf`, they are relocated into the versioned directory together with `path`, consistent with how the cert / tls_rule files are handled (reusing `joinPath`, which keeps only the last path segment);
+- Custom absolute paths outside `tls_conf` (such as an independently mounted `/mnt/ca`) do not match the prefix check and keep being read from the configured absolute path;
+- Calls to `/reload/tls_conf` without `path`, as well as the BFE startup load path, are not relocated into the versioned directory, and the `ClientCALoad` / `ClientCRLLoad` validation logic is consistent — a reload still fails correctly when the version directory lacks a referenced copy.
+
 ---
 
 ## How to Check the Currently Active Configuration Version
@@ -317,7 +329,7 @@ ls -l mod_ai_token_auth
 - Rainway AI Gateway adopts a configuration synchronization model of control plane generation and data plane pull: administrator changes are first written to the database, and Conf Agent then pulls them from the InnerAPI periodically and triggers a BFE hot reload.
 - `VersionControlManager` implements incremental synchronization based on MD5 signatures and the `config_versions` table; when the configuration has not changed, it returns `Data: null`, avoiding meaningless configuration delivery.
 - Each `Reloader` of Conf Agent consists of three parts — prober, file_store, and trigger — responsible for pulling, persistence, and triggering the BFE hot reload, respectively.
-- BFE completes hot reload through the `/reload/{module}` interface on the monitoring port, and each module has an independent hot reload path.
+- BFE completes hot reload through the `/reload/{module}` interface on the monitoring port, and each module has an independent hot reload path; `TLSConfReload` relocates the client CA/CRL base directories into the `?path=` versioned directory so that the self-contained version-directory validation can pass.
 - The active version can be checked via the Conf Agent log, the symlink target, or the `version` field in the configuration file.
 - Version rollback can use the historical version directories retained by Conf Agent: manually switch the symlink and reload, without restarting BFE.
 - When upgrading, perform database migration, AI Gateway API replacement, Dashboard upgrade, and Conf Agent configuration checks in order, and pay attention to the compatibility of authentication headers and configuration fields.
@@ -330,4 +342,5 @@ ls -l mod_ai_token_auth
 - `conf-agent/AGENTS.md`
 - `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/00-overview.md`
+- `bfe/docs/zh_cn/sys_design/tls_conf_reload_path.md`
 - [Chapter 21: Configuration Export and Version Control Design](../design/chapter14-config-export-and-version-control.md)

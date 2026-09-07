@@ -554,6 +554,14 @@ func shouldTriggerFallback(res *bfe_http.Response, err error) bool {
 		return true
 	}
 	code := getResponseStatus(res)
+
+	// Protocol-level error normalization seam. Phase 1: the default
+	// normalizer always returns nil, so the legacy status-code whitelist
+	// below keeps deciding, unchanged.
+	if perr := modelprotocol.Get("").ErrorNormalizer().Normalize(code, nil, nil); perr != nil {
+		return perr.IsUpstream && (perr.SwapKey || perr.Retryable)
+	}
+
 	if code >= 500 {
 		return true
 	}
@@ -568,11 +576,13 @@ Trigger conditions include:
 
 - An error during forwarding (connection failure, timeout, etc.);
 - The backend returns 5xx;
-- Degradation status codes additionally specified in the configuration (e.g., 429).
+- The backend status code hits the `aiFallbackStatusCodes` whitelist (400/401/402/403/422/429).
+
+Before the status-code whitelist decides, `shouldTriggerFallback()` first invokes the protocol adapter layer's `ErrorNormalizer().Normalize` seam (`bfe/bfe_model_protocol`; see [Chapter 7: Data Plane Forwarding Design](../design/chapter07-data-plane-design.md) for the adapter layer design). In phase 1 the default normalizer always returns `nil`, so the fallback behavior is identical to previous releases; the seam reserves an extension point for future protocols to customize degradation semantics based on the error body.
 
 Typical cases that do not trigger fallback:
 
-- Client 4xx errors;
+- A client `4xx` error whose status code is not in the `aiFallbackStatusCodes` whitelist;
 - Authentication failure or rate limit rejection;
 - Fallback proactively disabled when the request body is not rewindable.
 
@@ -812,6 +822,8 @@ Understanding the implementation of `mod_ai_route` helps you quickly find the ro
 - `bfe/bfe_modules/bfe_modules.go`
 - `bfe/bfe_basic/request_ai_route.go`
 - `bfe/bfe_server/reverseproxy.go`
+- `bfe/bfe_model_protocol/` (protocol adapter layer, source of the ErrorNormalizer seam in `shouldTriggerFallback`)
+- `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
 - `bfe/docs/zh_cn/modules/mod_ai_route/mod_ai_route.md`
 - `bfe/docs/zh_cn/configuration/mod_ai_route/ai_route.data.md`

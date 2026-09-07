@@ -8,7 +8,7 @@
 - 基于 `github.com/didi/gendry` 的 SQL 构建与扫描机制。
 - DAO 层的通用代码模板、CRUD 函数命名与字段约定。
 - Storage 层如何面向 `model/*` 各子包暴露接口，并完成业务模型到数据库模型的转换。
-- 25 张表的 Storage 映射关系。
+- 27 张表的 Storage 映射关系。
 - 事务抽象 `itxn.TxnStorager` 与 `storage/rdb/txn` 的实现方式。
 - 无物理外键的设计考量与数据一致性保障思路。
 
@@ -30,7 +30,8 @@ storage/rdb/
 ├── auth/                       # 认证/授权 Storage
 ├── basic/                      # 产品线 / BFE 集群 / 附加文件 Storage
 ├── cluster_conf/               # 集群 / 子集群 / 实例池 / LB 矩阵 / ModelPrice Storage
-├── entity/                     # Entity / EntityType Storage
+├── entity/                     # Entity / EntityType / Entity ID 序号分配 Storage
+├── ioperlog/                   # 操作日志 Storage
 ├── model_price/                # 模型定价 Storage
 ├── protocol/                   # TLS 证书 Storage
 ├── provider/                   # Provider Storage
@@ -188,6 +189,8 @@ func TEntityTypeDelete(dbCtx lib.DBContexter, where *TEntityTypeParam) (int64, e
 | `table_pools.go` | `PoolsList2Map` | 列表转 map |
 | `table_clusters.go` | `IDs []int64`、`Names []string` | 支持 `IN` 查询 |
 | `table_sub_clusters.go` | 多字段 `IN` 查询 | 支持 `IDs`、`Names`、`ClusterIDs`、`PoolsIDs` |
+| `table_operation_logs.go` | `TOperationLogCount` | 独立 count 查询，构造 SQL 前删除 `_limit`/`_orderby`，避免分页参数污染 `COUNT(*)` |
+| `table_entity_id_seq.go` | `TEntityIDSeqAllocate` | 原子序号分配：MySQL 单条 `INSERT ... ON DUPLICATE KEY UPDATE` + `LAST_INSERT_ID`，SQLite `INSERT OR IGNORE` + `UPDATE`，分配值不复用 |
 
 这些扩展能力通过 `T<Table>Param` 中新增切片字段实现。`Struct2Where` 对切片字段会原样放入 `where map`，gendry 的 `builder` 包会自动将其转换为 `IN` 子句。对于 `SELECT ... FOR UPDATE`，则在 `T<Table>Param` 中增加 `_lockMode` 字段，由 DAO 在调用 `internal.QueryList` 后追加锁提示。需要强调的是，这些特殊能力仍然是 DAO 层的细节，Storage 层在使用时只需按业务语义设置参数即可。
 
@@ -277,9 +280,9 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 }
 ```
 
-## 25 张表的 Storage 映射关系
+## 27 张表的 Storage 映射关系
 
-根据 `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`，当前系统共 25 张持久化表，按业务模块划分如下。
+根据 `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`，当前系统共 27 张持久化表，按业务模块划分如下。
 
 ### 基础配置（6 张表）
 
@@ -337,7 +340,26 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 |------|----------|------------|------|
 | `model_prices` | `table_model_prices.go` | `storage/rdb/model_price/model_price.go` | 模型定价 |
 
-注意：`route_cases` 表在 DDL 中定义，但当前代码中暂无对应 DAO 与 Storage 实现，因此实际由 DAO + Storage 覆盖的表为 24 张。
+### 操作日志与序号分配（2 张表）
+
+| 表名 | DAO 文件 | Storage 包 | 说明 |
+|------|----------|------------|------|
+| `operation_logs` | `table_operation_logs.go` | `storage/rdb/ioperlog/operation_log.go` | 配置操作日志 |
+| `entity_id_seq` | `table_entity_id_seq.go` | `storage/rdb/entity/id_generator.go` | Entity ID 序号分配 |
+
+`operation_logs` 表记录管理面所有配置写操作，是操作日志模块（`model/ioperlog`，详见 [第六章 控制面核心设计](../design/chapter06-control-plane-design.md)）的持久化载体。表的要点：
+
+- `log_id` 与 access log 的 `LogID` 一致，用于关联与去重；
+- `change_summary` 为 `mediumtext` JSON，记录脱敏后的变更前后快照与 `diff_keys`；
+- 建有 `idx_operator`、`idx_resource`、`idx_action`、`idx_created_at`、`idx_log_id`、`idx_resource_parent` 六个索引，覆盖查询接口的全部过滤维度。
+
+`entity_id_seq` 是 Entity ID 的序号分配表，仅有一行固定记录（`name='entity'`），`next_seq` 保存下一个可用序号。Entity ID 由此前的时间戳/随机数方案改为序列表分配（生成形如 `entity-{seq}` 的业务 ID），`TEntityIDSeqAllocate` 通过原子语句分配序号且已分配值不复用。
+
+注意：`route_cases` 表在 DDL 中定义，但当前代码中暂无对应 DAO 与 Storage 实现，因此实际由 DAO + Storage 覆盖的表为 26 张。
+
+### DDL 与升级说明
+
+项目不提供增量 migration 脚本，`db_ddl.sql`（SQLite 对应 `db_ddl_sqlite.sql`）为全量建表脚本。从旧版本升级时，需要手工在现有库中执行新增表的建表语句（如 `operation_logs`、`entity_id_seq`），应用层不会自动补表。
 
 从映射关系可以看出，Storage 子包的划分依据是业务域而非数据库表数量。例如 `cluster_conf` 子包同时管理 `clusters`、`sub_clusters`、`pools`、`lb_matrices` 四张表，因为这几张表共同服务于集群配置这一业务概念；`route_conf` 子包同时管理 `domains`、`route_basic_rules`、`route_advance_rules`、`route_default_rules`，因为它们共同组成产品级路由规则（AI 网关模式下不用于 AI 请求的 Cluster 选择，仅用于产品线识别上下文或非 AI 流量场景）。这种按业务域聚合的方式，让 Storage 接口更贴近模型层 Manager 的调用需求，避免了 Manager 同时依赖多个细粒度 Storage 的复杂局面。
 
@@ -569,7 +591,7 @@ func (s *RouteRulesStorager) FetchRouteRulesList(
 - DAO 层基于 `github.com/didi/gendry` 构建 SQL，通用 CRUD 封装在 `storage/rdb/internal/dao/internal/curd.go` 中。
 - 每个 DAO 文件遵循统一模板：表名常量、`T<Table>` 结果结构体、`T<Table>Param` 参数结构体、CRUD 函数。
 - Storage 通过 `lib.DBContextFactory` 获取数据库上下文，负责模型转换、JSON 序列化、分页计算和时间戳填充。
-- 25 张表按业务模块映射到不同的 Storage 子包，`route_cases` 当前无 DAO/Storage 实现。
+- 27 张表按业务模块映射到不同的 Storage 子包，`route_cases` 当前无 DAO/Storage 实现。
 - 事务通过 `model/itxn.TxnStorager` 抽象，`storage/rdb/txn/txn.go` 提供基于 RDB 的实现，模型层 Manager 负责编排跨表事务边界。
 - 数据库设计不使用物理外键，由应用层通过逻辑外键和事务保证一致性，兼顾性能与灵活性。
 
@@ -579,4 +601,6 @@ func (s *RouteRulesStorager) FetchRouteRulesList(
 - `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`
 - `ai-gateway-api/storage/rdb/internal/dao/`
 - `ai-gateway-api/storage/rdb/txn/`
+- `ai-gateway-api/db_ddl.sql`
+- `ai-gateway-api/db_ddl_sqlite.sql`
 - `ai-gateway-api/go.mod`

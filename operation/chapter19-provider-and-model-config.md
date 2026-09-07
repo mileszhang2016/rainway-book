@@ -170,6 +170,26 @@ models:
 
 > 说明：`/model-prices` 的 `provider` 字段仅作为价格归集标识，不再强制引用已存在的 `/providers`。因此可以先导入价格，再创建 Provider，二者独立维护。
 
+### 图片输入与视频生成的价格字段与计费模式
+
+BFE 数据面 cluster_conf 的 `ModelTable`（含全局 `Prices` 与 `TierPrices` 两级价格表，tier 初期仅支持 `peak`）包含图片输入与视频生成两个价格字段，在 `prices` 与 `tier_prices` 中均可配置：
+
+| 字段 | 适用模式 | 说明 |
+|------|---------|------|
+| `input_cost_per_image_token` | `image_generation` | 图片输入 token 单价，与按张计费的 `output_cost_per_image` 叠加计入成本 |
+| `output_cost_per_video` | `video_generation` | 视频生成单价，按实际生成的视频个数计费 |
+
+计费模式（mode）还包括以下两种：
+
+| mode | 计费方式 |
+|------|---------|
+| `responses` | 按 chat 计费，即沿用 `input_cost_per_token` / `output_cost_per_token` 等字段的 token 计费逻辑（`/v1/responses` 路径识别为该模式） |
+| `video_generation` | 成本 = `VideoCount × output_cost_per_video`（`/v1/video/generations` 路径识别为该模式） |
+
+对于 `video_generation` 模式，BFE 在认证阶段预读请求体 `n` 字段作为生成个数兜底：字段缺失或非法时按 1 个计费，避免少计费；响应 `usage` 中的 `video_count` 优先作为最终生成个数。相应地，`usage` 统计包含 `image_input_tokens` 与 `video_count` 字段，分别对应访问日志字段 `ai_image_input_tokens`(786) 与 `ai_video_count`(787)（bfe-access-pb v0.3.5）。
+
+实现参考：`bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go` 中的 `ModelPrice` 与价格字段常量、`bfe/bfe_basic/request_ai_basic.go` 中的 `DetectModeFromPath`、`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go` 中的 `calcVideoGenerationCost` / `calcResponsesCost`。完整计费语义见 `bfe/docs/zh_cn/sys_design/rmb_quota.md`。
+
 ## Provider 与 Cluster 的关联
 
 Provider 与 Cluster 通过 `cluster.llm_config.provider` 建立强引用关系。推荐配置顺序为：
@@ -298,7 +318,7 @@ Cluster 不声明 `instance_pool`、`model_endpoint` 或 `provider_type`，这�
 
 Provider 是壬远 AI 网关控制面中描述下游模型提供方的核心资源。Provider 与 Cluster 职责分离后，Cluster 专注转发策略，Provider 专注接入信息，提升了配置复用性、安全性与可维护性。
 
-本章重点包括：Provider 的数据模型与字段含义；通过 Dashboard 与 OpenAPI 创建、更新 Provider 的流程；模型端点、模型列表、Provider Keys 的配置方法与约束；`/providers/tools/discover-models` 无状态模型发现工具的使用；`openai` 与 `anthropic` 协议对认证头、版本头、Usage 解析与协议匹配的影响；通过 `model-list.yaml` 批量导入模型定价的流程与注意事项；Provider 与 Cluster 的强引用关系以及变更时的同步与冲突处理；常见问题的排查思路与配置示例。
+本章重点包括：Provider 的数据模型与字段含义；通过 Dashboard 与 OpenAPI 创建、更新 Provider 的流程；模型端点、模型列表、Provider Keys 的配置方法与约束；`/providers/tools/discover-models` 无状态模型发现工具的使用；`openai` 与 `anthropic` 协议对认证头、版本头、Usage 解析与协议匹配的影响；通过 `model-list.yaml` 批量导入模型定价的流程与注意事项；图片输入 token 与视频按个计费等价格字段及 `responses`、`video_generation` 计费模式；Provider 与 Cluster 的强引用关系以及变更时的同步与冲突处理；常见问题的排查思路与配置示例。
 
 合理规划 Provider 与 Cluster 的拆分，是后续路由规则、API-Key 配额、限流策略生效的重要前提。建议在生产环境中先统一维护 Provider 与模型价格，再按需创建不同业务线的 Cluster。定期对比 `/providers` 与 `/model-prices/actions/get-providers` 返回的 provider 列表，可及时发现并补录价格记录与实际 Provider 脱节的问题，确保成本核算准确。
 

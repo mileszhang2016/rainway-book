@@ -12,8 +12,8 @@ v0.5.0 包含以下组件版本：
 
 | 组件 | 版本 | 说明 |
 |---|---|---|
-| AI Gateway API | v0.0.8 | 控制面 |
-| BFE | v1.8.6 | 数据面 |
+| AI Gateway API | v0.0.9 | 控制面 |
+| BFE | v1.8.7 | 数据面 |
 | Dashboard | v0.0.8 | 控制台（内嵌于 API 镜像） |
 | conf-agent | v0.0.6 | 配置热加载代理 |
 | Log Reader | v1.2.0 | 访问日志 → Kafka |

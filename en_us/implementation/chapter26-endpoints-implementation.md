@@ -41,6 +41,7 @@ ai-gateway-api/endpoints/
 │   ├── entity_type/          # /entity-types
 │   ├── global_route_rules/   # /global-route-rules
 │   ├── model_price/          # /model-prices
+│   ├── operation_log/        # /operation-logs
 │   ├── product_cluster/      # /clusters
 │   ├── provider/             # /providers
 │   ├── route/                # /expression/verify
@@ -55,6 +56,7 @@ ai-gateway-api/endpoints/
     ├── mod_api_key/
     ├── mod_body_process/
     ├── protocol/
+    ├── quota_reset/            # /quota/trigger-reset
     ├── rate_limit_policy/
     ├── server_data/
     └── export_util/
@@ -377,6 +379,7 @@ func endpoints() []*xreq.Endpoint {
         route_tables.Endpoints,
         model_price.Endpoints,
         provider.Endpoints,
+        operation_log.Endpoints,
     )
 }
 
@@ -420,6 +423,7 @@ func endpoints() []*xreq.Endpoint {
         extra_file.ExportExtraFileEndpoint,
         mod_api_key.ExportRoute,
         mod_body_process.ExportRoute,
+        quota_reset.TriggerResetRoute,
         rate_limit_policy.ExportRoute,
         ai_route.ExportRoute,
     }
@@ -437,7 +441,7 @@ func RegisterRouter(router *mux.Router) *mux.Router {
 }
 ```
 
-Unlike OpenAPI, the InnerAPI subtree mounts only `McUserProbe`, not `McProductProbe`, because the Data Plane does not need to distinguish product line context when pulling configuration. Currently, InnerAPI exports nine categories of configuration in total:
+Unlike OpenAPI, the InnerAPI subtree mounts only `McUserProbe`, not `McProductProbe`, because the Data Plane does not need to distinguish product line context when pulling configuration. Currently, InnerAPI registers 10 endpoints in total: nine categories of configuration export endpoints plus one quota trigger-reset endpoint:
 
 | Endpoint Path | Config Topic | Description |
 |---|---|---|
@@ -450,8 +454,51 @@ Unlike OpenAPI, the InnerAPI subtree mounts only `McUserProbe`, not `McProductPr
 | `/configs/mod-body-process` | `mod_body_process` | Request body processing configuration |
 | `/configs/rate-limit-policy` | `mod_ai_rate_limit` | Rate limit policy configuration |
 | `/configs/ai-route` | `ai_route` | AI route configuration |
+| `/quota/trigger-reset` | None | Manually trigger a quota period reset; returns `{"status":"ok"}` |
 
 All InnerAPI export endpoints support the `version` query parameter, which is parsed by `export_util.NewExportFromReq` and then handed to the corresponding Manager's `ConfigExport` method. When the requested version matches the current version, `Data: nil` is returned to avoid redundant distribution.
+
+---
+
+## Operation Log Query and Quota Trigger Reset
+
+### OpenAPI: Operation Log Query
+
+`endpoints/openapi_v1/operation_log/list.go` exposes `GET /open-api/v1/operation-logs` for paginated queries of configuration operation logs. It is the only outward interface of the operation log module (see [Chapter 6: Control Plane Core Design](../design/chapter06-control-plane-design.md)):
+
+```go
+// ai-gateway-api/endpoints/openapi_v1/operation_log/list.go
+var OperationLogListRoute = &xreq.Endpoint{
+    Path:       "/operation-logs",
+    Method:     http.MethodGet,
+    Handler:    xreq.Convert(OperationLogListAction),
+    Authorizer: iauth.FA(iauth.FeatureOperationLog, iauth.ActionReadAll),
+}
+```
+
+The endpoint binds query parameters with `xreq.BindForm`: `operator_name`, `action`, `resource_type`, `resource_id`, `resource_name`, `resource_parent_id`, `status` (`1` = success / `2` = failed), `start_time` / `end_time` (Unix seconds), `page` (default 1), and `page_size` (default 20, capped at 100). The Action converts these into an `ioperlog.OperationLogFilter` and calls `container.OperationLogManager.QueryLogs`. The response is `{list, pagination:{page, page_size, total}}`; each `list` item carries `log_id`, operator and resource fields, `status`, `error_msg`, `change_summary`, `request_path` / `request_method`, `client_ip` / `user_agent`, etc., with `created_at` returned as a Unix timestamp in seconds.
+
+### InnerAPI: Quota Trigger Reset
+
+`endpoints/innerapi_v1/quota_reset/quota_reset.go` exposes `POST /inner-api/v1/quota/trigger-reset` to manually trigger a distributed-lock-protected quota period reset:
+
+```go
+// ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go
+var TriggerResetRoute = &xreq.Endpoint{
+    Path:    "/quota/trigger-reset",
+    Method:  http.MethodPost,
+    Handler: xreq.Convert(TriggerResetAction),
+}
+
+func TriggerResetAction(req *http.Request) (interface{}, error) {
+    if container.QuotaResetScheduler != nil {
+        container.QuotaResetScheduler.TriggerReset()
+    }
+    return map[string]string{"status": "ok"}, nil
+}
+```
+
+Unlike the export endpoints, `TriggerResetRoute` has **no `Authorizer` configured**: it serves operational triggering scenarios and skips Feature-level permission checks (it still goes through the `McUserProbe` identity resolution on the InnerAPI subtree). The scheduling, distributed locking, and atomic deduction details of quota reset are covered in the quota-related chapters.
 
 ---
 
@@ -645,6 +692,8 @@ The following table summarizes the core code locations covered in this chapter a
 | `ai-gateway-api/lib/xreq/param.go` | JSON / URI / Form parameter binding and validation |
 | `ai-gateway-api/lib/xreq/validate.go` | Custom `Validator` interface support |
 | `ai-gateway-api/endpoints/openapi_v1/entity_type/create.go` | Typical OpenAPI Action example |
+| `ai-gateway-api/endpoints/openapi_v1/operation_log/list.go` | Operation log query endpoint |
+| `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go` | Quota trigger reset endpoint |
 | `ai-gateway-api/endpoints/innerapi_v1/mod_api_key/export.go` | Typical InnerAPI export Action example |
 
 ---
@@ -655,7 +704,8 @@ The following table summarizes the core code locations covered in this chapter a
 - `xreq.Endpoint` unifies path, method, Handler, authorization, and custom registration, and is the core abstraction of the interface layer. Business Actions are converted to `Endpoint.Handler` via `xreq.Convert`.
 - Recovery, Logger, and CORS act as global middleware applying to all APIs; Product Probe and User Probe act as route-subtree middleware serving OpenAPI and InnerAPI respectively, where User Probe handles identity resolution and each Endpoint's `Authorizer` handles fine-grained permission validation.
 - OpenAPI v1 merges the `[]*xreq.Endpoint` exported by each sub-package via the `merge` function and registers them under `/open-api/v1`.
-- InnerAPI v1 registers nine categories of configuration export endpoints through a fixed slice; all export endpoints support `version`-based incremental synchronization, implemented jointly by `export_util.NewExportFromReq` and `model/iversion_control`.
+- InnerAPI v1 registers nine categories of configuration export endpoints through a fixed slice; all export endpoints support `version`-based incremental synchronization, implemented jointly by `export_util.NewExportFromReq` and `model/iversion_control`. It also registers `POST /quota/trigger-reset` for manually triggering a quota period reset.
+- OpenAPI provides the `GET /open-api/v1/operation-logs` operation log query endpoint, authorized by `FeatureOperationLog + ActionReadAll`, returning `{list, pagination}`.
 - Parameter binding is done by `xreq.Bind*`, supporting struct tag validation and custom `Validator`; permission validation is mounted on each Endpoint via `iauth.FA`; the unified response is completed by `xreq.Result` and `xreq.Render`, returning `{ErrNum, Data, ErrMsg}` uniformly to the outside.
 
 ---
@@ -675,6 +725,8 @@ The following table summarizes the core code locations covered in this chapter a
 - `ai-gateway-api/endpoints/middleware/product_probe.go`
 - `ai-gateway-api/endpoints/middleware/user_probe.go`
 - `ai-gateway-api/endpoints/openapi_v1/entity_type/create.go`
+- `ai-gateway-api/endpoints/openapi_v1/operation_log/list.go`
+- `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`
 - `ai-gateway-api/endpoints/innerapi_v1/mod_api_key/export.go`
 - [Chapter 6: Control Plane Core Design: AI Gateway API](../design/chapter06-control-plane-design.md)
 - [Chapter 21: Config Export and Version Control Design](../design/chapter14-config-export-and-version-control.md)

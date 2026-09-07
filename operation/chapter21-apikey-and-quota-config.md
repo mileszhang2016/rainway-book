@@ -181,6 +181,8 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 
 `unit = total_token` 适用于按 Token 计费的模型（如 OpenAI、Anthropic）。系统直接统计输入与输出 Token 的总量，并从余额中扣减。该方式直观、易于理解，适合模型单价相对固定或按 Token 采购的场景。
 
+`total_token` 配额允许配置为 `0`，表示**无余额计划**：控制面校验只要求 `quota >= 0`（`ai-gateway-api/lib/validate/validate.go` 中的 `QuotaValue`），绑定该计划的 API-Key/Entity 发起的请求在数据面直接被拒（429 QuotaExhausted）。如需临时放行，可设置 `pass_when_no_enough_quota=true`；RMB 配额同样允许为 0，语义一致。
+
 ```json
 {
   "quota_plan": {
@@ -262,6 +264,8 @@ curl http://localhost:8183/open-api/v1/api-keys/apikey-001/quota-plan \
 
 余额直接读取 Redis，是实时数据；Redis 不可用时查询接口会报错。无限配额返回 sentinel balance（`used=0`，`remaining=100000000`）。
 
+> 注意：数据面将 Redis 中**缺失的余额 key 视为余额耗尽**而非内部错误：`QuotaPlan.HasBalance`（`bfe/bfe_modules/mod_ai_token_auth/token.go`）通过 `IsKeyNotFound`（`bfe/bfe_util/redis_client/client.go`）识别 key 不存在的情况，按余额 0 处理并返回 QuotaExhausted（429），不再返回 500。例如配额配置为 0 且从未同步过 Redis 的 key，即属于此场景。
+
 ### 手动重置配额
 
 当需要提前恢复额度、修正配额总量或修复 Redis 异常时，可调用重置接口：
@@ -288,6 +292,19 @@ Entity 的余额查询与重置接口为 `/entities/{id}/quota-plan` 与 `/entit
 系统每分钟执行一次 `ResetExpiredBalances`，对 `reset_period` 为 `weekly` 或 `monthly` 且非无限配额的计划进行周期重置。周期重置会同时更新 Redis 与 `quota_plans.last_reset_at`。
 
 手动重置仅重置 Redis 余额，不更新 `last_reset_at`。例如，管理员在月中临时将某项目配额从 5000 元调整为 8000 元并手动重置，周期调度器仍会在下月 1 日按新的 `quota` 自动重置，不会受到本次手动操作的干扰。
+
+### 手动触发周期重置（Inner API）
+
+除等待每分钟一次的定时任务外，控制面还提供 Inner API 可立即触发一次周期重置（与定时任务执行同一入口 `QuotaResetScheduler.resetQuotas`，`ai-gateway-api/model/quota/scheduler.go`）：
+
+```bash
+curl -X POST http://localhost:8183/inner-api/v1/quota/trigger-reset \
+  -H "Authorization: Token <inner_token>"
+```
+
+成功时返回 `{"status":"ok"}`。该接口带分布式锁保护：Redis 锁 key 为 `quota:reset:scheduler:lock`，TTL 5 分钟并在持有期间自动续期，多副本部署下只有一个实例实际执行重置，与定时任务互斥，不会重复重置。手动触发不影响定时任务的后续执行节奏。
+
+典型使用场景：月初业务高峰前提前恢复额度、修复 Redis 异常后的余额恢复验证等。注意该接口为 Inner API，仅供内部管理与测试调用，鉴权方式与 Conf Agent 一致（`Authorization: Token <token>`）。
 
 ---
 
@@ -585,7 +602,7 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 
 - API-Key 是业务方调用壬远 AI 网关的凭证，支持创建、查询、全量/部分更新、删除及外部 Key 导入；删除时会级联清理专属配置与 Redis Key。
 - `QuotaPlan` 支持 `total_token` 与 `RMB` 两种单位，分别适用于按 Token 总量和按成本预算的场景；RMB 配额在 Redis 内部以定点整数存储，对外按 4 位小数展示。
-- 余额直接读取 Redis，OpenAPI 详情与独立 `quota-plan` 接口均返回实时 `used` / `remaining`；手动重置接口可按当前或新配额恢复余额，且不干扰周期调度。
+- 余额直接读取 Redis，OpenAPI 详情与独立 `quota-plan` 接口均返回实时 `used` / `remaining`；数据面将缺失的 Redis 余额 key 视为余额耗尽（429）而非 500；手动重置接口可按当前或新配额恢复余额，且不干扰周期调度；Inner API `POST /inner-api/v1/quota/trigger-reset` 可在分布式锁保护下立即触发一次周期重置。
 - Entity 支持层级结构，API-Key 挂载后继承模型白名单（交集）、黑名单（并集）、配额计划、限流策略与路由规则；策略按 API-Key 级 → Entity 级 → Global 级优先级生效。
 - 实际配置时，建议先规划 Entity 层级，再为 API-Key 挂载并叠加细粒度策略，以实现组织级预算控制与项目级资源隔离。遇到异常时，应结合 API-Key 状态、配额余额、Entity 继承结果与 BFE 日志综合排查。
 

@@ -142,7 +142,8 @@ DELETE /open-api/v1/certificates/{cert_name}
 Constraints:
 
 - Only non-default certificates can be deleted;
-- After deletion, a default certificate must still remain globally (guaranteed by the system).
+- After deletion, a default certificate must still remain globally (guaranteed by the system);
+- A certificate referenced by a Product cannot be deleted: `CertificateManager.DeleteCertificate` returns 409 Conflict; you must first unbind the certificate from the referencing Product and then delete it.
 
 ---
 
@@ -366,7 +367,7 @@ If you see output like this, domain binding, certificate upload, and HTTPS liste
 
 - Domain binding is maintained through AI Gateway API and is ultimately exported via InnerAPI as the HostTable and RouteTable in BFE's `server_data_conf`.
 - TLS certificates are uploaded via the OpenAPI `/certificates`; the Control Plane validates the certificate and private key format and pairing, and automatically parses the expiration time.
-- There must be exactly one default certificate globally, used for TLS fallback when the SNI does not match; the default certificate cannot be deleted directly.
+- There must be exactly one default certificate globally, used for TLS fallback when the SNI does not match; the default certificate cannot be deleted directly; certificates referenced by a Product are likewise protected from deletion (409 Conflict).
 - It is recommended to establish a certificate expiration monitoring mechanism to complete renewal and verification before expiration, avoiding HTTPS service interruption.
 - HTTPS verification can use `curl -v` to check the certificate chain, SAN, Issuer, and other information; common problems are mostly related to domain binding, certificate chain completeness, and missing default certificates.
 - Multi-domain scenarios can be implemented with a single certificate containing multiple SANs or with independent certificates per domain; BFE automatically selects the best certificate based on SNI.

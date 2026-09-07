@@ -554,6 +554,12 @@ func shouldTriggerFallback(res *bfe_http.Response, err error) bool {
 		return true
 	}
 	code := getResponseStatus(res)
+
+	// 协议级错误归一化挂钩（阶段一默认恒返回 nil，保持白名单行为不变）
+	if perr := modelprotocol.Get("").ErrorNormalizer().Normalize(code, nil, nil); perr != nil {
+		return perr.IsUpstream && (perr.SwapKey || perr.Retryable)
+	}
+
 	if code >= 500 {
 		return true
 	}
@@ -568,11 +574,13 @@ func shouldTriggerFallback(res *bfe_http.Response, err error) bool {
 
 - 转发过程发生错误（连接失败、超时等）；
 - 后端返回 5xx；
-- 配置中额外指定的降级状态码（如 429 等）。
+- 后端返回状态码命中 `aiFallbackStatusCodes` 白名单（400/401/402/403/422/429）。
+
+在状态码白名单判定之前，`shouldTriggerFallback()` 会先调用协议适配层的 `ErrorNormalizer().Normalize` 挂钩（`bfe/bfe_model_protocol`，适配层设计详见 [第七章 数据面转发设计](../design/chapter07-data-plane-design.md)）。阶段一的默认归一化器恒返回 `nil`，因此降级行为与历史版本完全一致；该挂钩为后续新协议按错误体定制降级语义预留了扩展点。
 
 不触发降级的典型情况：
 
-- 客户端 4xx 错误；
+- 客户端 `4xx` 错误且状态码不在 `aiFallbackStatusCodes` 白名单中；
 - 鉴权失败、限流拒绝；
 - 请求体不可回退时主动禁用 fallback。
 
@@ -812,6 +820,8 @@ flowchart TD
 - `bfe/bfe_modules/bfe_modules.go`
 - `bfe/bfe_basic/request_ai_route.go`
 - `bfe/bfe_server/reverseproxy.go`
+- `bfe/bfe_model_protocol/`（协议适配层，`shouldTriggerFallback` 中的 ErrorNormalizer 挂钩来源）
+- `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
 - `bfe/docs/zh_cn/modules/mod_ai_route/mod_ai_route.md`
 - `bfe/docs/zh_cn/configuration/mod_ai_route/ai_route.data.md`

@@ -169,6 +169,8 @@ type TokenUsage struct {
     AudioInputTokens  int64 // audio input tokens
     AudioOutputTokens int64 // audio output tokens
     ImageCount        int64 // number of images generated
+    ImageInputTokens  int64 // image input tokens (already included in PromptTokens)
+    VideoCount        int64 // number of videos generated
     UsedQuota         int64 // used token quota
     UsedCost          int64 // used RMB cost, 1 unit = 1e-8 yuan
 }
@@ -176,39 +178,41 @@ type TokenUsage struct {
 
 `QuotaUsageProcessor` (`bfe/bfe_modules/mod_body_process/content_quota_usage.go:23`) is the response event processor injected by default. It calls `Event.GetQuotaUsage()` on each event and writes the result into `aiBasicInfo.GetTokenUsage()`.
 
-`SSEEvent.GetQuotaUsage()` and `RawEvent.GetQuotaUsage()` have identical implementation logic (`llm_util.go:123`, `body_process.go:422`); both use `gjson` to read the following fields from JSON:
-
-- OpenAI style: `usage.total_tokens`, `usage.prompt_tokens`, `usage.completion_tokens`.
-- DeepSeek cache extension: `usage.cache_read_tokens`, `usage.prompt_cache_hit_tokens`, `usage.prompt_tokens_details.cached_tokens`.
-- Anthropic style: `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens`.
-- Image generation: `usage.image_count`, `data.#`.
+`SSEEvent.GetQuotaUsage()` and `RawEvent.GetQuotaUsage()` have identical implementation logic (`llm_util.go:158`, `body_process.go:421`); both delegate to `extractUsageFields()`; the field extraction rules are converged in the `bfe_model_protocol` protocol adapter layer (see [Chapter 7: Data Plane Design: BFE](../design/chapter07-data-plane-design.md)): `extractUsageFields` first invokes the OpenAI adapter chain (including DeepSeek/Groq/Responses fallbacks), and when prompt/completion are both 0 it composes in the corresponding fields from the Anthropic adapter chain:
 
 ```go
 // bfe/bfe_modules/mod_body_process/llm_util.go
-used := gjson.GetBytes(data, "usage.total_tokens").Int()
-prompt := gjson.GetBytes(data, "usage.prompt_tokens").Int()
-completion := gjson.GetBytes(data, "usage.completion_tokens").Int()
-
-// DeepSeek fallback
-if cacheRead == 0 {
-    cacheRead = gjson.GetBytes(data, "usage.prompt_cache_hit_tokens").Int()
-}
-
-// Claude fallback
-if prompt == 0 && completion == 0 {
-    prompt = gjson.GetBytes(data, "usage.input_tokens").Int()
-    completion = gjson.GetBytes(data, "usage.output_tokens").Int()
+func extractUsageFields(data []byte) modelprotocol.UsageFields {
+    fields := modelprotocol.Get(modelprotocol.ProtocolOpenAI).ExtractUsageFields(data)
+    if fields.PromptTokens == 0 && fields.CompletionTokens == 0 {
+        claude := modelprotocol.Get(modelprotocol.ProtocolAnthropic).ExtractUsageFields(data)
+        fields.PromptTokens = claude.PromptTokens
+        fields.CompletionTokens = claude.CompletionTokens
+        if fields.CacheReadTokens == 0 {
+            fields.CacheReadTokens = claude.CacheReadTokens
+        }
+        if fields.CacheWriteTokens == 0 {
+            fields.CacheWriteTokens = claude.CacheWriteTokens
+        }
+        if fields.UsedQuota == 0 {
+            fields.UsedQuota = claude.UsedQuota
+        }
+    }
+    return fields
 }
 ```
 
-If the response never contains a `usage` field, `IsGuess` stays `true` and `CurrentTokens` is estimated by `EstimateContentToken`, i.e., content length divided by 4 (`llm_util.go:319`). In `QuotaUsageProcessor.Process`, when `UsedQuota <= 0` and estimation is allowed, the estimated value is added to `CompletionTokens`.
+The concrete fields each protocol chain reads (OpenAI style `prompt_tokens`/`completion_tokens`/`total_tokens`, DeepSeek cache extensions, Anthropic style `input_tokens`/`output_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens`, image `image_count`, video `video_count`, image input `input_token_details.image_tokens`) are maintained by the corresponding adapters; extending to a new protocol requires no change to this module.
 
-The extraction logic adopts a "priority + fallback" strategy to accommodate the field naming differences across providers:
+`IsGuess` is `false` when any of `UsedQuota > 0`, `ImageCount > 0`, or `VideoCount > 0` holds; otherwise `CurrentTokens` is estimated by `EstimateContentToken`, i.e., content length divided by 4 (the implementation lives in `bfe/bfe_model_protocol/utils/usage_parse.go:128`; `llm_util.go:345` only forwards the call). In `QuotaUsageProcessor.Process`, when `UsedQuota <= 0` and estimation is allowed, the estimated value is added to `CompletionTokens`.
+
+The composed extraction logic forms a "priority + fallback" strategy to accommodate the field naming differences across providers:
 
 1. OpenAI-style fields are read first: `prompt_tokens`, `completion_tokens`, `total_tokens`.
 2. If both `prompt_tokens` and `completion_tokens` are 0, it falls back to the Anthropic style: `input_tokens`, `output_tokens`.
 3. Cache-hit fields also have multi-layer fallbacks: read `cache_read_tokens` first, then DeepSeek's `prompt_cache_hit_tokens` or `prompt_tokens_details.cached_tokens`, and finally Anthropic's `cache_read_input_tokens`.
-4. In image generation scenarios, `usage.image_count` is preferred, falling back to `data.#` (the length of the `data` array).
+4. In image generation scenarios, `usage.image_count` is preferred; in video generation scenarios, `usage.video_count` is preferred — both fall back to `data.#` (the length of the `data` array).
+5. Image input tokens are read from `usage.input_token_details.image_tokens` first, falling back to `usage.image_input_tokens`.
 
 This layered fallback allows the gateway to identify usage automatically as long as a model follows mainstream conventions, without configuring a field mapping per model.
 
@@ -222,6 +226,8 @@ This layered fallback allows the gateway to identify usage automatically as long
 | `completion_tokens` | `usage.completion_tokens` | OpenAI-style output tokens. |
 | `total_tokens` | `usage.total_tokens` | When present, used directly as `UsedQuota`. |
 | `cache_read_tokens` | Multi-source fallback | Input tokens served from cache, used for RMB tiered pricing. |
+| `image_count` / `video_count` | `usage.image_count` / `usage.video_count` (fallback `data.#`) | Number of images/videos generated, used for per-item billing. |
+| `image_input_tokens` | `usage.input_token_details.image_tokens` (fallback `usage.image_input_tokens`) | Image input tokens; billed separately when `input_cost_per_image_token` is configured. |
 
 ## Cooperation with mod_ai_token_auth
 

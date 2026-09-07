@@ -128,6 +128,18 @@ ConfFileName    = "token_rule.data"
 
 BFE 收到重载请求后，会重新读取对应模块的配置文件并更新内存中的规则表。由于重载过程不涉及进程重启，因此不会中断现有连接。
 
+### tls_conf 版本化热加载与 client CA/CRL 重定位
+
+Conf Agent 下发 TLS 配置采用"版本目录 + 符号链接"方式：它将新版本配置（含 `client_ca`、`client_crl` 等目录的完整副本）写入版本目录 `tls_conf_<version>`，然后先调用 `GET /reload/tls_conf?path=tls_conf_<version>`，让 BFE 在符号链接切换**之前**对版本目录这份自包含配置做一次完整加载校验；仅当 BFE 返回成功后，Conf Agent 才切换 `tls_conf` 软链接并清理过期版本。
+
+`TLSConfReload` 会把版本目录中的全部依赖（`server_cert_conf` / `tls_rule_conf` 以及 client CA/CRL 基目录）都随 `path` 一起重定位到版本目录：client CA/CRL 基目录如果仍从已激活目录 `<confRoot>/tls_conf/client_ca|crl` 读取，当变更涉及"仅存在于版本目录、激活目录中不存在"的 client CA 时，reload 会在 `ClientCALoad` 阶段报"找不到 CA 文件"，Conf Agent 因此无法完成本次切换，后续 reload 也会以同样原因失败。因此重定位是版本目录自包含校验的必要条件。
+
+重定位逻辑（`bfe/bfe_server/bfe_confdata_load.go` 中的 `TLSConfReload` / `tlsConfLoad`）：
+
+- 当 `ClientCABaseDir` / `ClientCRLBaseDir` 位于 `<confRoot>/tls_conf` 之下时，随 `path` 一起重定位到版本目录，与 cert / tls_rule 文件的处理方式一致（复用 `joinPath` 取末段拼接）；
+- 配置为 `tls_conf` 之外的自定义绝对路径（如独立挂载的 `/mnt/ca`）时不命中前缀判断，保持从配置的绝对路径读取；
+- 不带 `path` 的 `/reload/tls_conf` 调用以及 BFE 启动加载路径不从版本目录重定位，`ClientCALoad` / `ClientCRLLoad` 校验逻辑一致——版本目录副本缺失时 reload 仍会正确报错。
+
 ---
 
 ## 如何查看当前生效配置版本
@@ -317,7 +329,7 @@ ls -l mod_ai_token_auth
 - 壬远AI网关采用控制面生成、数据面拉取的配置同步模式：管理员变更先写入数据库，Conf Agent 再按周期从 InnerAPI 拉取并触发 BFE 热加载。
 - `VersionControlManager` 基于 MD5 签名与 `config_versions` 表实现增量同步；配置未变化时返回 `Data: null`，避免无意义的配置下发。
 - Conf Agent 的每个 `Reloader` 由 prober、file_store、trigger 三部分组成，分别负责拉取、持久化与触发 BFE 热加载。
-- BFE 通过监控端口的 `/reload/{module}` 接口完成热加载，各模块对应独立的热加载路径。
+- BFE 通过监控端口的 `/reload/{module}` 接口完成热加载，各模块对应独立的热加载路径；`TLSConfReload` 会把 client CA/CRL 基目录随 `?path=` 版本目录重定位，保证版本目录自包含校验可通过。
 - 生效版本可通过 Conf Agent 日志、软链接指向或配置文件中的 `version` 字段查看。
 - 版本回滚可利用 Conf Agent 保留的历史版本目录手动切换软链接并重新加载，无需重启 BFE。
 - 升级时需按顺序执行数据库迁移、AI Gateway API 替换、Dashboard 升级与 Conf Agent 配置检查，并注意鉴权头与配置字段的兼容性。
@@ -330,4 +342,5 @@ ls -l mod_ai_token_auth
 - `conf-agent/AGENTS.md`
 - `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/00-overview.md`
+- `bfe/docs/zh_cn/sys_design/tls_conf_reload_path.md`
 - [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)

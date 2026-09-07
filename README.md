@@ -12,8 +12,8 @@ v0.5.0 includes the following component versions:
 
 | Component | Version | Description |
 |---|---|---|
-| AI Gateway API | v0.0.8 | Control Plane |
-| BFE | v1.8.6 | Data Plane |
+| AI Gateway API | v0.0.9 | Control Plane |
+| BFE | v1.8.7 | Data Plane |
 | Dashboard | v0.0.8 | Management console (embedded in the API image) |
 | conf-agent | v0.0.6 | Configuration hot reload agent |
 | Log Reader | v1.2.0 | Access log → Kafka |

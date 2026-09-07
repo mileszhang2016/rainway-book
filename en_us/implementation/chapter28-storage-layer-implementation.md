@@ -8,7 +8,7 @@ This chapter focuses on the lowest-level data persistence mechanism of AI Gatewa
 - The SQL building and scanning mechanism based on `github.com/didi/gendry`.
 - The generic code template of the DAO layer, CRUD function naming, and field conventions.
 - How the Storage layer exposes interfaces to the `model/*` subpackages and converts business models to database models.
-- The Storage mapping for the 25 tables.
+- The Storage mapping for the 27 tables.
 - The transaction abstraction `itxn.TxnStorager` and the implementation in `storage/rdb/txn`.
 - The design rationale for the absence of physical foreign keys, and how data consistency is guaranteed.
 
@@ -30,7 +30,8 @@ storage/rdb/
 ├── auth/                       # authentication / authorization Storage
 ├── basic/                      # product line / BFE cluster / extra file Storage
 ├── cluster_conf/               # cluster / sub-cluster / instance pool / LB matrix / ModelPrice Storage
-├── entity/                     # Entity / EntityType Storage
+├── entity/                     # Entity / EntityType / Entity ID sequence Storage
+├── ioperlog/                   # operation log Storage
 ├── model_price/                # model pricing Storage
 ├── protocol/                   # TLS certificate Storage
 ├── provider/                   # Provider Storage
@@ -189,6 +190,8 @@ Some tables extend the generic template with special capabilities:
 | `table_pools.go` | `PoolsList2Map` | Convert list to map |
 | `table_clusters.go` | `IDs []int64`, `Names []string` | Supports `IN` queries |
 | `table_sub_clusters.go` | Multi-field `IN` queries | Supports `IDs`, `Names`, `ClusterIDs`, `PoolsIDs` |
+| `table_operation_logs.go` | `TOperationLogCount` | Standalone count query that removes `_limit`/`_orderby` before building SQL, so pagination parameters do not pollute `COUNT(*)` |
+| `table_entity_id_seq.go` | `TEntityIDSeqAllocate` | Atomic sequence allocation: a single `INSERT ... ON DUPLICATE KEY UPDATE` + `LAST_INSERT_ID` on MySQL, `INSERT OR IGNORE` + `UPDATE` on SQLite; allocated values are never reused |
 
 These extended capabilities are implemented by adding slice fields to `T<Table>Param`. `Struct2Where` puts slice fields into the `where map` as-is, and gendry's `builder` package automatically converts them into `IN` clauses. For `SELECT ... FOR UPDATE`, a `_lockMode` field is added to `T<Table>Param`, and the DAO appends the lock hint after calling `internal.QueryList`. It is worth emphasizing that these special capabilities remain DAO-layer details; the Storage layer only needs to set parameters according to business semantics when using them.
 
@@ -278,9 +281,9 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 }
 ```
 
-## Storage Mapping for the 25 Tables
+## Storage Mapping for the 27 Tables
 
-According to `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`, the current system has 25 persistent tables in total, divided by business module as follows.
+According to `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`, the current system has 27 persistent tables in total, divided by business module as follows.
 
 ### Basic Configuration (6 tables)
 
@@ -338,7 +341,26 @@ According to `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`, t
 |-------|----------|-----------------|-------------|
 | `model_prices` | `table_model_prices.go` | `storage/rdb/model_price/model_price.go` | Model pricing |
 
-Note: the `route_cases` table is defined in the DDL, but there is currently no corresponding DAO or Storage implementation in the code, so the tables actually covered by DAO + Storage number 24.
+### Operation Logs and Sequence Allocation (2 tables)
+
+| Table | DAO file | Storage package | Description |
+|-------|----------|-----------------|-------------|
+| `operation_logs` | `table_operation_logs.go` | `storage/rdb/ioperlog/operation_log.go` | Configuration operation logs |
+| `entity_id_seq` | `table_entity_id_seq.go` | `storage/rdb/entity/id_generator.go` | Entity ID sequence allocation |
+
+The `operation_logs` table records all configuration write operations on the management plane and is the persistence carrier of the operation log module (`model/ioperlog`; see [Chapter 6: Control Plane Core Design](../design/chapter06-control-plane-design.md)). Key points of the table:
+
+- `log_id` is identical to the `LogID` in access logs, for correlation and deduplication;
+- `change_summary` is a `mediumtext` JSON column holding masked before/after snapshots and `diff_keys`;
+- Six indexes are created — `idx_operator`, `idx_resource`, `idx_action`, `idx_created_at`, `idx_log_id`, and `idx_resource_parent` — covering all filter dimensions of the query interface.
+
+`entity_id_seq` is the sequence allocation table for Entity IDs, holding a single fixed row (`name='entity'`) whose `next_seq` column stores the next available sequence number. The Entity ID generation scheme changed from timestamps/random numbers to sequence-table allocation (producing business IDs like `entity-{seq}`); `TEntityIDSeqAllocate` allocates numbers atomically and never reuses allocated values.
+
+Note: the `route_cases` table is defined in the DDL, but there is currently no corresponding DAO or Storage implementation in the code, so the tables actually covered by DAO + Storage number 26.
+
+### DDL and Upgrade Notes
+
+The project provides no incremental migration scripts; `db_ddl.sql` (with `db_ddl_sqlite.sql` for SQLite) is a full table-creation script. When upgrading from an older version, the CREATE TABLE statements for newly added tables (such as `operation_logs` and `entity_id_seq`) must be executed manually against the existing database; the application layer does not create missing tables automatically.
 
 From the mapping it can be seen that Storage subpackages are divided by business domain rather than by the number of database tables. For example, the `cluster_conf` subpackage manages four tables — `clusters`, `sub_clusters`, `pools`, and `lb_matrices` — because these tables jointly serve the business concept of cluster configuration. The `route_conf` subpackage manages `domains`, `route_basic_rules`, `route_advance_rules`, and `route_default_rules` at the same time, because together they form the product-level route rules (in AI gateway mode they are not used for Cluster selection of AI requests, and are only used for product line identification context or non-AI traffic scenarios). This business-domain aggregation makes Storage interfaces closer to the call patterns of the model-layer Manager, avoiding the complexity of a Manager depending on multiple fine-grained Storages simultaneously.
 
@@ -570,7 +592,7 @@ This chapter introduced in detail the storage layer implementation of the Rainwa
 - The DAO layer builds SQL based on `github.com/didi/gendry`; the generic CRUD wrapper lives in `storage/rdb/internal/dao/internal/curd.go`.
 - Each DAO file follows a unified template: table name constant, `T<Table>` result struct, `T<Table>Param` parameter struct, and CRUD functions.
 - Storage obtains the database context via `lib.DBContextFactory` and is responsible for model conversion, JSON serialization, pagination calculation, and timestamp filling.
-- The 25 tables are mapped to different Storage subpackages by business module; `route_cases` currently has no DAO/Storage implementation.
+- The 27 tables are mapped to different Storage subpackages by business module; `route_cases` currently has no DAO/Storage implementation.
 - Transactions are abstracted through `model/itxn.TxnStorager`; `storage/rdb/txn/txn.go` provides an RDB-based implementation, and the model-layer Manager is responsible for orchestrating cross-table transaction boundaries.
 - The database design uses no physical foreign keys; consistency is guaranteed by the application layer through logical foreign keys and transactions, balancing performance and flexibility.
 
@@ -580,4 +602,6 @@ This chapter introduced in detail the storage layer implementation of the Rainwa
 - `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`
 - `ai-gateway-api/storage/rdb/internal/dao/`
 - `ai-gateway-api/storage/rdb/txn/`
+- `ai-gateway-api/db_ddl.sql`
+- `ai-gateway-api/db_ddl_sqlite.sql`
 - `ai-gateway-api/go.mod`

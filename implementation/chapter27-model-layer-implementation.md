@@ -12,6 +12,7 @@
 - 跨包适配器模式（Adapter）如何解决不同子包接口签名不一致的问题。
 - 典型 Manager（以 `APIKeyManager` 为例）如何编排参数校验、关联资源级联创建、Redis 缓存最终一致性同步等流程。
 - `QuotaPlanManager` 如何在事务外完成跨资源的配额余额重置。
+- `QuotaResetScheduler` 如何通过 Redis 分布式锁在多实例下互斥执行周期重置，以及 `ResetToQuotaAtomic` 与 `last_reset_at` 条件更新如何保证重置的原子性与幂等性。
 
 理解这些设计模式后，读者可以快速定位新增业务需求应该落在哪一层、应该遵循哪些约定，也能够为模型层编写符合既有风格的单元测试。
 
@@ -314,6 +315,7 @@ classDiagram
         +GetRemaining(ctx, key, unit)
         +SetRemaining(ctx, key, quota, unit)
         +ResetToQuota(ctx, key, quota, unit)
+        +ResetToQuotaAtomic(ctx, key, quota, unit)
         +DeleteKeys(ctx, keys)
     }
 
@@ -597,6 +599,57 @@ func (m *QuotaPlanManager) ResetBalance(ctx context.Context, planID int64, newQu
 
 除了 `ResetBalance`，`QuotaPlanManager` 还提供了 `ApplyQuotaPlanChange`，用于在 API-Key 或 Entity 更新配额计划时，仅在 `quota`、`unit`、`unlimited` 发生变化的情况下调整 Redis 余额，避免普通属性修改导致配额使用量被清零。该方法的实现同样遵循“先判断差异、再按需调整”的保守策略，体现了模型层对数据一致性的谨慎处理。
 
+## 周期重置的互斥执行与原子性保障
+
+配额周期重置在互斥执行与原子性两方面有保障：通过 Redis 分布式锁保证多实例部署下仅一个实例执行重置；周期重置路径使用原子 SET（`ResetToQuotaAtomic`）替代 read-modify-write 的 `IncrBy(delta)`，并配合 `last_reset_at` 条件更新兜底幂等。两者分别落在 `model/quotacache` 与 `model/quota` 两个包中。
+
+### 分布式锁抽象（model/quotacache/lock.go）
+
+`quotacache.DistributedLock` 定义了三个操作：
+
+```go
+// model/quotacache/lock.go
+type DistributedLock interface {
+    Acquire(ctx context.Context, key, token string, ttl time.Duration) (bool, error)
+    Release(ctx context.Context, key, token string) error
+    Renew(ctx context.Context, key, token string, ttl time.Duration) error
+}
+```
+
+`redisDistributedLock` 基于 BFE 的 `redis_client.Client` 用三段 Lua 脚本实现（该接口未暴露 `SET NX PX`，但提供 `NewScript/Run`）：Acquire 用 `EXISTS` + `SETEX` 模拟 SET NX PX 语义；Release 与 Renew 都先比较 `GET == token` 再执行 `DEL` / `EXPIRE`。token 校验是关键安全点：只有锁的持有者才能释放或续期，实例宕机重启后不会误删由其他实例持有的同名锁。
+
+### 调度器加锁流程（model/quota/scheduler.go）
+
+`QuotaResetScheduler` 构造时注入 `DistributedLock`，启动时生成实例唯一的 `instanceToken`（UUID）。每轮 `resetQuotas` 的流程：
+
+1. 申请锁，key 固定为 `quota:reset:scheduler:lock`，TTL 5 分钟；申请失败直接跳过本轮；
+2. 启动看门狗协程，按 TTL/3 周期调用 `Renew` 续期，重置耗时长于 TTL 时锁不会中途易主；
+3. 执行 `BalanceSyncManager.ResetExpiredBalances`；
+4. `defer` 中调用 `Release`，Lua 脚本校验 token 后删除锁。
+
+`TriggerReset()` 直接复用同一入口（`resetQuotasWithRecover`），因此 Inner API `POST /inner-api/v1/quota/trigger-reset` 的手动触发与定时执行具有完全相同的锁保护语义，且不影响 ticker 的下一次触发时间。
+
+### 原子重置与条件更新（model/quotacache/redis.go、model/quota/balance_sync.go）
+
+`redisQuotaCache` 新增预编译 Lua 脚本 `setQuotaScript`（`redis.call('set', KEYS[1], ARGV[1])`），由 `ResetToQuotaAtomic` 执行。与 `SetRemaining` 的 read-modify-write 不同，原子 SET 不读取当前值，结果恒等于目标配额，消除了“读旧值、算 delta、并发扣减穿插其间”导致的最终结果偏差。
+
+`BalanceSyncManager.resetAPIKeysRedisUsage` 对计划下所有 API-Key 与 Entity 调用 `ResetToQuotaAtomic` 后，`ResetExpiredBalances` 用条件更新推进重置水位：
+
+```go
+// model/quota/balance_sync.go
+periodStart := m.getPeriodStart(*plan.ResetPeriod, now)
+_, err = m.planStorager.UpdateQuotaPlan(ctx, &QuotaPlanFilter{
+    ID:                plan.ID,
+    LastResetAtBefore: &periodStart, // 仅当 last_reset_at 早于本周期起点时才更新
+}, &QuotaPlanParam{
+    LastResetAt: lib.PTime(now),
+})
+```
+
+`LastResetAtBefore` 是 `QuotaPlanFilter`（`model/quota/quota_plan.go`）新增的过滤字段，语义为“仅当 `last_reset_at` 早于本周期起点时才更新”。即使分布式锁失效、同周期内出现第二次重置，该条件更新的影响行数也为 0，`last_reset_at` 不会前进；配合原子 SET 的幂等性，重复重置无副作用。
+
+需要注意，手动重置路径（`QuotaPlanManager.ResetBalance`）仍走 `ResetToQuota`（内部即 `SetRemaining` 的 `IncrBy(delta)`），因为手动重置要求把剩余量补到配额总量、需要基于当前值算差额；周期重置则要求“无条件归零到配额总量”，两者语义不同，实现也刻意分开。
+
 ## 关键代码片段
 
 ### 1. 事务抽象接口
@@ -654,6 +707,47 @@ if param.Key != nil && param.QuotaPlan != nil &&
 }
 ```
 
+### 5. 分布式锁 Lua 脚本
+
+```go
+// ai-gateway-api/model/quotacache/lock.go
+const lockAcquireScript = `
+if redis.call('exists', KEYS[1]) == 0 then
+    redis.call('setex', KEYS[1], tonumber(ARGV[2]), ARGV[1])
+    return 1
+else
+    return 0
+end
+`
+const lockReleaseScript = `
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+`
+```
+
+### 6. 原子重置 Lua 脚本与 last_reset_at 条件更新
+
+```go
+// ai-gateway-api/model/quotacache/redis.go
+const setQuotaScriptSrc = `
+redis.call('set', KEYS[1], ARGV[1])
+return 1
+`
+```
+
+```go
+// ai-gateway-api/model/quota/balance_sync.go
+_, err = m.planStorager.UpdateQuotaPlan(ctx, &QuotaPlanFilter{
+    ID:                plan.ID,
+    LastResetAtBefore: &periodStart, // 仅当 last_reset_at 早于本周期起点时才更新
+}, &QuotaPlanParam{
+    LastResetAt: lib.PTime(now),
+})
+```
+
 ## 本章小结
 
 本章介绍了壬远 AI 网关模型层的 Manager 与 Storager 模式：
@@ -663,6 +757,7 @@ if param.Key != nil && param.QuotaPlan != nil &&
 3. **适配器模式**：`NewXxxStoragerAdapter` 把各子包的具体 Storager 适配为 `model/shared` 中的通用接口，降低 Manager 之间的耦合，也让单元测试更容易 mock。
 4. **典型实现**：`APIKeyManager` 展示了参数校验、关联资源级联创建、事务编排、Redis 最终一致性同步的完整流程。创建时先校验再级联创建子资源，查询时填充关联数据并在事务外读取实时余额，删除时先级联清理子资源再回收 Redis Key。
 5. **最终一致性**：Redis 配额缓存的写入/删除/重置放在事务外，失败只记录日志，避免引入分布式事务的复杂度。配额缓存本身可基于 DB 重建，因此短暂不一致是可接受的。
+6. **周期重置可靠性**：`QuotaResetScheduler` 通过 `quotacache.DistributedLock`（key `quota:reset:scheduler:lock`，TTL 5 分钟，TTL/3 看门狗续期，token 校验释放）保证多实例互斥执行；`BalanceSyncManager` 用 `ResetToQuotaAtomic` 原子 SET 替代 `IncrBy(delta)` 消除 read-modify-write 竞争，并以 `LastResetAtBefore` 条件更新 `last_reset_at` 兜底同周期重复重置的幂等性。
 
 模型层通过接口隔离与依赖注入，既保证了业务逻辑的内聚性，又为单元测试和后续扩展提供了清晰的边界。开发者在新增业务模型时，只需按照四层抽象补齐 Param、Filter、Storager、Manager，并通过 `AtomExecute` 编排事务，即可快速融入现有体系。
 
@@ -675,5 +770,12 @@ if param.Key != nil && param.QuotaPlan != nil &&
 - `ai-gateway-api/model/entity/entity.go`
 - `ai-gateway-api/model/quota/quota_plan_manager.go`
 - `ai-gateway-api/model/quota/adapters.go`
+- `ai-gateway-api/model/quota/scheduler.go`
+- `ai-gateway-api/model/quota/balance_sync.go`
+- `ai-gateway-api/model/quota/quota_plan.go`
+- `ai-gateway-api/model/quotacache/quotacache.go`
+- `ai-gateway-api/model/quotacache/redis.go`
+- `ai-gateway-api/model/quotacache/lock.go`
+- `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`
 - `ai-gateway-api/model/shared/types.go`
 - `ai-gateway-api/stateful/container/rdb/components.go`

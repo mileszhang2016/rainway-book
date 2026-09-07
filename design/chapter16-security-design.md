@@ -8,7 +8,7 @@
 - API-Key 作为请求链路的直接凭证，如何在控制面存储、如何随 Entity 继承策略、如何在数据面被校验；
 - 控制面的认证授权模型（Visitor、Scope、Feature-Action）及其与 OpenAPI / InnerAPI 的集成方式；
 - TLS/HTTPS 在控制面与数据面的配置要点；
-- 访问日志审计字段如何支撑安全事件追溯与计费对账；
+- 访问日志审计字段与控制面操作日志如何支撑安全事件追溯与计费对账；
 - Redis 中 Quota Key 与 Rate-Limit Key 的清理触发条件与敏感数据保护实践；
 - 限流与配额如何作为安全防线防止滥用与成本失控；
 - 模型白名单与黑名单如何按 Entity 层级继承；
@@ -246,6 +246,12 @@ BFE 数据面在请求处理各阶段（认证、限流、配额、转发）会�
 - 特定 IP 段大量触发 `QUOTA_EXHAUSTED`；
 - 某个模型被大量请求但多数返回 `MODEL_NOT_ALLOWED`。
 
+### 控制面操作日志审计
+
+除数据面访问日志外，控制面通过操作日志（Operation Log）模块（`model/ioperlog`）对 Entity、API-Key、Provider、证书等配置域的写操作进行持久化审计：记录操作者、动作、资源类型与名称、变更摘要（`change_summary`）、请求路径、客户端 IP 等字段，写入 `operation_logs` 表，并可通过 `GET /open-api/v1/operation-logs` 分页查询（`endpoints/openapi_v1/operation_log/list.go`）。该接口要求 `FeatureOperationLog` 的读取权限，敏感字段会做掩码处理。
+
+操作日志与访问日志互补：前者回答"谁在控制面改了什么配置"，后者回答"数据面拒绝了哪些请求"，两者结合可以完整还原一次安全事件的操作链路与影响范围。
+
 ---
 
 ## Redis Key 清理与敏感数据保护
@@ -412,7 +418,7 @@ BFE 的 TLS 配置通常位于 `conf/tls_conf/tls_rule_conf.data`，示例片段
 - 壬远AI网关采用分层防御思想，安全机制覆盖传输层、认证授权层、请求准入层与策略执行层。
 - API-Key 是请求链路的直接凭证，应通过 HTTPS 传输，并结合 Entity 继承实现组织级策略管控。
 - 控制面采用 Visitor 抽象与 Feature-Action 权限模型，支持 Password、Session、Token、Skip 四种认证方式；生产环境必须关闭 `SkipTokenValidate`。
-- 数据面 BFE 输出结构化错误响应与访问日志字段，支撑安全审计、异常检测与计费对账。
+- 数据面 BFE 输出结构化错误响应与访问日志字段，支撑安全审计、异常检测与计费对账；控制面操作日志持久化记录配置写操作，可经 `GET /open-api/v1/operation-logs` 审计追溯。
 - Redis 中的 Quota Key 与 Rate-Limit Key 在 API-Key / Entity 删除或策略变更时会被主动清理，避免残留数据带来的安全风险。
 - 限流与配额是防止 API-Key 泄露、滥用和成本失控的关键防线，支持 API-Key 与 Entity 多层级继承。
 - IP 子网控制、API-Key 认证、模型黑白名单、配额与限流共同构成请求准入的安全屏障，按“IP 白名单 → API-Key 认证 → 模型黑白名单 → 配额/限流”顺序逐层拦截。

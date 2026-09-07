@@ -9,6 +9,8 @@
 - 管理面 OpenAPI 与数据面 InnerAPI 的职责划分与路由组织方式；
 - `xreq.Endpoint` 统一抽象如何简化接口注册、鉴权与中间件处理；
 - 全局容器（`stateful/container`）与手动依赖注入的实现方式；
+- 操作日志模块的写入机制、脱敏规则与审计价值；
+- 资源依赖冲突的 409 Conflict 错误约定；
 - 从 `main.go` 到 HTTP 服务启动的完整流程。
 
 ---
@@ -26,7 +28,7 @@
 | Conf Agent | 配置代理 | 轮询 InnerAPI，拉取最新配置并触发 BFE 热加载 |
 | Service Controller | 服务发现 | 向控制面同步后端服务实例信息 |
 
-AI Gateway API 当前的功能范围覆盖：API-Key / Entity / Entity-Type 管理、Provider 与 Cluster 管理、模型定价管理、配额计划与限流策略管理、AI 路由规则管理、证书与附加文件管理、认证授权以及面向数据面的配置导出。
+AI Gateway API 当前的功能范围覆盖：API-Key / Entity / Entity-Type 管理、Provider 与 Cluster 管理、模型定价管理、配额计划与限流策略管理、AI 路由规则管理、证书与附加文件管理、认证授权、配置操作日志审计以及面向数据面的配置导出。
 
 ### 控制面与数据面的边界
 
@@ -103,6 +105,7 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 | `model/quota/` | QuotaPlan、BalanceSync、QuotaResetScheduler |
 | `model/rate_limit_policy/` | RateLimitPolicy 业务逻辑与导出 |
 | `model/route_rules/` | Global / Entity / API-Key 三级 AI 路由规则 |
+| `model/ioperlog/` | 操作日志 Manager、敏感字段脱敏、变更摘要 diff_keys 计算 |
 | `model/imods/` | mod-api-key、mod-body-process、AI 路由等模块配置导出 |
 | `model/itxn/` | 事务抽象接口 `TxnStorager` |
 | `model/shared/` | 跨包共享类型与通用 Storager 接口 |
@@ -129,6 +132,7 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 | `storage/rdb/rate_limit_policy/` | `model/rate_limit_policy` | `rate_limit_policies` |
 | `storage/rdb/route_conf/` | `model/iroute_conf` | `domains`、`route_*_rules` |
 | `storage/rdb/route_rules/` | `model/shared`、`model/route_rules` | `route_rules` |
+| `storage/rdb/ioperlog/` | `model/ioperlog` | `operation_logs` |
 | `storage/rdb/provider/` | `model/iprovider` | `providers` |
 
 ### 层间交互关系
@@ -214,6 +218,7 @@ OpenAPI v1 负责暴露可管理资源，典型模块包括：
 | `route_tables` | `/route-tables` | 路由表列表 |
 | `certificate` | `/certificates` | 证书管理 |
 | `auth` | `/auth`、`/meta` | 用户、Session Key、Token |
+| `operation_log` | `/operation-logs` | 配置操作日志查询 |
 
 ### InnerAPI v1 主要导出接口
 
@@ -230,6 +235,7 @@ InnerAPI v1 将控制面持久化的配置按主题导出，供数据面消费�
 | `/configs/mod-body-process` | 导出请求体处理配置 |
 | `/configs/rate-limit-policy` | 导出限流策略配置 |
 | `/configs/ai-route` | 导出 AI 路由配置 |
+| `/quota/trigger-reset` | 手动触发一次配额周期重置（详见配额章节） |
 
 所有 InnerAPI 导出接口均支持 `version` 查询参数，通过 `model/iversion_control` 实现增量同步：当请求版本与当前版本一致时返回 `Data: nil`，避免重复下发。
 
@@ -252,6 +258,115 @@ router.Use(middleware.MCCors)
 | `MCCors` | 处理 CORS 预检和响应头 |
 | `McProductProbe` | 从请求头解析产品线上下文 |
 | `McUserProbe` | 从 Session Key 或 Token 解析用户身份，完成权限校验 |
+
+---
+
+## 操作日志模块与 409 错误约定
+
+### 操作日志模块定位
+
+操作日志模块记录管理面（OpenAPI）的所有配置写操作，为配置变更提供可追溯的审计能力。模块位于 `model/ioperlog/`，核心设计如下：
+
+- **Manager 设计**：`OperationLogManager` 实现 `OperationLogRecorder`（`Record`）与 `OperationLogManagerInterface`（含 `QueryLogs`、`Close`）两级接口。各业务 Manager 通过 `SetOperationLogManager` 注入 recorder，仅依赖最小接口 `OperationLogRecorder`，避免对查询能力的反向依赖；
+- **存储实现**：`storage/rdb/ioperlog/operation_log.go` 实现 `BatchCreate`（批量插入）与 `List`（条件查询 + 分页），DAO 层对应 `storage/rdb/internal/dao/table_operation_logs.go`；
+- **查询接口**：`endpoints/openapi_v1/operation_log/list.go` 暴露 `GET /open-api/v1/operation-logs`，鉴权为 `iauth.FeatureOperationLog + ActionReadAll`，仅 `ScopeSystem` 全权限可查询。
+
+### 异步缓冲写入机制
+
+`OperationLogManager` 采用“异步缓冲 + 批量落库”的写入路径，避免日志写放大影响管理接口延迟：
+
+```
+业务 Manager ──Record()──▶ buffered channel (默认 4096 条)
+                                │
+                                ▼
+                    batchWorker：满 200 条 或 5s 超时即 flush
+                                │ BatchCreate
+                                ▼
+                    失败重试 3 次（100ms/200ms/300ms 退避）
+```
+
+关键参数与行为（`model/ioperlog/manager.go`）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| 缓冲容量 | 4096 | `NewOperationLogManager(storager, bufferSize)`，`bufferSize <= 0` 时使用默认值 |
+| 批量大小 | 200 | 累积满即 flush |
+| Flush 间隔 | 5s | 定时强制 flush |
+| 重试次数 | 3 | 重试间隔按 100ms 递增 |
+| 溢出策略 | 同步回退 | 缓冲满时默认 `OverflowStrategySync` 阻塞调用方同步写入；可选 `OverflowStrategyDiscard` 丢弃并告警 |
+
+`Close` 时会在 500ms  drain 超时内排空缓冲，尽量保证退出前日志落库。
+
+### 日志内容与关联
+
+`OperationLogEntry` 的字段分为四类：操作者、资源、结果、请求上下文。其中两点设计值得说明：
+
+1. **与访问日志关联**：`log_id` 与 access log 的 `LogID` 一致。上下文提取器 `operationLogContextExtractor`（`stateful/container/rdb/components.go`）从 `xreq.GetRequestInfo(ctx)` 取出 `LogID`、请求路径、方法、ClientIP、UserAgent 填入日志，使操作日志可与访问日志互相检索、并按 `log_id` 去重；
+2. **操作者提取**：从 `iauth.MustGetVisitor(ctx)` 提取，`operator_type` 为 `0`（user，取 `User.ID`）或 `1`（token，取 `Token.ID`）。
+
+失败操作同样记录：`status=2`，`error_msg` 经 `TruncateErrorMessageDefault` 截断为 1024 字符（超长时以 `...` 结尾），与 DDL 中 `error_msg varchar(1024)` 对齐。
+
+### 变更摘要与脱敏
+
+`change_summary`（`mediumtext`，存 JSON）记录变更前后的关键字段快照，由 `model/ioperlog/change_summary.go` 的 `BuildChangeSummary` 构造：
+
+- `before` / `after`：变更前后的字段 map，均先经 `MaskSensitiveFields` 脱敏；
+- `diff_keys`：仅 update 类日志携带，表示 after 相对 before **新增或值发生变化的键**（before 独有的键不计入，避免部分更新请求产生假阳性 diff），键名排序后存储。
+
+脱敏规则（`model/ioperlog/mask.go`）按小写键名匹配，并对嵌套 map 递归处理：
+
+| 键名 | 脱敏结果 |
+|------|----------|
+| `password` / `secret` / `session_key` / `private_key`（及无下划线变体） | `******` |
+| `api_key` / `apikey` / `key` | 保留首尾 4 位，中间以 `****` 代替；长度不超过 8 时整体脱敏 |
+| `certificate` / `cert` / `cert_body` / `private_key_body` | `[已更新]` |
+
+### 覆盖范围
+
+实际产生操作日志的资源与动作如下：
+
+| 资源 | 动作 |
+|------|------|
+| entities / entity-types | create / update / delete |
+| api-keys | create / update / delete |
+| clusters（POST/PUT/DELETE） | create / update / delete |
+| routes、global-route-rules（PUT） | update；Global 路由表更新记录为 `resource_type=route, resource_id=global` |
+| certificates | create / update / delete |
+| quota-plans | create / update / delete / reset（配额余额重置） |
+| model-prices | create / update / delete / import（整表导入） |
+| auth/users（含 session reset） | create / update / delete / reset |
+| auth/tokens | create / delete |
+
+domain 与 rate_limit_policy 当前不产生操作日志。
+
+### 查询接口
+
+`GET /open-api/v1/operation-logs` 支持如下查询参数（`xreq.BindForm` 绑定）：
+
+| 参数 | 说明 |
+|------|------|
+| `operator_name` | 操作人名称 |
+| `action` / `resource_type` / `resource_id` / `resource_name` / `resource_parent_id` | 资源维度过滤 |
+| `status` | `1`=成功，`2`=失败 |
+| `start_time` / `end_time` | Unix 秒时间戳 |
+| `page` / `page_size` | 默认 1 / 20，page_size 上限 100 |
+
+响应为 `{list, pagination:{page, page_size, total}}`；日志条目字段含 `id, log_id, operator_type, operator_id, operator_name, action, resource_type, resource_id, resource_name, resource_parent_id, status, error_msg, change_summary, request_path, request_method, client_ip, user_agent, created_at`（`created_at` 为 Unix 秒）。
+
+查询路径上的另一个细节：DAO 层 `TOperationLogCount` 在构造 count SQL 前会删除 where map 中的 `_limit` 与 `_orderby`，避免分页参数污染 `COUNT(*)`，保证任意页码下 `total` 都为符合条件的总条数。
+
+### 409 Conflict 错误约定
+
+`lib/xerror` 中 `WrapConflictErrorWithMsg` 将错误标记为 `Model.Conflict`，由 `resolve.go` 统一映射为 HTTP **409 Conflict**，用于表达“资源被其他资源引用、操作存在依赖冲突”的业务语义：
+
+- BFE 集群被 AI 集群的 `lb_matrix` 调度引用时禁止删除（`endpoints/openapi_v1/bfe_cluster/delete.go` 调用 `ClusterManager.IsBFEClusterUsed` 检查，此前返回 422）；
+- 实例池被 BFECluster / SubCluster 引用时禁止删除；
+- 证书被 Product 引用时禁止删除；
+- 产品集群被路由规则（advance / basic）引用时禁止删除；
+- 集群被 AI 路由规则的 target / fallback 引用时禁止删除；集群模型更新时被规则 target / fallback 引用时报错；
+- Entity 存在子节点时禁止删除。
+
+409 引入后，500 回归为兜底未知错误；422 保留给参数错误（`etParam`），语义不再与依赖冲突混用。
 
 ---
 
@@ -356,6 +471,7 @@ var (
 `rdb.Init()` 按以下顺序完成初始化：
 
 1. 事务与基础 Storage：`TxnStoragerSingleton`、各基础/集群/认证 Storage；
+2. 操作日志：`OperationLogStorager` 与 `OperationLogManager`（含上下文提取器 `operationLogContextExtractor`），先行初始化以便注入后续各业务 Manager；
 2. 基础 Manager：`ExtraFileManager`、`VersionControlManager`、`BFEClusterManager`、`CertificateManager`、`ProductManager`、`AIRouteRuleManager`、`RouteRuleManager` 等；
 3. 集群相关 Manager：`ClusterManager`、`SubClusterManager`、`DomainManager`、`PoolManager`；
 4. 认证授权 Manager：`AuthenticateManager`、`AuthorizeManager`；
@@ -566,6 +682,8 @@ func ExportAction(req *http.Request) (interface{}, error) {
 - OpenAPI 面向管理员和 Dashboard，负责资源配置；InnerAPI 面向 BFE 和 Conf Agent，负责配置导出与增量同步。
 - `xreq.Endpoint` 统一了接口的描述、注册与鉴权，降低了接口开发的样板代码。
 - `stateful/container` 提供全局单例容器，`stateful/container/rdb/components.go:Init()` 按依赖顺序完成手动依赖注入。
+- 操作日志模块（`model/ioperlog`）以异步缓冲 + 批量落库的方式记录管理面写操作，`log_id` 与访问日志关联，敏感字段脱敏后存入 `operation_logs` 表。
+- 资源依赖冲突统一返回 409 Conflict（`xerror.WrapConflictErrorWithMsg`），500 回归为兜底未知错误。
 - 启动流程从 `main.go` 的配置加载开始，经过数据库初始化、依赖注入、路由注册，最终通过 `graceful.Run` 启动 HTTP 服务。
 
 ---
@@ -576,5 +694,7 @@ func ExportAction(req *http.Request) (interface{}, error) {
 - `ai-gateway-api/design-docs/sys-design/接口层设计文档.md`
 - `ai-gateway-api/design-docs/sys-design/模型层设计文档.md`
 - `ai-gateway-api/design-docs/sys-design/存储层设计文档.md`
+- `ai-gateway-api/design-docs/sys-design/details/操作日志模块.md`
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/operation-logs.md`
 - `ai-gateway-api/AGENTS.md`
 - `ai-gateway-api/conf/ai_gateway_api.toml`

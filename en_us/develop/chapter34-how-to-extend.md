@@ -53,6 +53,7 @@ Before extending, you need to understand the layered structure of the three repo
 | `ai-gateway-api/` | `storage/rdb/` | MySQL/SQLite DAO implementations |
 | `ai-gateway-api/` | `design-docs/` | API definitions, system design, change notes |
 | `bfe/` | `bfe_modules/` | Data-plane modules |
+| `bfe/` | `bfe_model_protocol/` | Protocol adapter layer: per-protocol adapters (credential injection, usage extraction, error normalization) |
 | `bfe/` | `bfe_module/` | Module framework and callback point definitions |
 | `bfe/` | `bfe_config/` | Configuration loaders |
 | `conf-agent/` | `conf_reload/prober/` | Pulls configuration from the Control Plane |
@@ -474,7 +475,9 @@ The complete consumption chain for a new topic can be summarized as:
 
 ## Scenario 4: Extending Provider Protocol Support
 
-Provider protocol extension is a scenario unique to AI gateways. It usually requires modifying the Control Plane's protocol validation and model discovery at the same time as the Data Plane's authentication style, request/response transformation.
+Provider protocol extension is a scenario unique to AI gateways. In the Data Plane, all protocol knowledge (credential injection, supplementary headers, usage extraction, error normalization) is converged into per-protocol adapters in the protocol adapter layer `bfe/bfe_model_protocol/`, so the change surface for a new protocol is small; the Control Plane still needs to relax the protocol enum and add model discovery parser rules in sync.
+
+First, one conceptual boundary must be clear: **model_protocol (protocol knowledge) ≠ provider (user-defined cluster-level entity)**. A provider is managed by the Control Plane and carries user-defined information such as name, key pool, price table, and address; a model_protocol describes protocol knowledge such as how credentials are injected, which version headers are added, and what usage fields look like. Brands in the OpenAI-compatible ecosystem such as Groq, DeepSeek, and OpenRouter all use the `openai` protocol: onboarding such a provider requires **zero code changes** — just `model_protocols: ["openai"]` in the cluster configuration (usually carried automatically by the Control Plane when the Provider is created) — with no new adapter needed.
 
 ```mermaid
 flowchart LR
@@ -579,73 +582,115 @@ func newAIConf(llmConfig *LLMConfig, modelTable *cluster_conf.ModelTable,
 
 ### Data Plane Request/Response Transformation
 
-The Data Plane infers the protocol style based on request path and headers in `bfe_basic/request_ai_basic.go`:
+Data Plane protocol detection lives in `bfe/bfe_model_protocol/detect.go`; `bfe_basic.DetectAuthStyle` and `GetApiKey` keep their original signatures and delegate to it:
 
 ```go
-// bfe/bfe_basic/request_ai_basic.go
-func DetectAuthStyle(req *Request) string {
-    path := req.HttpRequest.URL.Path
-    if strings.HasPrefix(path, "/v1/messages") {
-        return AuthStyleAnthropic
-    }
-    if req.HttpRequest.Header.Get("x-api-key") != "" &&
-        req.HttpRequest.Header.Get("Authorization") == "" {
-        return AuthStyleAnthropic
-    }
-    return AuthStyleOpenAI
+// bfe/bfe_model_protocol/detect.go
+func DetectProtocol(req *bfe_http.Request) string {
+	if req == nil || req.URL == nil {
+		return ProtocolUnknown
+	}
+
+	path := req.URL.Path
+	if strings.HasPrefix(path, "/v1/messages") {
+		return ProtocolAnthropic
+	}
+
+	// x-api-key without Authorization indicates Anthropic style
+	if req.Header.Get("x-api-key") != "" &&
+		req.Header.Get("Authorization") == "" {
+		return ProtocolAnthropic
+	}
+
+	return ProtocolOpenAI
 }
 ```
 
-Before forwarding, `doSingleAIForward` in `bfe_server/reverseproxy.go` checks whether the cluster supports the protocol, and performs protocol-specific header injection:
+Before forwarding, `doSingleAIForward` in `bfe_server/reverseproxy.go` picks the protocol adapter for the request's `AuthStyle`, checks whether the cluster supports the protocol, and performs credential and supplementary header injection through the adapter:
 
 ```go
 // bfe/bfe_server/reverseproxy.go
+adapter := modelprotocol.Get(aiMeta.AuthStyle)
+
 if cluster.AIConf != nil && !clusterSupportsAuthStyle(cluster.AIConf.ModelProtocols, aiMeta.AuthStyle) {
-    err := bfe_basic.NewAiError(
-        bfe_basic.CodeProviderProtocolMismatch,
-        bfe_basic.TypeInvalidRequestError,
-        fmt.Sprintf("request protocol %s not supported by cluster provider", aiMeta.AuthStyle),
-    )
-    return err.CreateErrorResponse(basicReq), closeAfterReply, nil, bodyModel
+	err := bfe_basic.NewAiError(
+		bfe_basic.CodeProviderProtocolMismatch,
+		bfe_basic.TypeInvalidRequestError,
+		fmt.Sprintf("request protocol %s not supported by cluster provider (model_protocols=%v)",
+			aiMeta.AuthStyle, cluster.AIConf.ModelProtocols),
+	)
+	return err.CreateErrorResponse(basicReq), closeAfterReply, nil, bodyModel
 }
 
+// Credential injection: the openai adapter writes Authorization: Bearer,
+// the anthropic adapter writes x-api-key
 if selectedKey.Key != "" {
-    mod_ai_token_auth.SetApiKey(outreq, selectedKey.Key, aiMeta.AuthStyle)
+	if err := adapter.InjectAuth(outreq, selectedKey.Key); err != nil {
+		log.Logger.Warn("doSingleAIForward: inject auth failed: %v", err)
+	}
 }
 
-if aiMeta.AuthStyle == bfe_basic.AuthStyleAnthropic {
-    if outreq.Header.Get("anthropic-version") == "" {
-        outreq.Header.Set("anthropic-version", "2023-06-01")
-    }
+// Supplementary headers, e.g. anthropic-version; an explicit value on
+// the request takes precedence
+for k, v := range adapter.ExtraHeaders() {
+	if outreq.Header.Get(k) == "" {
+		outreq.Header.Set(k, v)
+	}
 }
 ```
 
-On the response side, `UpdateCtxByUsage` in `mod_ai_token_auth` is responsible for extracting token usage from backend responses; different protocols have different usage field paths:
+Note that `doSingleAIForward` no longer imports `mod_ai_token_auth`; `mod_ai_token_auth.SetApiKey` keeps its original signature and likewise delegates to `adapter.InjectAuth` internally.
+
+On the response side, `UpdateCtxByUsage` in `mod_ai_token_auth` selects the adapter's usage field chain (`ExtractUsageFields`) by the identified protocol; the subsequent accumulation and normalization logic is unchanged:
 
 ```go
 // bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go
 func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
-    used = gjson.GetBytes(data, "usage.total_tokens").Int()
-    prompt = gjson.GetBytes(data, "usage.prompt_tokens").Int()
-    completion = gjson.GetBytes(data, "usage.completion_tokens").Int()
-    // Claude fallback
-    if prompt == 0 && completion == 0 {
-        prompt = gjson.GetBytes(data, "usage.input_tokens").Int()
-        completion = gjson.GetBytes(data, "usage.output_tokens").Int()
-    }
+	fields := modelprotocol.Get(ctx.aiBasicInfo.AuthStyle).ExtractUsageFields(data)
+	used := fields.UsedQuota
+	prompt := fields.PromptTokens
+	completion := fields.CompletionTokens
+	// ... cache_read/cache_write, audio, image, video fields are taken the
+	// same way; the used>0 / else if prompt>0... accumulation branches are
+	// preserved line by line (writing bfe_basic.TokenUsage)
 }
 ```
 
-When adding a new protocol, you usually need to:
+On the streaming side, `SSEEvent/RawEvent.GetQuotaUsage` in `mod_body_process` composes the adapter field chains through the shared helper `extractUsageFields` (the openai chain first, falling back to the anthropic chain when prompt/completion are both zero); the `isguess` / `EstimateContentToken` logic is unchanged.
 
-1. Register it in `ValidModelProtocols`;
-2. Add model discovery parser rules in `modelProtocolParsers`;
-3. Add the authentication header in `BuildAuthHeader`;
-4. Recognize the request protocol in `DetectAuthStyle`;
-5. Add protocol-specific request transformation (path, headers, body fields) in `doSingleAIForward`;
-6. Add usage extraction logic in `UpdateCtxByUsage` or `mod_body_process`;
-7. Update the export logic in `model/icluster_conf/cluster.go` to ensure `ModelProtocols` is correctly delivered;
-8. Add unit tests and integration tests (refer to `bfe/tests/integration/implementation/scenario-SC06-claude-protocol-support/`).
+### Steps to Add a New Model Protocol
+
+Taking the gemini protocol as an example, the Data Plane framework code (reverseproxy / mod_body_process / mod_ai_token_auth) requires **zero modifications** — only three steps are needed:
+
+1. Add the `ProtocolGemini` constant in `bfe/bfe_model_protocol/utils/protocol.go`;
+2. Create the adapter package `bfe/bfe_model_protocol/gemini/` implementing the `ProtocolAdapter` interface: `InjectAuth` (e.g. `x-goog-api-key` injection), `ExtraHeaders`, `ExtractUsageFields` (extraction and normalization of `promptTokenCount` / `candidatesTokenCount` / `cachedContentTokenCount`);
+3. Add one detection rule in `detect.go` (e.g. recognize by the `x-goog-api-key` header);
+4. Add one line `Register(gemini.New())` in the `init()` of `registry.go`.
+
+Then, as needed:
+
+5. To customize degradation semantics based on the error body, implement an `ErrorNormalizer` (the seam in `shouldTriggerFallback` is already in place; the default implementation always returns `nil`, preserving the status-code whitelist behavior);
+6. In the Control Plane (ai-gateway-api), relax the `model_protocols` enum constraint in `ValidModelProtocols` in `model/iprovider/provider.go`, and add model discovery parser rules in `modelProtocolParsers` in `model/iprovider/discover.go`.
+
+The `cluster_conf.AIConf.ModelProtocols` exported from the Control Plane to BFE is assembled in `model/icluster_conf/cluster.go` (`newAIConf` passes the Provider's protocol list through directly); no per-protocol export logic changes are needed:
+
+```go
+// ai-gateway-api/model/icluster_conf/cluster.go
+func newAIConf(llmConfig *LLMConfig, modelTable *cluster_conf.ModelTable,
+    providerKeys []iprovider.ProviderKey, providerModelProtocols []string) *cluster_conf.AIConf {
+    aiConf := &cluster_conf.AIConf{
+        Type:           0,
+        ModelMapping:   convertToBFEModelMapping(llmConfig.ModelMappings),
+        Keys:           []cluster_conf.AIKey{},
+        ModelProtocols: providerModelProtocols,
+    }
+    // ...
+}
+```
+
+Also note: `bfe_server/bfe_confdata_load.go` validates at startup (`InitDataLoad`) and hot reload (`serverDataConfReload`) that every cluster's `AIConf.ModelProtocols` contains only registry-known protocols. A new protocol must be registered in the registry first, otherwise the configuration load fails.
+
+For unit tests and integration tests, refer to the existing `*_test.go` files under `bfe/bfe_model_protocol/` and `bfe/tests/integration/implementation/scenario-SC06-claude-protocol-support/`.
 
 ## Chapter Summary
 
@@ -654,7 +699,7 @@ When extending the Rainway AI Gateway, the most important thing is to identify w
 - **OpenAPI extensions** follow the order "endpoint layer → model layer → storage layer", use `xreq.Endpoint` to register routes, use `itxn.TxnStorager` to manage transactions, and use handwritten mocks to ensure model-layer unit test coverage.
 - **BFE module extensions** require implementing `bfe_module.BfeModule`, registering handler functions at the correct callback points, and maintaining module order in `bfe_modules/bfe_modules.go`.
 - **InnerAPI configuration export topic extensions** require implementing `ConfigGenerator` in the Control Plane, adding a `NormalFileTask` in Conf Agent, and implementing the hot-reload callback in the BFE module; the three are coordinated through version numbers and the `/reload/<module>` interface.
-- **Provider protocol extensions** span the Control Plane's protocol validation/model discovery, the Data Plane's auth style detection, request/response transformation, and usage extraction — the most typical cross-repository change.
+- **Provider protocol extensions** require distinguishing model_protocol from provider: onboarding a new OpenAI-compatible provider is zero-code and only needs `model_protocols: ["openai"]` in the cluster configuration; adding a new protocol means adding one adapter package, one detection rule, and one registration line in `bfe_model_protocol` (adapter + `detect.go` + `registry.go`), plus relaxing the protocol enum and model discovery parser rules in the Control Plane.
 
 Whatever the scenario, it is recommended to first complete the design documents following the six-step change process in `ai-gateway-api/design-docs/README.md` before writing code, and to keep design documents, code, and tests in sync.
 
@@ -666,6 +711,7 @@ Whatever the scenario, it is recommended to first complete the design documents 
 - `ai-gateway-api/design-docs/README.md`
 - `bfe/AGENTS.md`
 - `bfe/CONTRIBUTING.md`
+- `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
 - `conf-agent/AGENTS.md`
 - [Chapter 31: Endpoint Layer Implementation: OpenAPI and InnerAPI](../implementation/chapter26-endpoints-implementation.md)
 - [Chapter 31: AI Routing Module Implementation: mod_ai_route](../implementation/chapter29-mod-ai-route.md)

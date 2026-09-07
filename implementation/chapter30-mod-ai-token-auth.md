@@ -8,6 +8,7 @@
 - 如何校验请求携带的 API-Key，并在失败时返回结构化的错误响应；
 - 如何将 API-Key 与 `QuotaPlan` 绑定，并通过 Redis 查询实时余额；
 - 请求结束时如何根据实际 Token 用量或 RMB 成本扣减配额；
+- 扣费幂等、客户端中断不计费与 `/count_tokens` 跳过计费的可靠性语义；
 - RMB 配额如何结合 Provider 时段模板与模型分时段价格实现差异化计费；
 - `mod_ai_token_auth` 与 `mod_body_process` 在流式与非流式响应中的协作方式。
 
@@ -19,7 +20,7 @@
 
 1. **API-Key 提取与校验**：从请求 `Authorization: Bearer <api-key>` 头中提取 Key，校验其存在性、启用状态、过期时间、模型白名单/黑名单、来源 IP 子网等。校验失败时立即构造结构化错误响应返回客户端，避免无效请求进入后端。
 2. **配额余额预检**：在请求进入后端前，查询 Redis 中各 `QuotaPlan` 的剩余配额，余额不足或计划过期时拒绝请求。这一步只在请求成功认证后执行，未命中鉴权规则的请求不会触发配额检查。
-3. **请求结束扣减**：在响应完成后，根据响应体中的 `usage` 字段或按内容长度估算的 Token 数，对 `total_token` 配额执行扣减；对 `RMB` 配额则先按模型单价折算成本，再执行扣减。扣减失败会被捕获并记录 Warn 日志，不会影响响应返回。
+3. **请求结束扣减**：在响应完成后，根据响应体中的 `usage` 字段或按内容长度估算的 Token 数，对 `total_token` 配额执行扣减；对 `RMB` 配额则先按模型单价折算成本，再执行扣减。客户端中断且未拿到最终 usage 的请求不计费，`/count_tokens` 类端点跳过计费，扣费通过 `deducted` 标记保证幂等。扣减失败会被捕获并记录 Warn 日志，不会影响响应返回。
 4. **错误信息结构化**：在 `AiBasicInfo.AiAuthInfo` 中记录拒绝原因与命中的配额计划，便于访问日志与监控分析。这些字段也会被 `mod_access` 等访问日志模块输出，为后续排障提供完整上下文。
 
 ## 模块在 BFE 模块链中的位置
@@ -141,7 +142,16 @@ flowchart TD
     N -->|是| P[设置 TokenAuthContext]
 ```
 
-校验成功后，`SetTokenAuthContext` 会把 `KeyId`、`ApikeyTags`、预估的 `PromptTokens` 等信息写入 `AiBasicInfo`，供后续模块使用。
+校验成功后，`SetTokenAuthContext` 会把 `KeyId`、`ApikeyTags`、预估的 `PromptTokens` 等信息写入 `AiBasicInfo`，供后续模块使用。对于图片/视频生成模式，它还会在认证阶段预读请求体的 `n` 字段（`GetImageCountFromReq` / `GetVideoCountFromReq`）填入 `ImageCount` / `VideoCount` 作为兜底，`n` 缺失或 `≤ 0` 时取 1，防止响应未返回用量时按 0 计费少收：
+
+```go
+if aiBasicInfo.Mode == bfe_basic.ModeImageGeneration {
+    tusage.ImageCount = GetImageCountFromReq(req)
+}
+if aiBasicInfo.Mode == bfe_basic.ModeVideoGeneration {
+    tusage.VideoCount = GetVideoCountFromReq(req)
+}
+```
 
 ## 配额计划绑定与余额查询（Redis）
 
@@ -163,7 +173,7 @@ type QuotaPlan struct {
 
 控制面在导出配置时，已经为每个配额计划生成稳定的 `RedisKey`，格式为 `QUOTA_<stableId>`，其中 `stableId` 对于 API-Key 级配额是 API-Key 值，对于 Entity 级配额是 `entity_id`。BFE 直接使用下发的 `RedisKey`，不再根据计划名称或 ID 自行拼装，从而避免改名导致计数器重置。这一原则与 `mod_ai_rate_limit` 的 Redis key 稳定性设计保持一致：计数器 key 不能依赖任何用户可编辑的业务字段。相关设计可参见 `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`。
 
-`QuotaPlan` 中 `Unit` 为空时，`token_rule_load.go` 会将其默认置为 `total_token`，保证旧配置的向后兼容。配置校验阶段还会根据单位类型检查 `Quota` 的合法性：例如 `total_token` 必须大于 0，而 `RMB` 允许等于 0（通常用于后续按成本扣减的场景）。
+`QuotaPlan` 中 `Unit` 为空时，`token_rule_load.go` 会将其默认置为 `total_token`，保证旧配置的向后兼容。配置校验阶段还会根据单位类型检查 `Quota` 的合法性：`RMB` 与 `total_token` 均要求不小于 0。其中 `total_token` 配额允许配置为 0，表示这是一个"无余额计划"——绑定该计划的 API-Key 在配额预检阶段即因余额不足被拒绝（429 `CodeQuotaExhausted`），适用于先创建 Key、后续再发放额度的场景。
 
 ### 余额查询
 
@@ -181,6 +191,11 @@ func (q *QuotaPlan) HasBalance(client redis_client.Client) (bool, int64, error) 
 
     current, err := client.GetInt64(q.RedisKey)
     if err != nil {
+        // key 未初始化（例如配额为 0 从未同步过 Redis）视为无余额，
+        // 而不是内部错误
+        if redis_client.IsKeyNotFound(err) {
+            return false, 0, nil
+        }
         return false, 0, err
     }
 
@@ -188,7 +203,7 @@ func (q *QuotaPlan) HasBalance(client redis_client.Client) (bool, int64, error) 
 }
 ```
 
-对于 `total_token` 配额，Redis 值就是剩余 Token 数；对于 `RMB` 配额，Redis 值是以 `1e-8` 元为单位的定点整数。`Unlimited` 计划直接返回 `true`，不参与余额检查。
+对于 `total_token` 配额，Redis 值就是剩余 Token 数；对于 `RMB` 配额，Redis 值是以 `1e-8` 元为单位的定点整数。`Unlimited` 计划直接返回 `true`，不参与余额检查。注意预检查的是 Redis 中的实时余额而不是配置里的 `Quota` 字段：当余额 key 不存在（如配额为 0 的计划从未同步过 Redis）时，按无余额处理，请求在预检阶段被 429 `CodeQuotaExhausted` 拒绝，而不会返回 500 内部错误。
 
 ### 控制面的余额同步
 
@@ -196,11 +211,17 @@ func (q *QuotaPlan) HasBalance(client redis_client.Client) (bool, int64, error) 
 
 ## 请求结束时配额扣减
 
-配额扣减发生在 `HandleRequestFinish`，此时响应已经完整返回客户端。`tokenRequestFinishHandler` 只处理 HTTP 200 的请求，并优先使用实际解析到的 Token 用量；如果响应中没有 `usage` 且允许估算，则按内容长度估算。
+配额扣减发生在 `HandleRequestFinish`，此时响应已经完整返回客户端。`tokenRequestFinishHandler` 只处理 HTTP 200 的请求，并优先使用实际解析到的 Token 用量；如果响应中没有 `usage`、允许估算且响应已正常完成，则按内容长度估算。处理顺序为：先跳过 `/count_tokens` 端点，再校验扣费幂等标记，然后处理客户端中断场景，最后进入正常的用量结算：
 
 ```go
 func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, res *bfe_http.Response) int {
+    // /count_tokens 端点只统计 Token 数，永远不计费
+    if strings.Contains(req.HttpRequest.RequestURI, "/count_tokens") {
+        return bfe_module.BfeHandlerGoOn
+    }
+
     if res == nil || res.StatusCode != bfe_http.StatusOK {
+        // only count used quota for successful requests
         return bfe_module.BfeHandlerGoOn
     }
 
@@ -209,11 +230,34 @@ func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, re
         return bfe_module.BfeHandlerGoOn
     }
 
+    // HandleRequestFinish 可能多次触发，扣费只执行一次
+    if ctx.deducted {
+        return bfe_module.BfeHandlerGoOn
+    }
+
+    // 客户端中断（RST/close/写入失败）且未见到最终 usage：不按整请求估算扣费
+    aborted := isClientAbortErr(req.ErrCode)
+    if aborted && !ctx.aiBasicInfo.IsFinalUsageSeen() {
+        ctx.deducted = true
+        return bfe_module.BfeHandlerGoOn
+    }
+
     tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
-    if tokenUsage.UsedQuota <= 0 && ctx.aiBasicInfo.IsAllowEstimateToken() {
+    // 估算值仅在响应正常完成时才可计费；否则清零估算字段，
+    // 让下面的 calcCostUnits 直接按 Token 字段计费
+    estimateBillable := ctx.aiBasicInfo.IsAllowEstimateToken() &&
+        ctx.aiBasicInfo.IsResponseCompleted()
+    if !ctx.aiBasicInfo.IsFinalUsageSeen() && !estimateBillable {
+        tokenUsage.PromptTokens = 0
+        tokenUsage.CompletionTokens = 0
+        tokenUsage.UsedQuota = 0
+    }
+    if tokenUsage.UsedQuota <= 0 && estimateBillable {
         tokenUsage.UsedQuota = CalcReqUsedQuota(req, tokenUsage.PromptTokens, tokenUsage.CompletionTokens)
     }
 
+    // 按已由 mod_body_process（流式）或 tokenReadResponseHandler（非流式）
+    // 填充的 TokenUsage 计算 RMB 成本
     if tokenUsage.UsedCost <= 0 && hasRMBPlan(ctx.Token.QuotaPlans) {
         tokenUsage.UsedCost = m.calcCostUnits(req, ctx.serverConf, tokenUsage)
     }
@@ -243,9 +287,41 @@ func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, re
         }
     }
 
+    ctx.deducted = true
     return bfe_module.BfeHandlerGoOn
 }
 ```
+
+其中 `isClientAbortErr` 判定客户端侧中断错误：
+
+```go
+func isClientAbortErr(err error) bool {
+    return err == bfe_basic.ErrClientWrite ||
+        err == bfe_basic.ErrClientClose ||
+        err == bfe_basic.ErrClientReset
+}
+```
+
+### 扣费幂等
+
+`TokenAuthContext` 带有 `deducted` 标记。`HandleRequestFinish` 在某些场景下可能被多次触发（例如连接异常收尾），handler 入口检查 `ctx.deducted`，已扣费则直接返回；正常路径在扣减循环结束后置位。这保证了同一请求无论触发几次，最多只扣一次。
+
+### 客户端中断不计费与估算可靠性语义
+
+按内容长度估算 Token（`EstimateToken`，请求体 `Content-Length/4` 估算输入、响应体长度估算输出）只是兜底手段，只有响应正常完成时才允许参与计费。为此 `bfe_basic.AiBasicInfo` 维护两组状态标记：
+
+- `MarkResponseCompleted` / `IsResponseCompleted`：响应正常完成时置位。流式场景由 `mod_body_process` 在见到终止事件（Anthropic `message_stop`、OpenAI `[DONE]`）时置位；非流式场景由 `tokenReadResponseHandler` 在完整读出响应体后置位。
+- `MarkFinalUsageSeen` / `IsFinalUsageSeen`：从响应中解析到最终 usage 时置位。流式场景由 `QuotaUsageProcessor` 在收到最终 usage 事件（如 Anthropic `message_delta`，或带 `image_count` / `video_count` 的事件）时置位；非流式场景在解析出非零 `UsedQuota` 后置位。Anthropic `message_start` 中 `output_tokens = 0` 的初始 usage 不算最终 usage。
+
+结算规则为：
+
+1. **客户端中断且未见到最终 usage**（`req.ErrCode ∈ {ErrClientWrite, ErrClientClose, ErrClientReset}` 且 `IsFinalUsageSeen() == false`）：直接置位 `deducted` 返回，不扣费。客户端中途断开时响应体不完整，按整请求估算会严重高估；
+2. **非中断但响应未完成**（例如后端异常收尾）：清零 `PromptTokens` / `CompletionTokens` / `UsedQuota` 中的估算字段，再按正常公式计费，避免估算值污染 RMB 成本计算（`calcCostUnits` 直接读取 Token 字段，仅守住 `UsedQuota` 是不够的）；
+3. **响应正常完成**：估算值可用，按 `CalcReqUsedQuota` 计算 `UsedQuota` 后进入扣减。
+
+### /count_tokens 跳过计费
+
+Anthropic 等协议的 `/v1/messages/count_tokens` 端点用于预统计 Token 数，不产生真实调用。`tokenRequestFinishHandler` 入口通过 `RequestURI` 包含 `/count_tokens` 判定并直接放行，避免把 Token 统计请求计入配额。
 
 ### total_token 扣减
 
@@ -367,16 +443,36 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 
 ### 成本计算
 
-`calcCostUnits` 位于 `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`，它会根据目标 Cluster、目标模型、请求模式（chat / image_generation）查找对应 `ModelPrice`，并调用 `calcChatCost` 或 `calcImageGenerationCost`。
+`calcCostUnits` 位于 `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`，它会根据目标 Cluster、目标模型、请求模式查找对应 `ModelPrice`，再按模式分发到具体的计费函数：
+
+```go
+switch mode {
+case bfe_basic.ModeImageGeneration:
+    return calcImageGenerationCost(entry, usage, tierName)
+case bfe_basic.ModeVideoGeneration:
+    return calcVideoGenerationCost(entry, usage, tierName)
+case bfe_basic.ModeResponses:
+    return calcResponsesCost(entry, usage, tierName)
+default:
+    return calcChatCost(entry, usage, tierName)
+}
+```
+
+模式由 `bfe_basic.DetectModeFromPath` 根据请求路径判定，包括 `/v1/responses` → `ModeResponses` 与 `/v1/video/generations` → `ModeVideoGeneration`。
 
 `calcChatCost` 支持多种细粒度计费维度：
 
 - 普通输入 / 输出 Token（`input_cost_per_token`、`output_cost_per_token`）
 - 缓存命中输入 Token（`cache_read_input_token_cost`）
 - 缓存写入输入 Token（`cache_creation_input_token_cost`）
+- 图片输入 Token（`input_cost_per_image_token`）
 - 音频输入 / 输出 Token（`input_cost_per_audio_token`、`output_cost_per_audio_token`）
 
-计算时会先做卫生处理：确保各分项非负且不超过对应总量，再按配置的价格键分别相乘后求和。所有运算均为定点整数运算，不会产生浮点误差。
+计算时会先做卫生处理：确保各分项非负且不超过对应总量，再从总输入中依次拆出缓存读写、图片输入、音频输入 Token 分别计价。配置了 `input_cost_per_image_token` 或音频输入价格时，对应的输入 Token 从 `normalInput` 中拆出单独计价；未配置这些细化价格时，图片/音频输入 Token 按普通输入 Token 计价。所有 cache / audio / image 细化价格键均未配置时，回退 legacy 公式 `promptTokens × inputCost + completionTokens × outputCost`。所有运算均为定点整数运算，不会产生浮点误差。
+
+需要特别说明的是缓存拆分的前提：`PromptTokens` 必须是总输入 Token 数。Anthropic 协议的 `input_tokens` 不含缓存读写 Token，协议适配层（`bfe/bfe_model_protocol/utils/usage_parse.go` 的 `ParseAnthropicUsageFields`）已将其归一化为 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`，与 OpenAI `prompt_tokens` 语义对齐；usage 字段的统一提取也已在协议适配层完成（详见[第七章 数据面转发设计：BFE](../design/chapter07-data-plane-design.md)与[第二十九章 AI 路由模块实现：mod_ai_route](./chapter29-mod-ai-route.md)），本章只关注结算逻辑。
+
+`calcResponsesCost` 直接复用 chat 计费；`calcVideoGenerationCost` 按 `VideoCount × output_cost_per_video` 计费，其中 `VideoCount` 优先取响应 `usage.video_count`，回退 `data.#`；`calcImageGenerationCost` 按 `ImageCount × output_cost_per_image + ImageInputTokens × input_cost_per_image_token` 计费。
 
 控制面如何生成和下发时段配置，详见 `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`。
 
@@ -396,9 +492,14 @@ func (m *ModuleAITokenAuth) tokenReadResponseHandler(req *bfe_basic.Request, res
     }
     tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
     if res.StatusCode == bfe_http.StatusOK && res.ContentLength >= 0 {
+        // 完整响应体已读出：响应正常完成
+        ctx.aiBasicInfo.MarkResponseCompleted()
         if bodyAccessor, err := res.GetBodyAccessor(); err == nil {
             body, _ := bodyAccessor.GetBytes()
             UpdateCtxByUsage(ctx, body)
+        }
+        if tokenUsage.UsedQuota > 0 {
+            ctx.aiBasicInfo.MarkFinalUsageSeen()
         }
         // 若仍无 usage 且允许估算
         if tokenUsage.UsedQuota <= 0 && ctx.aiBasicInfo.IsAllowEstimateToken() {
@@ -411,13 +512,15 @@ func (m *ModuleAITokenAuth) tokenReadResponseHandler(req *bfe_basic.Request, res
 }
 ```
 
-`UpdateCtxByUsage` 使用 `gjson` 从响应体中提取多种 provider 的 `usage` 字段，包括 OpenAI、DeepSeek、Anthropic、Claude 等格式，并兼容 `prompt_cache_hit_tokens`、`prompt_tokens_details.cached_tokens` 等字段。由于不同 provider 的 usage 字段命名差异较大，模块通过多层 fallback 提高解析成功率：例如先尝试 `usage.total_tokens`，再尝试 `usage.input_tokens` / `usage.output_tokens`；缓存命中字段也兼容 DeepSeek 与 Claude 的两种命名。
+`UpdateCtxByUsage` 不再内置大段的 gjson 提取链，而是委托给协议适配层：根据请求阶段识别出的 `AiBasicInfo.AuthStyle` 取对应适配器（`modelprotocol.Get(authStyle).ExtractUsageFields`），由 `bfe_model_protocol` 按协议提取 `PromptTokens`、`CompletionTokens`、缓存读写、图片输入、图片/视频数量等字段后回填到 `TokenUsage`。这样既兼容 OpenAI、DeepSeek、Anthropic 等协议的 usage 差异（如 DeepSeek 的 `prompt_cache_hit_tokens`、Anthropic 的 `message.usage` 嵌套形态），也让新增协议的用量提取可以在适配层独立扩展。
 
 当响应体中确实没有 `usage` 字段（例如某些私有部署模型未返回用量），且配置允许估算时，模块会按 `Content-Length / 4` 粗略估算输出 Token 数，并结合请求体估算的输入 Token 数得到一个近似用量。估算逻辑仅作为兜底，不建议用于精确计费场景。
 
 ### 流式响应
 
 流式响应由 `mod_body_process` 在 `HandleReadResponse` 中逐段解析 SSE 事件，并通过 `QuotaUsageProcessor.Process` 累计 Token 用量到 `AiBasicInfo.TokenUsage`。由于流式响应在 `HandleReadResponse` 阶段尚未结束，`mod_ai_token_auth` 的 `tokenReadResponseHandler` 通常拿不到完整用量；最终扣减由 `tokenRequestFinishHandler` 在 `HandleRequestFinish` 阶段读取已填充的 `TokenUsage` 完成。
+
+`QuotaUsageProcessor` 在解析每个 SSE 事件时同步维护计费可靠性状态：见到终止事件（Anthropic `message_stop`、OpenAI `[DONE]`）时调用 `MarkResponseCompleted`；收到最终 usage 事件时调用 `MarkFinalUsageSeen`。Anthropic 流式的 `message_start` 只带初始 usage（`output_tokens = 0`），`message_delta` 才携带最终 output tokens 但不带 prompt 字段——Processor 对最终 usage 事件始终处理，并在 `message_delta` 场景下保留 `message_start` 阶段已解析的 `PromptTokens`、`CacheReadTokens`、`CacheWriteTokens` 等字段，只更新 completion 部分，避免缓存 Token 丢失或重复计价。这两个状态标记正是 `tokenRequestFinishHandler` 判断"客户端中断不计费、估算仅正常完成时可用"的依据。
 
 ```mermaid
 sequenceDiagram
@@ -526,20 +629,38 @@ func (m *ModuleAITokenAuth) ValidateUserTokenByReq(req *bfe_basic.Request) (toke
 
 ```go
 func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
-    used = gjson.GetBytes(data, "usage.total_tokens").Int()
-    prompt = gjson.GetBytes(data, "usage.prompt_tokens").Int()
-    completion = gjson.GetBytes(data, "usage.completion_tokens").Int()
-    cacheRead = gjson.GetBytes(data, "usage.cache_read_tokens").Int()
-    // DeepSeek fallback
-    if cacheRead == 0 {
-        cacheRead = gjson.GetBytes(data, "usage.prompt_cache_hit_tokens").Int()
+    // 按请求阶段识别出的 AuthStyle 取协议适配器，
+    // 由适配层统一提取各协议的 usage 字段
+    fields := modelprotocol.Get(ctx.aiBasicInfo.AuthStyle).ExtractUsageFields(data)
+    // fields 包含 UsedQuota / PromptTokens / CompletionTokens /
+    // CacheReadTokens / CacheWriteTokens / AudioInputTokens /
+    // AudioOutputTokens / ImageInputTokens / ImageCount / VideoCount
+    tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
+    if fields.UsedQuota > 0 {
+        // 回填全部字段到 TokenUsage
+        // ...
+    } else if fields.PromptTokens > 0 || fields.CompletionTokens > 0 ||
+        fields.ImageCount > 0 || fields.VideoCount > 0 {
+        // 无 total_tokens 时按分项合成 UsedQuota：
+        // 图片/视频生成以数量为 quota，文本以 prompt + completion
+        // ...
     }
-    // Claude fallback
-    if prompt == 0 && completion == 0 {
-        prompt = gjson.GetBytes(data, "usage.input_tokens").Int()
-        completion = gjson.GetBytes(data, "usage.output_tokens").Int()
-    }
-    // 填充 TokenUsage ...
+}
+```
+
+### 扣费幂等标记
+
+`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`：
+
+```go
+type TokenAuthContext struct {
+    Token       *Token
+    aiBasicInfo *bfe_basic.AiBasicInfo
+    // serverConf 缓存 SvrDataConf，供请求结束时计算 RMB 成本
+    serverConf bfe_basic.ServerDataConfInterface
+    // deducted 标记本请求是否已执行扣费，
+    // 防止 HandleRequestFinish 重复触发导致重复扣费
+    deducted bool
 }
 ```
 
@@ -598,8 +719,10 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 - 通过 `HandleFoundProduct`、`HandleReadResponse`、`HandleRequestFinish` 三个回调，分别完成认证、用量解析、配额扣减。
 - API-Key 从 `Authorization: Bearer <api-key>` 中提取，校验项包括存在性、启用状态、过期时间、模型白名单/黑名单、来源子网以及各 `QuotaPlan` 的 Redis 余额。
 - `QuotaPlan.RedisKey` 由控制面生成并下发，BFE 直接使用，避免改名导致计数器重置；`total_token` 与 `RMB` 两种单位分别使用不同的 Lua 脚本扣减。
-- RMB 配额按 `AIConf.ModelTable` 中的模型价格与当前时段 tier 计算成本，所有运算使用定点整数，避免浮点误差。
-- 流式响应的 Token 用量由 `mod_body_process` 解析并累计，非流式响应由 `mod_ai_token_auth` 直接解析；最终统一在 `HandleRequestFinish` 中扣减。
+- RMB 配额按 `AIConf.ModelTable` 中的模型价格与当前时段 tier 计算成本，所有运算使用定点整数，避免浮点误差；chat 计费从总输入中拆分缓存读写、图片/音频输入维度，均未配置时回退 legacy 公式，`responses` 复用 chat 计费，`video_generation` 按 `output_cost_per_video` × 视频数计费。
+- 计费可靠性由 `AiBasicInfo` 的 `MarkResponseCompleted` / `MarkFinalUsageSeen` 两组标记支撑：客户端中断且未见到最终 usage 不扣费，估算值仅在响应正常完成时可用；`TokenAuthContext.deducted` 保证扣费幂等；`/count_tokens` 端点跳过计费。
+- `total_token` 配额允许为 0（无余额计划，绑定请求被 429 拒绝），Redis 余额 key 不存在视为无余额而非内部错误。
+- 流式响应的 Token 用量由 `mod_body_process` 解析并累计（`message_delta` 保留 `message_start` 的 prompt/cache 字段），非流式响应由 `mod_ai_token_auth` 直接解析；usage 提取统一委托给 `bfe_model_protocol` 协议适配层，最终统一在 `HandleRequestFinish` 中扣减。
 
 理解 `mod_ai_token_auth` 的实现，有助于排查 API-Key 鉴权失败、配额误扣、RMB 计费不准等问题，也为后续扩展新的认证方式或计费维度打下基础。
 
@@ -613,6 +736,8 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 - `bfe/bfe_modules/mod_body_process/content_quota_usage.go`
 - `bfe/bfe_modules/mod_body_process/mod_body_process.go`
 - `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`
+- `bfe/bfe_basic/request_ai_basic.go`
+- `bfe/bfe_model_protocol/utils/usage_parse.go`
 - `bfe/bfe_modules/bfe_modules.go`
 - `bfe/docs/zh_cn/modules/mod_ai_token_auth/mod_ai_token_auth.md`
 - `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`

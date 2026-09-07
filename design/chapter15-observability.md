@@ -19,7 +19,7 @@ AI 网关承接大量大模型调用流量，请求链路涉及认证、路由�
 
 ### 日志（Logs）
 
-日志用于记录每个请求的完整生命周期。BFE 数据面通过访问日志（Access Log）输出请求在认证、路由、转发、计费各阶段的关键信息，支持下游进行故障排查、计费对账和安全审计。AI 专属字段统一占用 `bfe-access-pb` 协议的 701-900 编号区间，当前已定义 27 个字段，详见 [BFE AI 访问日志可观测字段设计](../bfe/docs/zh_cn/sys_design/ai_access_log_fields.md)。
+日志用于记录每个请求的完整生命周期。BFE 数据面通过访问日志（Access Log）输出请求在认证、路由、转发、计费各阶段的关键信息，支持下游进行故障排查、计费对账和安全审计。AI 专属字段统一占用 `bfe-access-pb` 协议的 701-900 编号区间，当前已定义 29 个字段，详见 [BFE AI 访问日志可观测字段设计](../bfe/docs/zh_cn/sys_design/ai_access_log_fields.md)。
 
 ### 指标（Metrics）
 
@@ -52,7 +52,7 @@ AI 可观测字段统一占用 `bfe-access-pb` 的 701-900 编号区间，按用
 |----------|------|
 | 701 - 713 | 已投入使用字段，如 API Key 标识、模型名、Token 数、限流命中等 |
 | 714 - 760 | 模型与请求基础信息，如 provider、protocol、stream、retry、cache 等 |
-| 761 - 800 | Token 与成本计量，包括普通 token/cost 及 cache/audio/image 子项 |
+| 761 - 800 | Token 与成本计量，包括普通 token/cost 及 cache/audio/image/video 子项 |
 | 801 - 840 | 路由、转换与插件，如路由规则命中、cluster/key 尝试列表 |
 | 841 - 880 | 安全、合规与隐私，如命中/拒绝的 Quota Plan ID |
 | 881 - 900 | 厂商扩展与预留 |
@@ -87,6 +87,34 @@ AI 可观测字段统一占用 `bfe-access-pb` 的 701-900 编号区间，按用
 | `ai_auth_hit_quota_plans` | 841 | repeated | 正常请求时命中的 Quota Plan ID 列表 | `mod_ai_token_auth` |
 
 需要特别强调的是，访问日志中的 `ai_apikey_id` 只记录 API Key 的内部标识，不会记录原始 key 值，从而避免敏感信息泄露。原始 key 仍保留在内存中用于向上游注入，但不会被写入日志。
+
+除上表列出的核心字段外，761-800 区间的 781-790 子段用于计量拆分项，覆盖缓存、音频、图像与视频生成场景：
+
+| 字段名 | 编号 | 类型 | 说明 |
+|--------|------|------|------|
+| `ai_cache_read_tokens` | 781 | int64 | 从 cache 读取的 Token 数（已包含在 `ai_input_tokens` 中） |
+| `ai_cache_write_tokens` | 782 | int64 | 写入 cache 的 Token 数（独立附加项） |
+| `ai_audio_input_tokens` | 783 | int64 | 音频输入 Token 数（已包含在 `ai_input_tokens` 中） |
+| `ai_audio_output_tokens` | 784 | int64 | 音频输出 Token 数（已包含在 `ai_output_tokens` 中） |
+| `ai_image_count` | 785 | int64 | 生成的图像张数（image_generation 模式） |
+| `ai_image_input_tokens` | 786 | int64 | 图片输入 Token 数（已包含在 `ai_input_tokens` 中） |
+| `ai_video_count` | 787 | int64 | 生成视频数量（video_generation 模式） |
+
+其中 `ai_image_input_tokens` 与 `ai_video_count` 依赖 `bfe-access-pb` v0.3.5，采集逻辑位于 `bfe_modules/mod_access_pb3/request_log.go` 的 `reqAiInfoGen()`，取值来自 `bfe_basic.TokenUsage` 的 `ImageInputTokens` 与 `VideoCount`，由 `mod_ai_token_auth` 在响应阶段解析 usage 时填充。
+
+### 控制面操作日志（审计数据源）
+
+访问日志刻画的是数据面的请求生命周期；控制面（AI Gateway API）的每一次配置变更则由操作日志（Operation Log）模块记录，形成审计观测数据源，并提供查询接口 `GET /open-api/v1/operation-logs`（接口定义见 [附1 OpenAPI 接口速查](../appendix/appendix01-openapi-quick-reference.md)）。
+
+各资源的写操作（覆盖 `/entities`、`/api-keys`、`/providers`、`/clusters`、`/routes`、`/global-route-rules`、`/certificates`、`/quota-plans`、`/model-prices`、`/auth` 等模块的创建、更新、删除等）在执行成功或失败后都会由系统自动写入一条操作日志，接口层不暴露写入接口。每条日志记录：
+
+- 操作者信息：`operator_type`（user/token）、`operator_id`、`operator_name`；
+- 资源信息：`action`（create/update/delete/reset/import/bind/unbind）、`resource_type`、`resource_id`、`resource_name`、`resource_parent_id`；
+- 执行结果：`status`（1 成功/2 失败），失败时附 `error_msg`；
+- 变更摘要：`change_summary`，包含变更前后内容（`before`/`after`）与变更字段列表（`diff_keys`），其中 API-Key Token、密码、证书私钥等敏感字段已脱敏；
+- 请求上下文：`request_path`、`request_method`、`client_ip`、`user_agent` 与 `created_at`。
+
+操作日志存储于控制面数据库的 `operation_logs` 表，`log_id` 与 BFE 访问日志中的 LogID 一致，审计场景下可按操作人、资源、时间区间等条件分页查询，实现"配置变更—请求行为"的双向追溯。
 
 ## 关键监控指标
 
@@ -284,7 +312,8 @@ StdOut      = false
 本章介绍了壬远 AI 网关的可观测性设计，核心要点如下：
 
 - 可观测性由日志、指标、追踪三个支柱构成，BFE 数据面当前在日志与指标方面做了深度定制；
-- AI 访问日志包含 27 个专属字段，覆盖认证、路由、限流、Token 计量、成本估算等全生命周期信息，且不会记录原始 API Key；
+- AI 访问日志包含 29 个专属字段，覆盖认证、路由、限流、Token 计量（含图像/视频生成子项）、成本估算等全生命周期信息，且不会记录原始 API Key；
+- 控制面操作日志记录每一次配置变更的操作者、资源、变更摘要（含 diff_keys）与请求上下文，敏感字段已脱敏，可通过 `GET /open-api/v1/operation-logs` 审计查询；
 - 关键监控指标包括 `REQ_TOTAL`、路由命中/未命中/兜底、限流触发、配额命中与拒绝、Token 消耗速率、TTFT/TPOT 等；
 - Prometheus 可通过 Pull 方式采集 BFE 指标，Zabbix 可通过 HTTP Agent 或自定义脚本接入；
 - 错误码体系分为认证与准入、限流检查、配额扣减、转发与协议适配四个层级，与访问日志字段存在明确对应关系；
@@ -299,5 +328,6 @@ StdOut      = false
 - `bfe/docs/zh_cn/modules/mod_ai_route/mod_ai_route.md` — AI 路由模块文档
 - `bfe/docs/zh_cn/modules/mod_ai_rate_limit/mod_ai_rate_limit.md` — AI 限流模块文档
 - `ai-gateway-api/docs/zh_cn/config_param.md` — AI Gateway API 配置文件说明
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/operation-logs.md` — 操作日志接口定义
 - `bfe_basic/request_ai_basic.go` — AI 上下文与错误码 Go 语言定义
 - `bfe_modules/mod_access_pb3/` — 访问日志输出模块

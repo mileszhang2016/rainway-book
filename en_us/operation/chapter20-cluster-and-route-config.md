@@ -38,7 +38,7 @@ Once preparation is complete, configuration can be submitted either through the 
 Before creating a Cluster, the corresponding Provider must already exist, and the `llm_config.provider` reference must be present. The typical creation flow is as follows:
 
 1. Submit the Cluster configuration via `POST /clusters`.
-2. The Control Plane validates that `name` is globally unique, `provider` exists, `models` is a subset of the Provider's models, and `keys` reference keys already defined in the Provider.
+2. The Control Plane validates that `name` is globally unique and 1-64 characters long (single-character names are allowed and work with the get-one/delete/ready endpoints too), `provider` exists, `models` is a subset of the Provider's models, and `keys` reference keys already defined in the Provider.
 3. The system automatically:
    - Creates an instance pool named `{product_name}.{cluster_name}`;
    - Creates a sub-cluster named `{cluster_name}`;
@@ -101,7 +101,9 @@ To update a Cluster, use `PATCH /clusters/{cluster_name}`. Fields that can be mo
 - `llm_config.keys` is treated as a **full replacement** — the caller must pass the complete list of key references;
 - `sub_clusters` and `scheduler` are generated automatically by the system and do not support manual modification.
 
-When deleting a Cluster, the system first checks whether the Cluster is referenced by AI route rules at the Global, Entity, or API-Key level. If references exist, the deletion fails; the references or the corresponding route rules must be removed first. After passing the reference check, the system cascades: unbinds the sub-cluster, deletes the sub-cluster, deletes the instance pool, and finally deletes the Cluster.
+When deleting a Cluster, the system first checks whether the Cluster is referenced by AI route rules at the Global, Entity, or API-Key level. If references exist, the deletion fails with `409 Conflict` (the response names the referencing rule); the references or the corresponding route rules must be removed first. After passing the reference check, the system cascades: unbinds the sub-cluster, deletes the sub-cluster, deletes the instance pool, and finally deletes the Cluster.
+
+Similarly, when updating a Cluster's model list, if a removed model is still referenced by a route rule's `targets` or `fallbacks`, the update also returns `409 Conflict`; adjust the corresponding route rules before changing the Cluster's model list.
 
 ## Configuring Forwarding Policies, Model Mappings, Key Policies, and Session Affinity
 
@@ -216,7 +218,7 @@ The Global Route Table is the global catch-all rule; every API-Key is ultimately
 
 The route tables of Entity and API-Key are written as embedded objects when the corresponding resource is created or updated. For example, attaching `route_rules` in an Entity configuration achieves department-level routing policies; attaching `route_rules` in an API-Key achieves user-level fine-grained routing. If `route_rules` is not explicitly passed at creation time, the system generates an empty record by default (`enabled=false`, `rules=[]`), making it easy to enable later.
 
-`GET /route-tables` returns paginated metadata for all route tables; the returned fields contain only `id`, `type`, `owner`, and `enabled`, not the rule details. To view or modify rule content, access the management API of the corresponding level — for example, the Global Route Table uses `GET /global-route-rules` and `PUT /global-route-rules`.
+`GET /route-tables` returns paginated metadata for all route tables; the returned fields contain only `id`, `type`, `owner`, and `enabled`, not the rule details. The `type` of an API-Key level route table is exposed externally as `api_key` (internal storage and the BFE export still use `apikey`; the Control Plane maps between the two automatically), and the `type` query parameter also accepts `api_key`. To view or modify rule content, access the management API of the corresponding level — for example, the Global Route Table uses `GET /global-route-rules` and `PUT /global-route-rules`.
 
 ## Route Rule Priority and Fallback
 

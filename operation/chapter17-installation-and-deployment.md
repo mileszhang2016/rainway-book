@@ -342,6 +342,16 @@ docker run -d \
 
 如果 MySQL 不在容器网络中，请确保容器可访问数据库地址，或使用 Docker 网络/主机网络模式。生产环境建议使用自定义 Docker 网络，将 AI Gateway API 与 MySQL、Redis 放入同一网络命名空间，便于服务发现和访问控制。
 
+### 容器内时区数据（tzdata）注意事项
+
+BFE 的 Dockerfile 在 conf-agent、log-reader 构建阶段与最终 alpine 运行镜像均执行 `apk add tzdata`。alpine 基础镜像本身不含 `/usr/share/zoneinfo`，若镜像内缺少时区数据，会影响日志时间戳、配额周期（`reset_period` weekly/monthly）计算以及分时段定价（tier）匹配等依赖本地时区的功能。
+
+若使用自定义镜像或不包含上述改动的镜像二次构建，请确保镜像内已安装 `tzdata`，或运行时挂载宿主机的时区文件：
+
+```bash
+docker run -d -v /etc/localtime:/etc/localtime:ro ...
+```
+
 ## Kubernetes 部署示例
 
 以下示例展示如何在 Kubernetes 中部署 AI Gateway API。示例假设 MySQL 与 Redis 已在外部或同集群中可用。
@@ -694,6 +704,7 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 - 最小可运行配置需调整数据库连接与 Redis 逻辑名；Redis 真实地址通过 `name_conf.data` 解析。
 - 可通过 `make docker` 构建容器镜像，并采用 Kubernetes Deployment、Service 与 DaemonSet 进行集群化部署。
 - 多组件启动顺序为：数据库初始化 → AI Gateway API → BFE → Conf Agent，确保数据面能够及时获得控制面下发的最新配置。
+- BFE 镜像内置 tzdata；使用自定义镜像时需自行保证容器内时区数据完整。
 - 常见部署问题主要集中于数据库连接、静态资源挂载、Conf Agent 通信、TLS 配置关联检查、端口冲突与 Redis 连接失败。
 - 上线前应完成生产部署检查清单，重点检查密码安全、权限配置和回滚方案。
 

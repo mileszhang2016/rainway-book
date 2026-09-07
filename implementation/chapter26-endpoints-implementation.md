@@ -41,6 +41,7 @@ ai-gateway-api/endpoints/
 │   ├── entity_type/          # /entity-types
 │   ├── global_route_rules/   # /global-route-rules
 │   ├── model_price/          # /model-prices
+│   ├── operation_log/        # /operation-logs
 │   ├── product_cluster/      # /clusters
 │   ├── provider/             # /providers
 │   ├── route/                # /expression/verify
@@ -55,6 +56,7 @@ ai-gateway-api/endpoints/
     ├── mod_api_key/
     ├── mod_body_process/
     ├── protocol/
+    ├── quota_reset/            # /quota/trigger-reset
     ├── rate_limit_policy/
     ├── server_data/
     └── export_util/
@@ -377,6 +379,7 @@ func endpoints() []*xreq.Endpoint {
         route_tables.Endpoints,
         model_price.Endpoints,
         provider.Endpoints,
+        operation_log.Endpoints,
     )
 }
 
@@ -420,6 +423,7 @@ func endpoints() []*xreq.Endpoint {
         extra_file.ExportExtraFileEndpoint,
         mod_api_key.ExportRoute,
         mod_body_process.ExportRoute,
+        quota_reset.TriggerResetRoute,
         rate_limit_policy.ExportRoute,
         ai_route.ExportRoute,
     }
@@ -437,7 +441,7 @@ func RegisterRouter(router *mux.Router) *mux.Router {
 }
 ```
 
-与 OpenAPI 不同，InnerAPI 子树只挂载 `McUserProbe`，不挂载 `McProductProbe`，因为数据面拉取配置时不需要再区分产品线上下文。当前 InnerAPI 共导出九类配置：
+与 OpenAPI 不同，InnerAPI 子树只挂载 `McUserProbe`，不挂载 `McProductProbe`，因为数据面拉取配置时不需要再区分产品线上下文。当前 InnerAPI 共注册 10 个接口：9 类配置导出接口加 1 个配额触发重置接口：
 
 | 接口路径 | 配置主题 | 说明 |
 |---|---|---|
@@ -450,8 +454,51 @@ func RegisterRouter(router *mux.Router) *mux.Router {
 | `/configs/mod-body-process` | `mod_body_process` | 请求体处理配置 |
 | `/configs/rate-limit-policy` | `mod_ai_rate_limit` | 限流策略配置 |
 | `/configs/ai-route` | `ai_route` | AI 路由配置 |
+| `/quota/trigger-reset` | 无 | 手动触发一次配额周期重置，返回 `{"status":"ok"}` |
 
 所有 InnerAPI 导出接口都支持 `version` 查询参数，由 `export_util.NewExportFromReq` 解析后交给对应 Manager 的 `ConfigExport` 方法处理。当请求版本与当前版本一致时，返回 `Data: nil`，避免重复下发。
+
+---
+
+## 操作日志查询与配额触发重置
+
+### OpenAPI：操作日志查询
+
+`endpoints/openapi_v1/operation_log/list.go` 暴露 `GET /open-api/v1/operation-logs`，用于分页查询配置操作日志，是操作日志模块（详见 [第六章 控制面核心设计](../design/chapter06-control-plane-design.md)）对外的唯一接口：
+
+```go
+// ai-gateway-api/endpoints/openapi_v1/operation_log/list.go
+var OperationLogListRoute = &xreq.Endpoint{
+    Path:       "/operation-logs",
+    Method:     http.MethodGet,
+    Handler:    xreq.Convert(OperationLogListAction),
+    Authorizer: iauth.FA(iauth.FeatureOperationLog, iauth.ActionReadAll),
+}
+```
+
+该接口使用 `xreq.BindForm` 绑定查询参数：`operator_name`、`action`、`resource_type`、`resource_id`、`resource_name`、`resource_parent_id`、`status`（`1`=成功 / `2`=失败）、`start_time` / `end_time`（Unix 秒）、`page`（默认 1）与 `page_size`（默认 20、上限 100）。Action 将参数转换为 `ioperlog.OperationLogFilter` 后调用 `container.OperationLogManager.QueryLogs`，响应结构为 `{list, pagination:{page, page_size, total}}`；其中 `list` 条目包含 `log_id`、操作者与资源信息、`status`、`error_msg`、`change_summary`、`request_path` / `request_method`、`client_ip` / `user_agent` 等字段，`created_at` 以 Unix 秒返回。
+
+### InnerAPI：配额触发重置
+
+`endpoints/innerapi_v1/quota_reset/quota_reset.go` 暴露 `POST /inner-api/v1/quota/trigger-reset`，用于手动触发一次带分布式锁保护的配额周期重置：
+
+```go
+// ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go
+var TriggerResetRoute = &xreq.Endpoint{
+    Path:    "/quota/trigger-reset",
+    Method:  http.MethodPost,
+    Handler: xreq.Convert(TriggerResetAction),
+}
+
+func TriggerResetAction(req *http.Request) (interface{}, error) {
+    if container.QuotaResetScheduler != nil {
+        container.QuotaResetScheduler.TriggerReset()
+    }
+    return map[string]string{"status": "ok"}, nil
+}
+```
+
+与导出接口不同，`TriggerResetRoute` **未配置 `Authorizer`**，它面向运维触发场景，不做 Feature 级权限校验（仍经过 InnerAPI 子树的 `McUserProbe` 身份解析）。配额重置的调度、分布式锁与原子扣减细节详见配额相关章节。
 
 ---
 
@@ -645,6 +692,8 @@ func exportActionProcess(req *http.Request) (interface{}, error) {
 | `ai-gateway-api/lib/xreq/param.go` | JSON / URI / Form 参数绑定与校验 |
 | `ai-gateway-api/lib/xreq/validate.go` | 自定义 `Validator` 接口支持 |
 | `ai-gateway-api/endpoints/openapi_v1/entity_type/create.go` | OpenAPI 典型 Action 示例 |
+| `ai-gateway-api/endpoints/openapi_v1/operation_log/list.go` | 操作日志查询接口 |
+| `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go` | 配额触发重置接口 |
 | `ai-gateway-api/endpoints/innerapi_v1/mod_api_key/export.go` | InnerAPI 典型导出 Action 示例 |
 
 ---
@@ -655,7 +704,8 @@ func exportActionProcess(req *http.Request) (interface{}, error) {
 - `xreq.Endpoint` 统一了路径、方法、Handler、鉴权与自定义注册方式，是接口层的核心抽象。业务 Action 通过 `xreq.Convert` 转换为 `Endpoint.Handler`。
 - Recovery、Logger、CORS 作为全局中间件对所有 API 生效；Product Probe 与 User Probe 作为路由子树中间件分别服务于 OpenAPI 与 InnerAPI，其中 User Probe 负责身份解析，Endpoint 的 `Authorizer` 负责细粒度权限校验。
 - OpenAPI v1 通过 `merge` 函数将各子包导出的 `[]*xreq.Endpoint` 合并后注册到 `/open-api/v1`。
-- InnerAPI v1 通过固定切片注册九类配置导出接口，所有导出接口均支持 `version` 增量同步，由 `export_util.NewExportFromReq` 与 `model/iversion_control` 共同实现。
+- InnerAPI v1 通过固定切片注册九类配置导出接口，所有导出接口均支持 `version` 增量同步，由 `export_util.NewExportFromReq` 与 `model/iversion_control` 共同实现；另注册 `POST /quota/trigger-reset` 用于手动触发配额周期重置。
+- OpenAPI 提供 `GET /open-api/v1/operation-logs` 操作日志查询接口，鉴权为 `FeatureOperationLog + ActionReadAll`，响应 `{list, pagination}`。
 - 参数绑定由 `xreq.Bind*` 完成，支持 struct tag 校验与自定义 `Validator`；权限校验通过 `iauth.FA` 挂载到每个 Endpoint；统一响应由 `xreq.Result` 与 `xreq.Render` 完成，对外统一返回 `{ErrNum, Data, ErrMsg}`。
 
 ---
@@ -675,6 +725,8 @@ func exportActionProcess(req *http.Request) (interface{}, error) {
 - `ai-gateway-api/endpoints/middleware/product_probe.go`
 - `ai-gateway-api/endpoints/middleware/user_probe.go`
 - `ai-gateway-api/endpoints/openapi_v1/entity_type/create.go`
+- `ai-gateway-api/endpoints/openapi_v1/operation_log/list.go`
+- `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`
 - `ai-gateway-api/endpoints/innerapi_v1/mod_api_key/export.go`
 - [第六章 控制面核心设计：AI Gateway API](../design/chapter06-control-plane-design.md)
 - [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)

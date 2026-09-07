@@ -12,6 +12,7 @@ After reading this chapter, you will understand:
 - How cross-package Adapters resolve signature inconsistencies between subpackage interfaces.
 - How a typical Manager (using `APIKeyManager` as an example) orchestrates parameter validation, cascading creation of associated resources, and eventual-consistency synchronization with the Redis cache.
 - How `QuotaPlanManager` resets quota balances across resources outside the transaction.
+- How `QuotaResetScheduler` uses a Redis distributed lock to run periodic resets exclusively across instances, and how `ResetToQuotaAtomic` plus the conditional `last_reset_at` update guarantee the atomicity and idempotency of resets.
 
 With an understanding of these design patterns, readers can quickly determine which layer a new business requirement belongs to and which conventions it should follow, and can write unit tests for the model layer that match the existing style.
 
@@ -314,6 +315,7 @@ classDiagram
         +GetRemaining(ctx, key, unit)
         +SetRemaining(ctx, key, quota, unit)
         +ResetToQuota(ctx, key, quota, unit)
+        +ResetToQuotaAtomic(ctx, key, quota, unit)
         +DeleteKeys(ctx, keys)
     }
 
@@ -597,6 +599,57 @@ The key design points here are:
 
 Besides `ResetBalance`, `QuotaPlanManager` also provides `ApplyQuotaPlanChange`, used when an API-Key or Entity changes its quota plan: it adjusts the Redis balance only when `quota`, `unit`, or `unlimited` actually change, preventing ordinary attribute modifications from zeroing out the quota usage. The implementation of this method likewise follows a conservative "detect differences first, then adjust as needed" strategy, reflecting the model layer's careful treatment of data consistency.
 
+## Mutual Exclusion and Atomicity Guarantees for Periodic Reset
+
+Periodic quota reset is protected in two aspects: a Redis distributed lock ensures that only one instance performs the reset in a multi-instance deployment, and the periodic reset path uses an atomic SET (`ResetToQuotaAtomic`) instead of the read-modify-write `IncrBy(delta)`, complemented by a conditional `last_reset_at` update as an idempotency backstop. The two mechanisms live in the `model/quotacache` and `model/quota` subpackages respectively.
+
+### Distributed Lock Abstraction (model/quotacache/lock.go)
+
+`quotacache.DistributedLock` defines three operations:
+
+```go
+// model/quotacache/lock.go
+type DistributedLock interface {
+    Acquire(ctx context.Context, key, token string, ttl time.Duration) (bool, error)
+    Release(ctx context.Context, key, token string) error
+    Renew(ctx context.Context, key, token string, ttl time.Duration) error
+}
+```
+
+`redisDistributedLock` implements them with three Lua scripts on top of BFE's `redis_client.Client` (that interface does not expose `SET NX PX` but does provide `NewScript/Run`): Acquire uses `EXISTS` + `SETEX` to simulate SET NX PX semantics; Release and Renew both compare `GET == token` before executing `DEL` / `EXPIRE`. The token check is the key safety property: only the lock holder can release or renew it, so an instance that crashes and restarts cannot delete a same-named lock now held by another instance.
+
+### Scheduler Locking Flow (model/quota/scheduler.go)
+
+`QuotaResetScheduler` receives the `DistributedLock` via constructor injection and generates a unique per-instance `instanceToken` (UUID) at startup. Each round of `resetQuotas` works as follows:
+
+1. Acquire the lock with the fixed key `quota:reset:scheduler:lock` and a TTL of 5 minutes; if acquisition fails, skip this round entirely;
+2. Start a watchdog goroutine that calls `Renew` at TTL/3 intervals, so the lock does not change hands mid-reset even if the reset outlasts the TTL;
+3. Execute `BalanceSyncManager.ResetExpiredBalances`;
+4. Call `Release` in a `defer`; the Lua script verifies the token before deleting the lock.
+
+`TriggerReset()` reuses the same entry point (`resetQuotasWithRecover`), so the manual trigger via the Inner API `POST /inner-api/v1/quota/trigger-reset` has exactly the same lock-protection semantics as the scheduled execution and does not affect the ticker’s next fire time.
+
+### Atomic Reset and Conditional Update (model/quotacache/redis.go, model/quota/balance_sync.go)
+
+`redisQuotaCache` adds a precompiled Lua script `setQuotaScript` (`redis.call('set', KEYS[1], ARGV[1])`), executed by `ResetToQuotaAtomic`. Unlike the read-modify-write of `SetRemaining`, the atomic SET does not read the current value: the result is always exactly the target quota, eliminating the deviation caused by "read a stale value, compute delta, and have a concurrent deduction interleave" scenarios.
+
+After `BalanceSyncManager.resetAPIKeysRedisUsage` calls `ResetToQuotaAtomic` for every API-Key and Entity under the plan, `ResetExpiredBalances` advances the reset watermark with a conditional update:
+
+```go
+// model/quota/balance_sync.go
+periodStart := m.getPeriodStart(*plan.ResetPeriod, now)
+_, err = m.planStorager.UpdateQuotaPlan(ctx, &QuotaPlanFilter{
+    ID:                plan.ID,
+    LastResetAtBefore: &periodStart, // update only when last_reset_at is earlier than the current period start
+}, &QuotaPlanParam{
+    LastResetAt: lib.PTime(now),
+})
+```
+
+`LastResetAtBefore` is a new filter field on `QuotaPlanFilter` (`model/quota/quota_plan.go`), with the semantics "update only when `last_reset_at` is earlier than the current period start." Even if the distributed lock fails and a second reset occurs within the same period, this conditional update matches zero rows and `last_reset_at` does not advance; combined with the idempotency of the atomic SET, duplicate resets have no side effects.
+
+Note that the manual reset path (`QuotaPlanManager.ResetBalance`) still goes through `ResetToQuota` (internally the `IncrBy(delta)` of `SetRemaining`), because a manual reset must bring the remaining amount up to the total quota based on the current value; a periodic reset, by contrast, must "unconditionally zero the balance to the total quota." The two semantics differ, and their implementations are deliberately kept separate.
+
 ## Key Code Snippets
 
 ### 1. Transaction Abstraction Interface
@@ -654,6 +707,47 @@ if param.Key != nil && param.QuotaPlan != nil &&
 }
 ```
 
+### 5. Distributed Lock Lua Scripts
+
+```go
+// ai-gateway-api/model/quotacache/lock.go
+const lockAcquireScript = `
+if redis.call('exists', KEYS[1]) == 0 then
+    redis.call('setex', KEYS[1], tonumber(ARGV[2]), ARGV[1])
+    return 1
+else
+    return 0
+end
+`
+const lockReleaseScript = `
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+`
+```
+
+### 6. Atomic Reset Lua Script and Conditional last_reset_at Update
+
+```go
+// ai-gateway-api/model/quotacache/redis.go
+const setQuotaScriptSrc = `
+redis.call('set', KEYS[1], ARGV[1])
+return 1
+`
+```
+
+```go
+// ai-gateway-api/model/quota/balance_sync.go
+_, err = m.planStorager.UpdateQuotaPlan(ctx, &QuotaPlanFilter{
+    ID:                plan.ID,
+    LastResetAtBefore: &periodStart, // update only when last_reset_at is earlier than the current period start
+}, &QuotaPlanParam{
+    LastResetAt: lib.PTime(now),
+})
+```
+
 ## Chapter Summary
 
 This chapter introduced the Manager and Storager patterns of the Rainway AI Gateway model layer:
@@ -663,6 +757,7 @@ This chapter introduced the Manager and Storager patterns of the Rainway AI Gate
 3. **Adapter pattern**: `NewXxxStoragerAdapter` adapts the concrete Storagers of each subpackage to the generic interfaces in `model/shared`, reducing coupling between Managers and making mocks easier to write in unit tests.
 4. **Typical implementation**: `APIKeyManager` demonstrates the complete flow of parameter validation, cascading creation of associated resources, transaction orchestration, and eventual-consistency synchronization with Redis. On creation, it validates first and then cascades creation of subresources; on query, it populates associated data and reads real-time balances outside the transaction; on deletion, it cascades cleanup of subresources first and then reclaims the Redis key.
 5. **Eventual consistency**: writes/deletes/resets of the Redis quota cache happen outside the transaction, and failures are only logged, avoiding the complexity of a distributed transaction. Since the quota cache itself can be rebuilt from the DB, brief inconsistency is acceptable.
+6. **Periodic reset reliability**: `QuotaResetScheduler` uses `quotacache.DistributedLock` (key `quota:reset:scheduler:lock`, TTL 5 minutes, watchdog renewal at TTL/3, token-guarded release) to guarantee exclusive execution across instances; `BalanceSyncManager` replaces `IncrBy(delta)` with the atomic SET of `ResetToQuotaAtomic` to eliminate the read-modify-write race, and updates `last_reset_at` conditionally via `LastResetAtBefore` as an idempotency backstop against duplicate resets within the same period.
 
 Through interface isolation and dependency injection, the model layer keeps business logic cohesive while providing clear boundaries for unit testing and future extension. When adding a new business model, developers only need to fill in Param, Filter, Storager, and Manager according to the four-layer abstraction and orchestrate transactions via `AtomExecute` to fit quickly into the existing system.
 
@@ -675,5 +770,12 @@ Through interface isolation and dependency injection, the model layer keeps busi
 - `ai-gateway-api/model/entity/entity.go`
 - `ai-gateway-api/model/quota/quota_plan_manager.go`
 - `ai-gateway-api/model/quota/adapters.go`
+- `ai-gateway-api/model/quota/scheduler.go`
+- `ai-gateway-api/model/quota/balance_sync.go`
+- `ai-gateway-api/model/quota/quota_plan.go`
+- `ai-gateway-api/model/quotacache/quotacache.go`
+- `ai-gateway-api/model/quotacache/redis.go`
+- `ai-gateway-api/model/quotacache/lock.go`
+- `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`
 - `ai-gateway-api/model/shared/types.go`
 - `ai-gateway-api/stateful/container/rdb/components.go`

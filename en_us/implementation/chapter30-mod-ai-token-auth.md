@@ -8,6 +8,7 @@ Through this chapter, readers will understand the complete implementation of the
 - How to validate the API-Key carried by a request and return a structured error response on failure;
 - How to bind an API-Key to `QuotaPlan`s and query real-time balances via Redis;
 - How to deduct quota at request end based on actual Token usage or RMB cost;
+- The reliability semantics of deduction idempotency, no billing on client abort, and `/count_tokens` skipping billing;
 - How RMB quota achieves differentiated billing by combining Provider time-period templates with time-period model prices;
 - How `mod_ai_token_auth` cooperates with `mod_body_process` in streaming and non-streaming responses.
 
@@ -19,7 +20,7 @@ The module's core responsibilities include:
 
 1. **API-Key extraction and validation**: extract the Key from the request's `Authorization: Bearer <api-key>` header, and check its existence, enabled state, expiration time, model allowlist/blocklist, source IP subnets, etc. When validation fails, a structured error response is constructed and returned to the client immediately, preventing invalid requests from reaching the backend.
 2. **Quota balance pre-check**: before a request enters the backend, query the remaining quota of each `QuotaPlan` in Redis, and reject the request when the balance is insufficient or the plan has expired. This step runs only after the request is successfully authenticated; requests that do not hit an authentication rule do not trigger a quota check.
-3. **Deduction at request end**: after the response completes, deduct the `total_token` quota based on the `usage` field in the response body or the Token count estimated from content length; for the `RMB` quota, first convert the cost at the model unit price, then deduct. Deduction failures are caught and recorded as Warn logs, and do not affect the response delivery.
+3. **Deduction at request end**: after the response completes, deduct the `total_token` quota based on the `usage` field in the response body or the Token count estimated from content length; for the `RMB` quota, first convert the cost at the model unit price, then deduct. Requests aborted by the client without a final usage are not billed, `/count_tokens`-style endpoints skip billing, and the `deducted` flag makes deduction idempotent. Deduction failures are caught and recorded as Warn logs, and do not affect the response delivery.
 4. **Structured error information**: record the rejection reason and the hit quota plan in `AiBasicInfo.AiAuthInfo`, facilitating access-log and monitoring analysis. These fields are also output by access-log modules such as `mod_access`, providing complete context for troubleshooting.
 
 ## Position of the Module in the BFE Module Chain
@@ -141,7 +142,16 @@ flowchart TD
     N -->|Yes| P[Set TokenAuthContext]
 ```
 
-After validation succeeds, `SetTokenAuthContext` writes information such as `KeyId`, `ApikeyTags`, and the estimated `PromptTokens` into `AiBasicInfo` for use by subsequent modules.
+After validation succeeds, `SetTokenAuthContext` writes information such as `KeyId`, `ApikeyTags`, and the estimated `PromptTokens` into `AiBasicInfo` for use by subsequent modules. For image/video generation modes, it also pre-reads the `n` field of the request body (`GetImageCountFromReq` / `GetVideoCountFromReq`) at the authentication stage to populate `ImageCount` / `VideoCount` as a fallback; when `n` is missing or `<= 0`, it takes 1, preventing under-billing when the response carries no usage:
+
+```go
+if aiBasicInfo.Mode == bfe_basic.ModeImageGeneration {
+    tusage.ImageCount = GetImageCountFromReq(req)
+}
+if aiBasicInfo.Mode == bfe_basic.ModeVideoGeneration {
+    tusage.VideoCount = GetVideoCountFromReq(req)
+}
+```
 
 ## Quota Plan Binding and Balance Query (Redis)
 
@@ -163,7 +173,7 @@ type QuotaPlan struct {
 
 When exporting configuration, the Control Plane already generates a stable `RedisKey` for each quota plan, in the format `QUOTA_<stableId>`, where `stableId` is the API-Key value for API-Key-level quota, or `entity_id` for Entity-level quota. BFE uses the delivered `RedisKey` directly and no longer assembles it from the plan name or ID itself, thereby avoiding counter resets caused by renames. This principle is consistent with the Redis key stability design of `mod_ai_rate_limit`: counter keys must not depend on any user-editable business field. For the related design, see `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`.
 
-When `Unit` in `QuotaPlan` is empty, `token_rule_load.go` defaults it to `total_token`, ensuring backward compatibility with old configurations. During configuration validation, the validity of `Quota` is also checked based on the unit type: for example, `total_token` must be greater than 0, while `RMB` is allowed to equal 0 (typically used in scenarios where cost-based deduction follows).
+When `Unit` in `QuotaPlan` is empty, `token_rule_load.go` defaults it to `total_token`, ensuring backward compatibility with old configurations. During configuration validation, the validity of `Quota` is also checked based on the unit type: both `RMB` and `total_token` must be no less than 0. A `total_token` quota is allowed to be 0, which means a "no-balance plan" — an API-Key bound to such a plan is rejected at the quota pre-check with insufficient balance (429 `CodeQuotaExhausted`), suitable for scenarios where the Key is created first and quota is granted later.
 
 ### Balance Query
 
@@ -181,6 +191,11 @@ func (q *QuotaPlan) HasBalance(client redis_client.Client) (bool, int64, error) 
 
     current, err := client.GetInt64(q.RedisKey)
     if err != nil {
+        // A missing key (e.g. a zero-quota plan never synced to Redis)
+        // means no balance, not an internal error
+        if redis_client.IsKeyNotFound(err) {
+            return false, 0, nil
+        }
         return false, 0, err
     }
 
@@ -188,7 +203,7 @@ func (q *QuotaPlan) HasBalance(client redis_client.Client) (bool, int64, error) 
 }
 ```
 
-For a `total_token` quota, the Redis value is the remaining Token count; for an `RMB` quota, the Redis value is a fixed-point integer in units of `1e-8` RMB. `Unlimited` plans return `true` directly and do not participate in balance checks.
+For a `total_token` quota, the Redis value is the remaining Token count; for an `RMB` quota, the Redis value is a fixed-point integer in units of `1e-8` RMB. `Unlimited` plans return `true` directly and do not participate in balance checks. Note that the pre-check reads the real-time balance in Redis rather than the `Quota` field in the configuration: when the balance key does not exist (for example, a zero-quota plan that was never synced to Redis), it is treated as no balance, and the request is rejected with 429 `CodeQuotaExhausted` at the pre-check stage instead of returning a 500 internal error.
 
 ### Control Plane Balance Synchronization
 
@@ -196,11 +211,17 @@ When creating an API-Key / Entity, the Control Plane `ai-gateway-api` writes the
 
 ## Quota Deduction at Request End
 
-Quota deduction happens in `HandleRequestFinish`, when the response has already been fully returned to the client. `tokenRequestFinishHandler` only handles HTTP 200 requests, and prefers the actually parsed Token usage; if the response has no `usage` and estimation is allowed, it estimates based on content length.
+Quota deduction happens in `HandleRequestFinish`, when the response has already been fully returned to the client. `tokenRequestFinishHandler` only handles HTTP 200 requests, and prefers the actually parsed Token usage; if the response has no `usage`, estimation is allowed, and the response completed normally, it estimates based on content length. The processing order is: skip `/count_tokens` endpoints first, then check the idempotency mark, then handle client-abort scenarios, and finally enter the normal usage settlement:
 
 ```go
 func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, res *bfe_http.Response) int {
+    // /count_tokens endpoints only count tokens and are never billed
+    if strings.Contains(req.HttpRequest.RequestURI, "/count_tokens") {
+        return bfe_module.BfeHandlerGoOn
+    }
+
     if res == nil || res.StatusCode != bfe_http.StatusOK {
+        // only count used quota for successful requests
         return bfe_module.BfeHandlerGoOn
     }
 
@@ -209,11 +230,36 @@ func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, re
         return bfe_module.BfeHandlerGoOn
     }
 
+    // HandleRequestFinish may be triggered more than once; deduct only once
+    if ctx.deducted {
+        return bfe_module.BfeHandlerGoOn
+    }
+
+    // Client aborted (RST/close/write-fail) before the final usage was
+    // seen: never bill by full-request estimation
+    aborted := isClientAbortErr(req.ErrCode)
+    if aborted && !ctx.aiBasicInfo.IsFinalUsageSeen() {
+        ctx.deducted = true
+        return bfe_module.BfeHandlerGoOn
+    }
+
     tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
-    if tokenUsage.UsedQuota <= 0 && ctx.aiBasicInfo.IsAllowEstimateToken() {
+    // Estimated values are billable only when the response completed
+    // normally; otherwise reset the estimate fields, since calcCostUnits
+    // below bills from the token fields directly
+    estimateBillable := ctx.aiBasicInfo.IsAllowEstimateToken() &&
+        ctx.aiBasicInfo.IsResponseCompleted()
+    if !ctx.aiBasicInfo.IsFinalUsageSeen() && !estimateBillable {
+        tokenUsage.PromptTokens = 0
+        tokenUsage.CompletionTokens = 0
+        tokenUsage.UsedQuota = 0
+    }
+    if tokenUsage.UsedQuota <= 0 && estimateBillable {
         tokenUsage.UsedQuota = CalcReqUsedQuota(req, tokenUsage.PromptTokens, tokenUsage.CompletionTokens)
     }
 
+    // Calculate RMB cost from the TokenUsage already populated by
+    // mod_body_process (streaming) or tokenReadResponseHandler (non-streaming)
     if tokenUsage.UsedCost <= 0 && hasRMBPlan(ctx.Token.QuotaPlans) {
         tokenUsage.UsedCost = m.calcCostUnits(req, ctx.serverConf, tokenUsage)
     }
@@ -243,9 +289,41 @@ func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, re
         }
     }
 
+    ctx.deducted = true
     return bfe_module.BfeHandlerGoOn
 }
 ```
+
+Here `isClientAbortErr` determines client-side abort errors:
+
+```go
+func isClientAbortErr(err error) bool {
+    return err == bfe_basic.ErrClientWrite ||
+        err == bfe_basic.ErrClientClose ||
+        err == bfe_basic.ErrClientReset
+}
+```
+
+### Deduction Idempotency
+
+`TokenAuthContext` carries a `deducted` flag. `HandleRequestFinish` can be triggered multiple times in some scenarios (for example, abnormal connection teardown); the handler checks `ctx.deducted` at entry and returns immediately if already deducted, and sets the flag after the deduction loop on the normal path. This guarantees that a single request is deducted at most once no matter how many times the handler fires.
+
+### No Billing on Client Abort and Estimation Reliability Semantics
+
+Estimating Tokens from content length (`EstimateToken`: `Content-Length/4` of the request body for input, response body length for output) is only a fallback and is allowed to participate in billing only when the response completed normally. For this purpose, `bfe_basic.AiBasicInfo` maintains two sets of state marks:
+
+- `MarkResponseCompleted` / `IsResponseCompleted`: set when the response finishes normally. In streaming scenarios, `mod_body_process` sets it when a termination event is seen (Anthropic `message_stop`, OpenAI `[DONE]`); in non-streaming scenarios, `tokenReadResponseHandler` sets it after the full response body is read.
+- `MarkFinalUsageSeen` / `IsFinalUsageSeen`: set when the final usage is parsed from the response. In streaming scenarios, `QuotaUsageProcessor` sets it when the final usage event arrives (such as Anthropic `message_delta`, or an event carrying `image_count` / `video_count`); in non-streaming scenarios, it is set after a non-zero `UsedQuota` is parsed. The initial usage of Anthropic `message_start` (`output_tokens = 0`) does not count as final usage.
+
+The settlement rules are:
+
+1. **Client aborted and no final usage seen** (`req.ErrCode ∈ {ErrClientWrite, ErrClientClose, ErrClientReset}` and `IsFinalUsageSeen() == false`): set `deducted` and return without billing. When the client disconnects midway, the response body is incomplete, and full-request estimation would greatly overestimate;
+2. **Not aborted but the response did not complete** (for example, abnormal backend teardown): reset the estimate fields `PromptTokens` / `CompletionTokens` / `UsedQuota` before billing with the normal formula, preventing estimate values from polluting the RMB cost calculation (`calcCostUnits` reads the token fields directly, so guarding `UsedQuota` alone is not enough);
+3. **Response completed normally**: estimates are usable; `UsedQuota` is computed via `CalcReqUsedQuota` and deduction proceeds.
+
+### /count_tokens Skips Billing
+
+Endpoints such as Anthropic's `/v1/messages/count_tokens` are used to pre-count Tokens and do not represent real calls. `tokenRequestFinishHandler` detects this via `RequestURI` containing `/count_tokens` and passes through directly, preventing token-counting requests from being counted against the quota.
 
 ### total_token Deduction
 
@@ -367,16 +445,36 @@ Time zone parsing happens at configuration load time, via the Go standard librar
 
 ### Cost Calculation
 
-`calcCostUnits` is located in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`. It looks up the corresponding `ModelPrice` based on the target Cluster, target model, and request mode (chat / image_generation), and calls `calcChatCost` or `calcImageGenerationCost`.
+`calcCostUnits` is located in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`. It looks up the corresponding `ModelPrice` based on the target Cluster, target model, and request mode, then dispatches to a mode-specific billing function:
+
+```go
+switch mode {
+case bfe_basic.ModeImageGeneration:
+    return calcImageGenerationCost(entry, usage, tierName)
+case bfe_basic.ModeVideoGeneration:
+    return calcVideoGenerationCost(entry, usage, tierName)
+case bfe_basic.ModeResponses:
+    return calcResponsesCost(entry, usage, tierName)
+default:
+    return calcChatCost(entry, usage, tierName)
+}
+```
+
+The mode is determined by `bfe_basic.DetectModeFromPath` from the request path, including `/v1/responses` → `ModeResponses` and `/v1/video/generations` → `ModeVideoGeneration`.
 
 `calcChatCost` supports multiple fine-grained billing dimensions:
 
 - Normal input / output Tokens (`input_cost_per_token`, `output_cost_per_token`)
 - Cache-hit input Tokens (`cache_read_input_token_cost`)
 - Cache-write input Tokens (`cache_creation_input_token_cost`)
+- Image input Tokens (`input_cost_per_image_token`)
 - Audio input / output Tokens (`input_cost_per_audio_token`, `output_cost_per_audio_token`)
 
-Before calculation, sanitization is performed: each component is ensured to be non-negative and not to exceed its corresponding total; then each is multiplied by its configured price key and summed. All operations are fixed-point integer arithmetic, producing no floating-point error.
+Before calculation, sanitization is performed: each component is ensured to be non-negative and not to exceed its corresponding total; then cache read/write, image input, and audio input Tokens are split out of the total input and priced separately. When `input_cost_per_image_token` or an audio input price is configured, the corresponding input Tokens are split out of `normalInput` and priced individually; when these refinement prices are not configured, image/audio input Tokens are billed as regular input Tokens. When none of the cache / audio / image refinement price keys is configured, it falls back to the legacy formula `promptTokens × inputCost + completionTokens × outputCost`. All operations are fixed-point integer arithmetic, producing no floating-point error.
+
+One prerequisite of the cache split deserves emphasis: `PromptTokens` must be the total input Token count. The Anthropic protocol's `input_tokens` excludes cache read/write Tokens, and the protocol adapter layer (`ParseAnthropicUsageFields` in `bfe/bfe_model_protocol/utils/usage_parse.go`) has normalized it to `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`, aligning with the semantics of OpenAI's `prompt_tokens`. The unified extraction of usage fields also now lives in the protocol adapter layer (see [Chapter 7: Data Plane Forwarding Design: BFE](../design/chapter07-data-plane-design.md) and [Chapter 29: AI Routing Module Implementation: mod_ai_route](./chapter29-mod-ai-route.md)); this chapter focuses only on the settlement logic.
+
+`calcResponsesCost` directly reuses chat billing; `calcVideoGenerationCost` bills `VideoCount × output_cost_per_video`, where `VideoCount` is taken from `usage.video_count` in the response, falling back to `data.#`; `calcImageGenerationCost` bills `ImageCount × output_cost_per_image + ImageInputTokens × input_cost_per_image_token`.
 
 For how the Control Plane generates and delivers time-period configurations, see `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`.
 
@@ -396,9 +494,14 @@ func (m *ModuleAITokenAuth) tokenReadResponseHandler(req *bfe_basic.Request, res
     }
     tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
     if res.StatusCode == bfe_http.StatusOK && res.ContentLength >= 0 {
+        // The full response body was read: the response is complete
+        ctx.aiBasicInfo.MarkResponseCompleted()
         if bodyAccessor, err := res.GetBodyAccessor(); err == nil {
             body, _ := bodyAccessor.GetBytes()
             UpdateCtxByUsage(ctx, body)
+        }
+        if tokenUsage.UsedQuota > 0 {
+            ctx.aiBasicInfo.MarkFinalUsageSeen()
         }
         // If still no usage and estimation is allowed
         if tokenUsage.UsedQuota <= 0 && ctx.aiBasicInfo.IsAllowEstimateToken() {
@@ -411,13 +514,15 @@ func (m *ModuleAITokenAuth) tokenReadResponseHandler(req *bfe_basic.Request, res
 }
 ```
 
-`UpdateCtxByUsage` uses `gjson` to extract the `usage` field from the response body in multiple provider formats, including OpenAI, DeepSeek, Anthropic, Claude, etc., and is compatible with fields such as `prompt_cache_hit_tokens` and `prompt_tokens_details.cached_tokens`. Because the usage field naming differs significantly across providers, the module improves its parsing success rate through layered fallbacks: for example, it first tries `usage.total_tokens`, then `usage.input_tokens` / `usage.output_tokens`; the cache-hit field also supports both DeepSeek and Claude naming conventions.
+`UpdateCtxByUsage` no longer embeds a long gjson extraction chain; instead it delegates to the protocol adapter layer: based on the `AiBasicInfo.AuthStyle` identified at the request stage, it picks the corresponding adapter (`modelprotocol.Get(authStyle).ExtractUsageFields`), and `bfe_model_protocol` extracts the usage fields of each protocol — `PromptTokens`, `CompletionTokens`, cache read/write, image input, image/video counts, etc. — and writes them back into `TokenUsage`. This both accommodates usage differences across protocols such as OpenAI, DeepSeek, and Anthropic (e.g. DeepSeek's `prompt_cache_hit_tokens`, Anthropic's `message.usage` nesting), and allows usage extraction for new protocols to be extended independently within the adapter layer.
 
 When the response body truly has no `usage` field (for example, some privately deployed models do not return usage), and estimation is allowed, the module roughly estimates the output Token count as `Content-Length / 4` and combines it with the input Token count estimated from the request body to produce an approximate usage. Estimation serves only as a last resort and is not recommended for precise billing scenarios.
 
 ### Streaming Responses
 
 For streaming responses, `mod_body_process` parses SSE events segment by segment in `HandleReadResponse`, and accumulates Token usage into `AiBasicInfo.TokenUsage` via `QuotaUsageProcessor.Process`. Because a streaming response has not ended yet at the `HandleReadResponse` stage, `tokenReadResponseHandler` of `mod_ai_token_auth` usually cannot obtain the complete usage; the final deduction is performed by `tokenRequestFinishHandler` at the `HandleRequestFinish` stage, reading the already populated `TokenUsage`.
+
+While parsing each SSE event, `QuotaUsageProcessor` also maintains the billing-reliability state: it calls `MarkResponseCompleted` when a termination event is seen (Anthropic `message_stop`, OpenAI `[DONE]`), and calls `MarkFinalUsageSeen` when a final usage event arrives. In Anthropic streaming, `message_start` carries only the initial usage (`output_tokens = 0`), and `message_delta` carries the final output tokens but no prompt fields — the Processor always processes the final usage event, and in the `message_delta` scenario it retains the `PromptTokens`, `CacheReadTokens`, `CacheWriteTokens`, and other fields parsed at the `message_start` stage, updating only the completion part, avoiding cache Token loss or double counting. These two state marks are exactly the basis on which `tokenRequestFinishHandler` decides "no billing on client abort, estimates usable only on normal completion".
 
 ```mermaid
 sequenceDiagram
@@ -526,20 +631,40 @@ func (m *ModuleAITokenAuth) ValidateUserTokenByReq(req *bfe_basic.Request) (toke
 
 ```go
 func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
-    used = gjson.GetBytes(data, "usage.total_tokens").Int()
-    prompt = gjson.GetBytes(data, "usage.prompt_tokens").Int()
-    completion = gjson.GetBytes(data, "usage.completion_tokens").Int()
-    cacheRead = gjson.GetBytes(data, "usage.cache_read_tokens").Int()
-    // DeepSeek fallback
-    if cacheRead == 0 {
-        cacheRead = gjson.GetBytes(data, "usage.prompt_cache_hit_tokens").Int()
+    // Pick the protocol adapter based on the AuthStyle identified at the
+    // request stage; the adapter layer uniformly extracts usage fields
+    fields := modelprotocol.Get(ctx.aiBasicInfo.AuthStyle).ExtractUsageFields(data)
+    // fields contains UsedQuota / PromptTokens / CompletionTokens /
+    // CacheReadTokens / CacheWriteTokens / AudioInputTokens /
+    // AudioOutputTokens / ImageInputTokens / ImageCount / VideoCount
+    tokenUsage := ctx.aiBasicInfo.GetTokenUsage()
+    if fields.UsedQuota > 0 {
+        // Write all fields back to TokenUsage
+        // ...
+    } else if fields.PromptTokens > 0 || fields.CompletionTokens > 0 ||
+        fields.ImageCount > 0 || fields.VideoCount > 0 {
+        // Without total_tokens, compose UsedQuota from components:
+        // image/video generation uses the count as quota, text uses
+        // prompt + completion
+        // ...
     }
-    // Claude fallback
-    if prompt == 0 && completion == 0 {
-        prompt = gjson.GetBytes(data, "usage.input_tokens").Int()
-        completion = gjson.GetBytes(data, "usage.output_tokens").Int()
-    }
-    // Fill TokenUsage ...
+}
+```
+
+### Deduction Idempotency Mark
+
+`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`:
+
+```go
+type TokenAuthContext struct {
+    Token       *Token
+    aiBasicInfo *bfe_basic.AiBasicInfo
+    // serverConf caches SvrDataConf for RMB cost calculation at request finish time
+    serverConf bfe_basic.ServerDataConfInterface
+    // deducted marks whether deduction has already been executed for this
+    // request, preventing duplicate charges when HandleRequestFinish fires
+    // multiple times
+    deducted bool
 }
 ```
 
@@ -598,8 +723,10 @@ func UpdateCtxByUsage(ctx *TokenAuthContext, data []byte) {
 - Through three callbacks — `HandleFoundProduct`, `HandleReadResponse`, and `HandleRequestFinish` — it completes authentication, usage parsing, and quota deduction respectively.
 - The API-Key is extracted from `Authorization: Bearer <api-key>`; validation items include existence, enabled state, expiration time, model allowlist/blocklist, source subnets, and the Redis balance of each `QuotaPlan`.
 - `QuotaPlan.RedisKey` is generated and delivered by the Control Plane and used directly by BFE, avoiding counter resets caused by renames; the `total_token` and `RMB` units use different Lua scripts for deduction.
-- RMB quota computes cost based on model prices and the current time-period tier in `AIConf.ModelTable`; all operations use fixed-point integers to avoid floating-point error.
-- Token usage of streaming responses is parsed and accumulated by `mod_body_process`, while non-streaming responses are parsed directly by `mod_ai_token_auth`; deduction is unified in `HandleRequestFinish`.
+- RMB quota computes cost based on model prices and the current time-period tier in `AIConf.ModelTable`; all operations use fixed-point integers to avoid floating-point error. Chat billing splits cache read/write and image/audio input dimensions out of the total input, falling back to the legacy formula when none are configured; `responses` reuses chat billing, and `video_generation` is billed as `output_cost_per_video` × video count.
+- Billing reliability is supported by the two sets of marks on `AiBasicInfo` — `MarkResponseCompleted` / `MarkFinalUsageSeen`: no billing when the client aborts without a final usage, and estimates are usable only when the response completes normally; `TokenAuthContext.deducted` makes deduction idempotent; `/count_tokens` endpoints skip billing.
+- A `total_token` quota is allowed to be 0 (a no-balance plan whose bound requests are rejected with 429), and a missing Redis balance key is treated as no balance rather than an internal error.
+- Token usage of streaming responses is parsed and accumulated by `mod_body_process` (`message_delta` retains the prompt/cache fields from `message_start`), while non-streaming responses are parsed directly by `mod_ai_token_auth`; usage extraction is uniformly delegated to the `bfe_model_protocol` protocol adapter layer, and deduction is unified in `HandleRequestFinish`.
 
 Understanding the implementation of `mod_ai_token_auth` helps troubleshoot problems such as API-Key authentication failures, incorrect quota deduction, and inaccurate RMB billing, and lays the foundation for extending new authentication methods or billing dimensions.
 
@@ -613,6 +740,8 @@ Understanding the implementation of `mod_ai_token_auth` helps troubleshoot probl
 - `bfe/bfe_modules/mod_body_process/content_quota_usage.go`
 - `bfe/bfe_modules/mod_body_process/mod_body_process.go`
 - `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`
+- `bfe/bfe_basic/request_ai_basic.go`
+- `bfe/bfe_model_protocol/utils/usage_parse.go`
 - `bfe/bfe_modules/bfe_modules.go`
 - `bfe/docs/zh_cn/modules/mod_ai_token_auth/mod_ai_token_auth.md`
 - `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`

@@ -142,7 +142,8 @@ DELETE /open-api/v1/certificates/{cert_name}
 约束条件：
 
 - 只能删除非默认证书；
-- 删除后全局仍必须保留一个默认证书（由系统保证）。
+- 删除后全局仍必须保留一个默认证书（由系统保证）；
+- 证书被 Product 引用时禁止删除，`CertificateManager.DeleteCertificate` 会返回 409 Conflict；需先在引用它的 Product 上解除证书绑定，再执行删除。
 
 ---
 
@@ -366,7 +367,7 @@ curl -v https://api.example.com/v1/chat/completions \
 
 - 域名绑定通过 AI Gateway API 维护，最终由 InnerAPI 导出为 BFE 的 `server_data_conf` 中的 HostTable 与 RouteTable。
 - TLS 证书通过 OpenAPI `/certificates` 上传，控制面会校验证书与私钥的格式、配对关系，并自动解析过期时间。
-- 全局必须且只能有一张默认证书，用于 SNI 未匹配时的 TLS 回退；默认证书不能被直接删除。
+- 全局必须且只能有一张默认证书，用于 SNI 未匹配时的 TLS 回退；默认证书不能被直接删除；被 Product 引用的证书同样禁止删除（409 Conflict）。
 - 建议建立证书过期监控机制，在证书到期前完成续期和验证，避免 HTTPS 服务中断。
 - HTTPS 验证可使用 `curl -v` 检查证书链、SAN、Issuer 等信息；常见问题多与域名绑定、证书链完整性、默认证书缺失有关。
 - 多域名场景可通过单证书多 SAN 或多证书独立配置实现，BFE 会依据 SNI 自动选择最佳证书。

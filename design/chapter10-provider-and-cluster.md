@@ -206,7 +206,7 @@ Provider 与 Cluster 解耦后，二者各自拥有独立的生命周期，但�
 
 **Cluster 删除**
 
-删除 cluster 时，系统会先检查该集群是否被 AI 路由规则（global / entity / api-key 级别）引用；若被引用，删除失败并返回引用冲突错误。通过引用检查后，系统自动级联清理关联的子集群和实例池。
+删除 cluster 时，系统会先检查该集群是否被 AI 路由规则（global / entity / api-key 级别）引用；若被引用，删除失败并返回 `409 Conflict`。通过引用检查后，系统自动级联清理关联的子集群和实例池。
 
 **更新接口的 name 约束**
 
@@ -282,6 +282,8 @@ flowchart LR
 ### ModelProtocols
 
 `ModelProtocols` 来自 Provider 的 `model_protocols`，控制面按 cluster 的 `provider` 引用透传到 `AIConf`。BFE 据此判断请求协议风格（如 OpenAI 兼容格式或 Anthropic Messages API）。
+
+数据面在启动加载与热加载时都会校验每个 cluster 的 `AIConf.ModelProtocols`：`bfe_server/bfe_confdata_load.go` 中的 `validateClusterModelProtocols` 调用 `bfe_model_protocol.ValidateProtocols`，要求列表中的每个协议都已在 `bfe_model_protocol` 协议适配层注册表中注册（内置 `openai`、`anthropic`）；只要出现未知协议名，启动加载或热加载就会失败，并指明是哪个集群配置非法。空列表视为合法，按默认 `["openai"]` 处理。协议适配层的设计详见[第七章 数据面转发设计：BFE](./chapter07-data-plane-design.md)。
 
 ## 模型发现机制
 

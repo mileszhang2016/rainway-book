@@ -181,6 +181,8 @@ After the import is complete, immediately verify that the Key works on the Data 
 
 `unit = total_token` applies to models billed by token (such as OpenAI and Anthropic). The system directly counts the total input and output tokens and deducts them from the balance. This approach is intuitive and easy to understand, and suits scenarios where model prices are relatively fixed or tokens are procured by token.
 
+A `total_token` quota may be set to `0`, which means **no balance**: the Control Plane only requires `quota >= 0` (`QuotaValue` in `ai-gateway-api/lib/validate/validate.go`), and requests from API-Keys/Entities bound to such a plan are rejected by the Data Plane with 429 QuotaExhausted. To temporarily allow traffic, set `pass_when_no_enough_quota=true`; RMB quotas also allow 0 with the same semantics.
+
 ```json
 {
   "quota_plan": {
@@ -262,6 +264,8 @@ Example response (token quota):
 
 The balance is read directly from Redis and is real-time data; when Redis is unavailable, the query endpoint returns an error. An unlimited quota returns a sentinel balance (`used=0`, `remaining=100000000`).
 
+> Note: the Data Plane treats a **missing Redis balance key as an exhausted balance** rather than an internal error: `QuotaPlan.HasBalance` (`bfe/bfe_modules/mod_ai_token_auth/token.go`) detects a non-existent key via `IsKeyNotFound` (`bfe/bfe_util/redis_client/client.go`) and handles it as a zero balance, returning QuotaExhausted (429) instead of a 500. A key that was never synced to Redis because its quota is configured as 0 falls into this case.
+
 ### Manually Resetting the Quota
 
 When you need to restore quota ahead of time, correct the total quota, or fix a Redis anomaly, call the reset endpoint:
@@ -288,6 +292,19 @@ The balance query and reset endpoints for Entities are `/entities/{id}/quota-pla
 Every minute the system executes `ResetExpiredBalances`, which performs periodic resets for plans whose `reset_period` is `weekly` or `monthly` and whose quota is not unlimited. A periodic reset updates both Redis and `quota_plans.last_reset_at`.
 
 A manual reset only resets the Redis balance and does not update `last_reset_at`. For example, if an administrator temporarily adjusts a project's quota from 5,000 yuan to 8,000 yuan mid-month and manually resets, the periodic scheduler will still automatically reset on the 1st of next month according to the new `quota`, unaffected by this manual operation.
+
+### Manually Triggering a Periodic Reset (Inner API)
+
+Besides waiting for the once-per-minute scheduled task, the Control Plane provides an Inner API to trigger a periodic reset immediately (it executes the same entry point as the scheduled task, `QuotaResetScheduler.resetQuotas` in `ai-gateway-api/model/quota/scheduler.go`):
+
+```bash
+curl -X POST http://localhost:8183/inner-api/v1/quota/trigger-reset \
+  -H "Authorization: Token <inner_token>"
+```
+
+On success it returns `{"status":"ok"}`. The endpoint is protected by a distributed lock: the Redis lock key is `quota:reset:scheduler:lock` with a TTL of 5 minutes and automatic renewal while held, so in a multi-replica deployment only one instance actually performs the reset. It is mutually exclusive with the scheduled task and does not cause duplicate resets. A manual trigger does not affect the cadence of subsequent scheduled executions.
+
+Typical use cases include restoring quota ahead of a business peak at the start of a month, or verifying balance recovery after a Redis anomaly. Note that this is an Inner API for internal management and testing only; its authentication is the same as Conf Agent's (`Authorization: Token <token>`).
 
 ---
 
@@ -585,7 +602,7 @@ Once the above configuration takes effect, the API-Key is subject to all of the 
 
 - The API-Key is the credential used by business parties to call Rainway AI Gateway, supporting creation, query, full/partial update, deletion, and external Key import; deletion cascades the cleanup of dedicated configurations and Redis Keys.
 - `QuotaPlan` supports two units, `total_token` and `RMB`, applicable to scenarios billed by total token volume and by cost budget respectively; RMB quotas are stored internally in Redis as fixed-point integers and displayed externally with 4 decimal places.
-- The balance is read directly from Redis; both the OpenAPI detail response and the dedicated `quota-plan` endpoint return the real-time `used` / `remaining`; the manual reset endpoint can restore the balance to the current or a new quota without interfering with periodic scheduling.
+- The balance is read directly from Redis; both the OpenAPI detail response and the dedicated `quota-plan` endpoint return the real-time `used` / `remaining`; the Data Plane treats a missing Redis balance key as exhausted (429) instead of 500; the manual reset endpoint can restore the balance to the current or a new quota without interfering with periodic scheduling; and the Inner API `POST /inner-api/v1/quota/trigger-reset` immediately triggers a periodic reset protected by a distributed lock.
 - Entities support a hierarchical structure; after an API-Key is attached, it inherits the model allowlist (intersection), blocklist (union), quota plans, rate limit policies, and route rules; policies take effect in the priority order API-Key level → Entity level → Global level.
 - In practice, it is recommended to plan the Entity hierarchy first, then attach API-Keys and layer fine-grained policies on top, achieving organizational-level budget control and project-level resource isolation. When encountering anomalies, troubleshoot comprehensively by combining the API-Key status, quota balance, Entity inheritance result, and BFE logs.
 

@@ -38,7 +38,7 @@ graph LR
 创建 Cluster 前，必须先创建好对应的 Provider，并确认 `llm_config.provider` 引用存在。典型创建流程如下：
 
 1. 通过 `POST /clusters` 提交 Cluster 配置。
-2. 控制面校验 `name` 全局唯一、`provider` 存在、`models` 是 Provider 模型子集、`keys` 引用 Provider 中已定义的 Key。
+2. 控制面校验 `name` 全局唯一、长度 1-64 字符（允许单字符名，单查/删除/ready 接口对单字符名同样兼容）、`provider` 存在、`models` 是 Provider 模型子集、`keys` 引用 Provider 中已定义的 Key。
 3. 系统自动：
    - 创建实例池，名称格式为 `{product_name}.{cluster_name}`；
    - 创建子集群，名称为 `{cluster_name}`；
@@ -101,7 +101,9 @@ graph LR
 - `llm_config.keys` 按**全量替换**处理，调用方需传入完整的 Key 引用列表；
 - `sub_clusters` 与 `scheduler` 为系统内部自动生成，不支持手动修改。
 
-删除 Cluster 时，系统会先检查该 Cluster 是否被 Global、Entity 或 API-Key 级别的 AI 路由规则引用。若存在引用，删除将失败，需先解除引用或删除对应路由规则。通过引用检查后，系统会级联解绑子集群、删除子集群、删除实例池，最后删除 Cluster。
+删除 Cluster 时，系统会先检查该 Cluster 是否被 Global、Entity 或 API-Key 级别的 AI 路由规则引用。若存在引用，删除将失败并返回 `409 Conflict`（响应中会指明引用规则名），需先解除引用或删除对应路由规则。通过引用检查后，系统会级联解绑子集群、删除子集群、删除实例池，最后删除 Cluster。
+
+同样地，更新 Cluster 模型列表时，若被移除的模型仍被某条路由规则的 `targets` 或 `fallbacks` 引用，更新也会返回 `409 Conflict`；需要先调整对应的路由规则，再修改 Cluster 的模型列表。
 
 ## 配置转发策略、模型映射、Key 策略、会话亲和性
 
@@ -216,7 +218,7 @@ Global 路由表是全局兜底规则，所有 API-Key 最终都会绑定它。�
 
 Entity 和 API-Key 的路由表在创建/更新对应资源时作为内嵌对象写入。例如，在 Entity 配置中附带 `route_rules`，即可实现部门级路由策略；在 API-Key 中附带 `route_rules`，则可实现用户级精细化路由。创建时若未显式传入 `route_rules`，系统会默认生成一条 `enabled=false`、`rules=[]` 的空记录，方便后续再启用。
 
-`GET /route-tables` 用于分页查看所有路由表元信息，返回字段仅包含 `id`、`type`、`owner`、`enabled`，不包含规则详情。若需要查看或修改规则内容，需要访问对应层级的管理接口，例如 Global 路由表使用 `GET /global-route-rules` 与 `PUT /global-route-rules`。
+`GET /route-tables` 用于分页查看所有路由表元信息，返回字段仅包含 `id`、`type`、`owner`、`enabled`，不包含规则详情。其中 API-Key 级路由表的 `type` 对外取值为 `api_key`（内部存储与 BFE 导出配置仍使用 `apikey`，控制面自动做双向映射），`type` 查询参数也接受 `api_key`。若需要查看或修改规则内容，需要访问对应层级的管理接口，例如 Global 路由表使用 `GET /global-route-rules` 与 `PUT /global-route-rules`。
 
 ## 路由规则优先级与 Fallback
 

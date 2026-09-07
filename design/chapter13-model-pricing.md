@@ -99,7 +99,9 @@
 | `cache_creation_input_token_cost` | 缓存创建输入 Token 成本 |
 | `input_cost_per_token_above_200k_tokens` | 超过 200k Token 的输入成本 |
 | `output_cost_per_token_above_200k_tokens` | 超过 200k Token 的输出成本 |
-| `output_cost_per_image` | 每张输出图像成本 |
+| `output_cost_per_image` | 每张输出图像成本（image_generation 模式） |
+| `input_cost_per_image_token` | 每图片输入 Token 成本（chat 与 image_generation 模式均可用） |
+| `output_cost_per_video` | 每个生成视频成本（video_generation 模式） |
 | `output_cost_per_pixel` | 每像素输出成本 |
 | `input_cost_per_audio_per_second` | 每秒音频输入成本 |
 | `input_cost_per_video_per_second` | 每秒视频输入成本 |
@@ -107,7 +109,7 @@
 | `ocr_cost_per_page` | 每页 OCR 成本 |
 | `output_cost_per_character` | 每字符输出成本 |
 
-当前版本主要使用按 Token 计费的价格项，其余字段为后续多模态计费预留。
+当前版本已启用按 Token 计费、缓存计费、图片计费与视频计费相关的价格项，其余字段为后续多模态计费预留。`input_cost_per_image_token` 与 `output_cost_per_video` 两个价格键支持配置在全局 `prices` 与 `tier_prices.<tier>` 两级，缺省值为 0（即该维度不计费），负值在配置加载时直接报错。
 
 ### 价格精度
 
@@ -279,7 +281,7 @@ AIConf.ModelTable
 └──────────────┘
 ```
 
-BFE 使用定点整数存储价格，避免运行时浮点运算引入误差。所有价格字段按统一精度放大后参与扣减计算。
+BFE 使用定点整数存储价格，避免运行时浮点运算引入误差。所有价格字段按统一精度（1 个整数单位 = 1e-8 元，见 `quota.RmbToFixedPoint`）放大后参与扣减计算。加载阶段对每个模型的 `prices` 与每个 tier 的 `tier_prices.<tier>` 执行校验：所有价格键（含 `input_cost_per_image_token`、`output_cost_per_video` 等）缺省视为 0，出现负值则整个配置文件加载失败并报出具体模型名与价格键，避免错误价格进入运行时。
 
 ### 运行时时段匹配
 
@@ -320,28 +322,80 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 请求结束
    │
    ▼
-解析 TokenUsage
-   ├── prompt_tokens
-   ├── completion_tokens
-   └── cached_tokens
+解析 TokenUsage（协议适配层 bfe_model_protocol 统一提取）
+   ├── PromptTokens（总输入，含缓存读写与图片/音频输入）
+   ├── CompletionTokens
+   ├── CacheReadTokens / CacheWriteTokens
+   ├── AudioInputTokens / AudioOutputTokens
+   ├── ImageInputTokens / ImageCount
+   └── VideoCount
    │
    ▼
 匹配 ActiveTierName
    │
-   ├── 命中 tier ──► 取 tier_prices.<tier> 价格
+   ├── 命中 tier ──► 取 tier_prices.<tier> 价格，缺键回退默认 prices
    └── 未命中 tier ──► 取 prices 默认价格
    │
    ▼
-分别计算
-   ├── 缓存命中输入 = cached_tokens × cache_read_input_token_cost
-   ├── 普通输入     = (prompt_tokens - cached_tokens) × input_cost_per_token
-   └── 输出         = completion_tokens × output_cost_per_token
+按请求模式分别计算（calcChatCost 等，均为定点整数运算）
    │
    ▼
 累加为本次请求总成本，用于 RMB 配额扣减与日志输出
 ```
 
-若某个 tier 未配置特定价格键，则自动 fallback 到默认 `prices` 中的对应键。`TokenUsage` 增加 `CachedTokens` 字段后，缓存命中与未命中的输入 Token 可分别计价。
+#### chat 计费公式
+
+`calcChatCost`（`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`）以总输入 Token 为起点做维度拆分：
+
+```
+normalInput = PromptTokens                          // 未配置缓存价格时
+            = max(PromptTokens - CacheRead - CacheWrite, 0)   // 配置了缓存价格时
+
+配置了 input_cost_per_image_token 时：
+    imageInputTokens = min(ImageInputTokens, normalInput)
+    normalInput -= imageInputTokens
+
+配置了 audio 输入价格时：
+    audioInputTokens = min(AudioInputTokens, normalInput)
+    normalInput -= audioInputTokens
+
+配置了 audio 输出价格时：
+    normalOutput = CompletionTokens - AudioOutputTokens
+    （audioOutputTokens 上限截断为 CompletionTokens）
+
+成本 = normalInput  × input_cost_per_token
+     + CacheRead    × cache_read_input_token_cost
+     + CacheWrite   × cache_creation_input_token_cost
+     + imageInput   × input_cost_per_image_token
+     + audioInput   × input_cost_per_audio_token
+     + normalOutput × output_cost_per_token
+     + audioOutput  × output_cost_per_audio_token
+```
+
+当 cache / audio / image 的任何细化价格键都未配置时，回退 legacy 公式 `PromptTokens × input_cost_per_token + CompletionTokens × output_cost_per_token`，保证旧配置行为不变。
+
+#### Anthropic 用量语义归一化
+
+Anthropic 协议的 `input_tokens` 只统计未命中缓存的新鲜 Token，不含 `cache_read_input_tokens` 与 `cache_creation_input_tokens`，与 OpenAI 的 `prompt_tokens`（总输入）语义不同。归一化在解析层（`bfe/bfe_model_protocol/utils/usage_parse.go` 的 `ParseAnthropicUsageFields`）完成：
+
+```
+PromptTokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+```
+
+使下游的"总输入减缓存"拆分逻辑对 OpenAI 与 Anthropic 完全一致。流式响应中，`message_start` 事件的 usage 嵌套在 `message.usage` 下，解析层同时兼容该形态；`message_delta` 事件只携带最终 output tokens，计费模块保留 `message_start` 阶段已解析的 prompt/cache 字段，避免缓存 Token 丢失或重复计价。缓存创建 Token 只按 `cache_creation_input_token_cost` 计价一次，避免高缓存命中场景下 fresh tokens 被截断为 0 而完全不计费。
+
+#### 其他请求模式
+
+另外两个请求模式的计费逻辑如下：
+
+| 模式 | 路径前缀 | 计费公式 |
+|------|----------|----------|
+| `responses` | `/v1/responses` | 复用 chat 计费（`calcResponsesCost` 直接委托 `calcChatCost`） |
+| `video_generation` | `/v1/video/generations` | `VideoCount × output_cost_per_video` |
+
+`VideoCount` 优先取响应 `usage.video_count`，回退响应 `data.#`（生成结果条数）；认证阶段还会预读请求体 `n` 字段作为兜底（`n ≤ 0` 时取 1），防止响应未返回用量时少收。图片生成模式（`image_generation`）的费用为 `ImageCount × output_cost_per_image + ImageInputTokens × input_cost_per_image_token`，其中 `ImageInputTokens` 来源为 `usage.input_token_details.image_tokens`，回退 `usage.image_input_tokens`。
+
+若某个 tier 未配置特定价格键，则自动 fallback 到默认 `prices` 中的对应键。`TokenUsage` 中的 `CacheReadTokens`、`ImageInputTokens`、`VideoCount` 等字段使缓存命中、图片输入与视频生成可以分别计价。
 
 ### 向后兼容
 
@@ -350,6 +404,8 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 - `/providers` 不填 `time_zone` / `tiers` 时，`ModelTable.TimeZone` / `ModelTable.Tiers` 为空，行为与固定价格完全一致；
 - `/model-prices` 不填 `tier_prices` 时，始终按默认 `Prices` 计费；
 - 命中 tier 但该 tier 未配置某个价格键时，自动 fallback 到默认 `Prices`；
+- chat 计费中未配置任何 cache / audio / image 细化价格键时，回退 legacy 公式，存量固定价格配置无需修改；
+- 未配置 `input_cost_per_image_token` / audio 价格时，图片/音频输入 Token 按普通输入 Token 计价，语义与旧版本一致；
 - `TokenUsage.UsedCost`、Lua 扣减逻辑、Redis 定点数存储都不需要修改。
 
 这种兼容方式使得现有部署可以平滑启用分时段能力，无需一次性全量调整配置。
@@ -491,7 +547,9 @@ models:
 - `ModelPrice` 以 `(provider, model, mode)` 为主键，包含能力、限制、默认价格和分时段价格等字段。
 - `model-list.yaml` 提供批量导入能力，支持 `replace` 与 `merge` 两种模式，是当前版本维护模型价格的主要数据源格式。
 - RMB 配额分时段定价通过 Provider 时段模板与 Model tier 价格配合实现，BFE 按请求发生时刻匹配 `peak` 等 tier，未命中时 fallback 到默认价格。
-- BFE 数据面在加载阶段将价格转为定点整数，运行时根据 Token 用量和活跃 tier 完成纯整数成本计算，避免浮点误差。
+- BFE 数据面在加载阶段将价格转为定点整数（精度 1e-8 元，负值加载报错），运行时根据 Token 用量和活跃 tier 完成纯整数成本计算，避免浮点误差。
+- chat 计费以总输入 Token 为起点拆分缓存读写、图片输入、音频输入等维度；所有细化价格键均未配置时回退 legacy 公式。
+- Anthropic 用量在协议适配层归一化为总输入语义（`input_tokens + cache_read + cache_creation`），与 OpenAI 的 `prompt_tokens` 对齐；支持 `responses`（复用 chat 计费）与 `video_generation`（按 `output_cost_per_video` × 视频数）两种计费模式。
 - Provider 与 Cluster 概念分离后，`model-prices.provider` 仅作为价格归集标识，与 `/providers` 为弱引用关系，配置更灵活；`AIConf.ModelTable` 由控制面在导出时按 provider 拼接生成。
 
 ---
@@ -501,3 +559,6 @@ models:
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/model-prices.md`
 - `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`
 - `ai-gateway-api/design-docs/sys-design/details/provider与cluster概念分离.md`
+- `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`
+- `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`
+- `bfe/bfe_model_protocol/utils/usage_parse.go`

@@ -342,6 +342,16 @@ docker run -d \
 
 If MySQL is not in the container network, make sure the container can reach the database address, or use a Docker network / host network mode. For production, it is recommended to use a custom Docker network and place AI Gateway API together with MySQL and Redis in the same network namespace for service discovery and access control.
 
+### Container Timezone Data (tzdata) Notes
+
+The BFE Dockerfile runs `apk add tzdata` in both the conf-agent and log-reader build stages and in the final alpine runtime image. The alpine base image itself does not contain `/usr/share/zoneinfo`; without timezone data inside the image, features that depend on the local timezone are affected, such as log timestamps, quota period calculation (`reset_period` weekly/monthly), and time-of-day pricing tier matching.
+
+If you build a custom image or extend an image that does not include this setup, make sure `tzdata` is installed inside the image, or mount the host timezone file at runtime:
+
+```bash
+docker run -d -v /etc/localtime:/etc/localtime:ro ...
+```
+
 ## Kubernetes Deployment Example
 
 The following example shows how to deploy AI Gateway API in Kubernetes. The example assumes MySQL and Redis are already available externally or in the same cluster.
@@ -694,6 +704,7 @@ This chapter systematically covered the installation and deployment of the Rainw
 - The minimal runnable configuration requires adjusting the database connection and the Redis logical name; the real Redis address is resolved via `name_conf.data`.
 - Container images can be built with `make docker`, and cluster deployment uses Kubernetes Deployments, Services, and DaemonSets.
 - The multi-component startup order is: database initialization → AI Gateway API → BFE → Conf Agent, ensuring the Data Plane promptly receives the latest configuration distributed by the Control Plane.
+- The BFE image ships with tzdata built in; when using a custom image, ensure the container has complete timezone data.
 - Common deployment issues mainly involve database connections, static asset mounting, Conf Agent communication, TLS configuration association checks, port conflicts, and Redis connection failures.
 - Before going live, complete the production deployment checklist, focusing on password security, permission configuration, and the rollback plan.
 

@@ -169,6 +169,8 @@ type TokenUsage struct {
     AudioInputTokens  int64 // 音频输入 Token
     AudioOutputTokens int64 // 音频输出 Token
     ImageCount        int64 // 图片生成数量
+    ImageInputTokens  int64 // 图片输入 Token（已含在 PromptTokens 内）
+    VideoCount        int64 // 视频生成数量
     UsedQuota         int64 // 已用 Token 配额
     UsedCost          int64 // 已用 RMB 成本，1 unit = 1e-8 元
 }
@@ -176,39 +178,41 @@ type TokenUsage struct {
 
 `QuotaUsageProcessor`（`bfe/bfe_modules/mod_body_process/content_quota_usage.go:23`）是默认注入的响应事件处理器。它对每个事件调用 `Event.GetQuotaUsage()`，并把结果写入 `aiBasicInfo.GetTokenUsage()`。
 
-`SSEEvent.GetQuotaUsage()` 与 `RawEvent.GetQuotaUsage()` 的实现逻辑一致（`llm_util.go:123`、`body_process.go:422`），都使用 `gjson` 从 JSON 中读取以下字段：
-
-- OpenAI 风格：`usage.total_tokens`、`usage.prompt_tokens`、`usage.completion_tokens`。
-- DeepSeek 缓存扩展：`usage.cache_read_tokens`、`usage.prompt_cache_hit_tokens`、`usage.prompt_tokens_details.cached_tokens`。
-- Anthropic 风格：`usage.input_tokens`、`usage.output_tokens`、`usage.cache_read_input_tokens`、`usage.cache_creation_input_tokens`。
-- 图片生成：`usage.image_count`、`data.#`。
+`SSEEvent.GetQuotaUsage()` 与 `RawEvent.GetQuotaUsage()` 的实现逻辑一致（`llm_util.go:158`、`body_process.go:421`），两者都委托给 `extractUsageFields()`，字段提取规则收敛在 `bfe_model_protocol` 协议适配层（见[第七章 数据面转发设计：BFE](../design/chapter07-data-plane-design.md)）：`extractUsageFields` 先调用 OpenAI 适配链（内含 DeepSeek/Groq/Responses 回退），当 prompt/completion 均为 0 时再组合 Anthropic 适配链的对应字段：
 
 ```go
 // bfe/bfe_modules/mod_body_process/llm_util.go
-used := gjson.GetBytes(data, "usage.total_tokens").Int()
-prompt := gjson.GetBytes(data, "usage.prompt_tokens").Int()
-completion := gjson.GetBytes(data, "usage.completion_tokens").Int()
-
-// DeepSeek fallback
-if cacheRead == 0 {
-    cacheRead = gjson.GetBytes(data, "usage.prompt_cache_hit_tokens").Int()
-}
-
-// Claude fallback
-if prompt == 0 && completion == 0 {
-    prompt = gjson.GetBytes(data, "usage.input_tokens").Int()
-    completion = gjson.GetBytes(data, "usage.output_tokens").Int()
+func extractUsageFields(data []byte) modelprotocol.UsageFields {
+    fields := modelprotocol.Get(modelprotocol.ProtocolOpenAI).ExtractUsageFields(data)
+    if fields.PromptTokens == 0 && fields.CompletionTokens == 0 {
+        claude := modelprotocol.Get(modelprotocol.ProtocolAnthropic).ExtractUsageFields(data)
+        fields.PromptTokens = claude.PromptTokens
+        fields.CompletionTokens = claude.CompletionTokens
+        if fields.CacheReadTokens == 0 {
+            fields.CacheReadTokens = claude.CacheReadTokens
+        }
+        if fields.CacheWriteTokens == 0 {
+            fields.CacheWriteTokens = claude.CacheWriteTokens
+        }
+        if fields.UsedQuota == 0 {
+            fields.UsedQuota = claude.UsedQuota
+        }
+    }
+    return fields
 }
 ```
 
-如果响应中始终没有 `usage` 字段，`IsGuess` 保持为 `true`，`CurrentTokens` 按 `EstimateContentToken` 估算，即内容长度除以 4（`llm_util.go:319`）。在 `QuotaUsageProcessor.Process` 中，当 `UsedQuota <= 0` 且允许估算时，会把估算值累加到 `CompletionTokens`。
+各协议链读取的具体字段（OpenAI 风格 `prompt_tokens`/`completion_tokens`/`total_tokens`、DeepSeek 缓存扩展、Anthropic 风格 `input_tokens`/`output_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens`、图片 `image_count`、视频 `video_count`、图片输入 `input_token_details.image_tokens`）由对应适配器维护，扩展新协议时无需修改本模块。
 
-提取逻辑采用“优先级 + fallback”策略，以兼容不同厂商的字段命名差异：
+提取结果中 `UsedQuota > 0`、`ImageCount > 0` 或 `VideoCount > 0` 任一成立时 `IsGuess` 为 `false`；否则 `CurrentTokens` 按 `EstimateContentToken` 估算，即内容长度除以 4（实现位于 `bfe/bfe_model_protocol/utils/usage_parse.go:128`，`llm_util.go:345` 仅做转发）。在 `QuotaUsageProcessor.Process` 中，当 `UsedQuota <= 0` 且允许估算时，会把估算值累加到 `CompletionTokens`。
+
+组合后的提取逻辑形成“优先级 + fallback”策略，以兼容不同厂商的字段命名差异：
 
 1. 优先读取 OpenAI 风格字段：`prompt_tokens`、`completion_tokens`、`total_tokens`。
 2. 若 `prompt_tokens` 与 `completion_tokens` 均为 0，则回退到 Anthropic 风格：`input_tokens`、`output_tokens`。
 3. 缓存命中字段同样存在多层 fallback：先读 `cache_read_tokens`，再读 DeepSeek 的 `prompt_cache_hit_tokens` 或 `prompt_tokens_details.cached_tokens`，最后读 Anthropic 的 `cache_read_input_tokens`。
-4. 图片生成场景下，优先使用 `usage.image_count`，不存在时回退到 `data.#`（即 `data` 数组长度）。
+4. 图片生成场景下，优先使用 `usage.image_count`；视频生成场景下，优先使用 `usage.video_count`，两者均回退到 `data.#`（即 `data` 数组长度）。
+5. 图片输入 Token 优先取 `usage.input_token_details.image_tokens`，回退 `usage.image_input_tokens`。
 
 这种分层 fallback 使得网关无需为每个模型单独配置字段映射，只要模型遵循主流约定即可自动识别。
 
@@ -222,6 +226,8 @@ if prompt == 0 && completion == 0 {
 | `completion_tokens` | `usage.completion_tokens` | OpenAI 风格输出 Token。 |
 | `total_tokens` | `usage.total_tokens` | 当存在时直接作为 `UsedQuota`。 |
 | `cache_read_tokens` | 多源 fallback | 命中缓存的输入 Token，用于 RMB 分价计费。 |
+| `image_count` / `video_count` | `usage.image_count` / `usage.video_count`（回退 `data.#`） | 图片/视频生成数量，用于按个计费。 |
+| `image_input_tokens` | `usage.input_token_details.image_tokens`（回退 `usage.image_input_tokens`） | 图片输入 Token，配置 `input_cost_per_image_token` 时单独计价。 |
 
 ## 与 mod_ai_token_auth 的协作
 
