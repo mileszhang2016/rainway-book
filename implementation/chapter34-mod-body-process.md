@@ -347,7 +347,7 @@ RMB 配额扣减发生在 `HandleRequestFinish`，此时 `mod_body_process` 已�
 - 若请求发生在高峰时段，`ActiveTierName` 返回 `"peak"`，`calcChatCost` 使用 `peak` 价格计算，成本约为 `(800 × 0.0000030 + 200 × cache_read_cost + 500 × output_cost)` 元。
 - 若请求发生在非高峰时段，未命中 tier，回退到默认 `Prices`，成本按默认价格计算。
 
-所有价格在被加载到 `ModelTable` 时已经通过 `PriceMap` 自定义 `MarshalJSON` 转换为定点整数（`1 unit = 1e-8` 元），因此运行时乘法与累加都是整数运算，既保证精度又提升性能。
+价格以 float64 原值加载到 `ModelTable`（仅做非负校验，允许科学计数法表示）；每个计费项经 `quota.CalcCostUnits(用量, 价格)` 换算为定点整数（`1 unit = 1e-8` 元）后以 int64 累加，浮点只参与单项乘法，既保证精度又避免浮点累加误差。
 
 ## 关键代码片段
 
@@ -461,7 +461,7 @@ mod_ai_rate_limit.NewModuleAiRateLimit(),
 - 它通过 `BodyProcessor` 将解码、处理、编码抽象为事件流，支持 SSE、JSON/NDJSON、行模式等多种输入。
 - `QuotaUsageProcessor` 默认注入响应处理链，负责从 SSE 事件或非流式 JSON 中提取 `input_tokens`、`output_tokens`、`total_tokens` 等用量信息，并写入 `TokenUsage` 上下文。
 - RMB 配额扣减仍由 `mod_ai_token_auth` 在请求结束时完成；`mod_body_process` 只提供准确的 Token 用量数据，两者通过请求上下文解耦。
-- 分时段定价的 tier 匹配在 BFE 侧通过 `ModelTable.ActiveTierName` 完成，成本计算使用定点整数避免浮点误差。
+- 分时段定价的 tier 匹配在 BFE 侧通过 `ModelTable.ActiveTierName` 完成，成本逐项 `quota.CalcCostUnits` 换算为定点整数后累加，避免浮点误差。
 
 理解 `mod_body_process` 的实现，有助于在扩展新的模型协议、新的内容审核策略或新的计费维度时，保持数据面代码的清晰与可维护性。后续若需支持新的响应格式（如 protobuf 流、multipart），可在 `body_process.go` 中新增 `EventDecoder` 实现并接入 `ContentTypeDecoder` 的分发逻辑；若需新增体处理策略（如 PII 脱敏、关键词替换），则只需实现 `EventProcessor` 并在规则配置中注册即可。
 

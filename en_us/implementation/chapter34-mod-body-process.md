@@ -347,7 +347,7 @@ Here is a concrete example: for a certain DeepSeek model, the off-peak `input_co
 - If the request occurs during peak hours, `ActiveTierName` returns `"peak"`, `calcChatCost` uses the `peak` prices, and the cost is approximately `(800 × 0.0000030 + 200 × cache_read_cost + 500 × output_cost)` yuan.
 - If the request occurs during off-peak hours, no tier matches and it falls back to the default `Prices`, with the cost computed at default prices.
 
-All prices are already converted to fixed-point integers (`1 unit = 1e-8` yuan) by `PriceMap`'s custom `MarshalJSON` when loaded into `ModelTable`, so multiplications and accumulations at runtime are all integer operations, ensuring both precision and performance.
+Prices are loaded into `ModelTable` as `float64` values (only non-negative validation is performed; scientific notation is accepted); each billing line item is converted via `quota.CalcCostUnits(usage, price)` into a fixed-point integer (`1 unit = 1e-8` yuan) and accumulated in int64, with floating point participating only in the single multiplication per line item — ensuring both precision and performance.
 
 ## Key Code Snippets
 
@@ -461,7 +461,7 @@ mod_ai_rate_limit.NewModuleAiRateLimit(),
 - Through `BodyProcessor`, it abstracts decoding, processing, and encoding as an event stream, supporting multiple inputs such as SSE, JSON/NDJSON, and line mode.
 - `QuotaUsageProcessor` is injected into the response processing chain by default, responsible for extracting usage information such as `input_tokens`, `output_tokens`, and `total_tokens` from SSE events or non-streaming JSON, and writing it into the `TokenUsage` context.
 - RMB quota deduction is still completed by `mod_ai_token_auth` at the end of the request; `mod_body_process` only provides accurate token usage data, and the two are decoupled through the request context.
-- Tier matching for time-based pricing is done on the BFE side via `ModelTable.ActiveTierName`, and cost calculation uses fixed-point integers to avoid floating-point errors.
+- Tier matching for time-based pricing is done on the BFE side via `ModelTable.ActiveTierName`, and costs are converted per line item via `quota.CalcCostUnits` into fixed-point integers before accumulation, avoiding floating-point errors.
 
 Understanding the implementation of `mod_body_process` helps keep Data Plane code clear and maintainable when extending new model protocols, new content moderation policies, or new billing dimensions. Later, if support for a new response format (e.g., protobuf streams, multipart) is needed, a new `EventDecoder` implementation can be added in `body_process.go` and wired into the dispatch logic of `ContentTypeDecoder`; if a new body-processing policy (e.g., PII masking, keyword replacement) is needed, one only needs to implement an `EventProcessor` and register it in the rule configuration.
 

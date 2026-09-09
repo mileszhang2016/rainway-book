@@ -113,7 +113,7 @@
 
 ### 价格精度
 
-`prices` 与 `tier_prices` 中的价格字段为浮点数，业务上支持 8 位及更多小数精度，例如 `0.0000015`、`0.00000075`。为避免默认 JSON encoder 将极小数值输出为科学计数法（如 `1.5e-6`），AI Gateway API 与 BFE 两侧对 `PriceMap` / `TierPriceMap` 均实现了自定义 `MarshalJSON`，强制使用十进制表示法。该表示方式仅影响配置文本的可读性，不改变 `float64` 数值语义，也不影响 BFE 内部的定点整数扣减逻辑。
+`prices` 与 `tier_prices` 中的价格字段为 `float64` 浮点数（有效数字约 15 位），业务上支持远超 8 位的小数精度，例如 `0.0000015`、`7.6234102728e-08`（10~12 位小数的目录价格可无损表示）。输入侧（OpenAPI 请求体、`model-list.yaml` 导入）十进制表示法与科学计数法均可，两者等价；输出侧由标准编码器序列化，极小数值以科学计数法呈现（如 `1.5e-6`），两者均为合法 JSON number，数值语义不变。校验规则为：价格非负，且 `|price × 1e8| < 2^53`（约 9e15），保证下游 BFE 浮点计费不溢出。
 
 ---
 
@@ -277,11 +277,11 @@ AIConf.ModelTable
        │
        ▼
 ┌──────────────┐
-│ 价格转定点整数 │───  prices / tier_prices 均转为整数单位
+│ 价格校验         │─── 非负校验；价格保持 float64，不做定点转换
 └──────────────┘
 ```
 
-BFE 使用定点整数存储价格，避免运行时浮点运算引入误差。所有价格字段按统一精度（1 个整数单位 = 1e-8 元，见 `quota.RmbToFixedPoint`）放大后参与扣减计算。加载阶段对每个模型的 `prices` 与每个 tier 的 `tier_prices.<tier>` 执行校验：所有价格键（含 `input_cost_per_image_token`、`output_cost_per_video` 等）缺省视为 0，出现负值则整个配置文件加载失败并报出具体模型名与价格键，避免错误价格进入运行时。
+BFE 加载后价格保持 `float64`（元/token），不做定点预转换。对每个模型的 `prices` 与每个 tier 的 `tier_prices.<tier>` 执行校验：所有价格键（含 `input_cost_per_image_token`、`output_cost_per_video` 等）缺省视为 0，出现负值则整个配置文件加载失败并报出具体模型名与价格键，避免错误价格进入运行时。请求计费时逐项调用 `quota.CalcCostUnits(用量, 价格)`（即 `round(用量 × 价格 × 1e8)`）换算为 1e-8 元定点整数后累加，浮点只参与单项乘法，避免浮点累加误差。
 
 ### 运行时时段匹配
 
@@ -337,7 +337,7 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
    └── 未命中 tier ──► 取 prices 默认价格
    │
    ▼
-按请求模式分别计算（calcChatCost 等，均为定点整数运算）
+按请求模式分别计算（calcChatCost 等，逐项 round(用量 × 价格 × 1e8) 后整数累加）
    │
    ▼
 累加为本次请求总成本，用于 RMB 配额扣减与日志输出
@@ -547,7 +547,7 @@ models:
 - `ModelPrice` 以 `(provider, model, mode)` 为主键，包含能力、限制、默认价格和分时段价格等字段。
 - `model-list.yaml` 提供批量导入能力，支持 `replace` 与 `merge` 两种模式，是当前版本维护模型价格的主要数据源格式。
 - RMB 配额分时段定价通过 Provider 时段模板与 Model tier 价格配合实现，BFE 按请求发生时刻匹配 `peak` 等 tier，未命中时 fallback 到默认价格。
-- BFE 数据面在加载阶段将价格转为定点整数（精度 1e-8 元，负值加载报错），运行时根据 Token 用量和活跃 tier 完成纯整数成本计算，避免浮点误差。
+- BFE 数据面加载后价格保持 `float64`（负值加载报错），运行时根据 Token 用量和活跃 tier 逐项 `quota.CalcCostUnits` 换算为 1e-8 元定点整数再累加，Redis 扣减与存量配置的金额语义保持不变。
 - chat 计费以总输入 Token 为起点拆分缓存读写、图片输入、音频输入等维度；所有细化价格键均未配置时回退 legacy 公式。
 - Anthropic 用量在协议适配层归一化为总输入语义（`input_tokens + cache_read + cache_creation`），与 OpenAI 的 `prompt_tokens` 对齐；支持 `responses`（复用 chat 计费）与 `video_generation`（按 `output_cost_per_video` × 视频数）两种计费模式。
 - Provider 与 Cluster 概念分离后，`model-prices.provider` 仅作为价格归集标识，与 `/providers` 为弱引用关系，配置更灵活；`AIConf.ModelTable` 由控制面在导出时按 provider 拼接生成。

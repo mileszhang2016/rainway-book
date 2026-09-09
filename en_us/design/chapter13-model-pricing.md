@@ -113,7 +113,7 @@ The current version has enabled Token-based, cache, image, and video billing pri
 
 ### Price Precision
 
-Price fields in `prices` and `tier_prices` are floating-point numbers; 8 or more decimal digits are supported, e.g. `0.0000015`, `0.00000075`. To prevent the default JSON encoder from outputting very small values in scientific notation (e.g. `1.5e-6`), both AI Gateway API and BFE implement a custom `MarshalJSON` for `PriceMap` / `TierPriceMap`, forcing decimal representation. This representation only affects the readability of the configuration text; it does not change the `float64` value semantics nor affect BFE's internal fixed-point integer deduction logic.
+Price fields in `prices` and `tier_prices` are `float64` floating-point numbers (about 15 significant digits), which in practice support far more than 8 decimal digits of precision, e.g. `0.0000015`, `7.6234102728e-08` (catalog prices with 10–12 decimal digits are represented losslessly). Both the input side (OpenAPI request bodies, `model-list.yaml` import) accept either decimal notation or scientific notation, which are equivalent; the output side is serialized by the standard encoder, where very small values appear in scientific notation (e.g. `1.5e-6`). Both forms are valid JSON numbers with unchanged numeric semantics. The validation rules are: the price must be non-negative, and `|price × 1e8| < 2^53` (about 9e15), ensuring that downstream BFE floating-point billing does not overflow.
 
 ---
 
@@ -277,12 +277,11 @@ AIConf.ModelTable
        │
        ▼
 ┌──────────────┐
-│ Convert prices │───  prices / tier_prices converted to integer units
-│ to fixed point │
+│ Validate prices │───  non-negative validation; prices stay float64, no fixed-point conversion
 └──────────────┘
 ```
 
-BFE stores prices as fixed-point integers to avoid errors introduced by floating-point arithmetic at runtime. All price fields are scaled by a unified precision (1 integer unit = 1e-8 RMB, see `quota.RmbToFixedPoint`) before participating in deduction calculations. At load time, validation is performed on each model's `prices` and each tier's `tier_prices.<tier>`: all price keys (including `input_cost_per_image_token`, `output_cost_per_video`, etc.) default to 0 when absent, and a negative value fails the entire configuration load with the specific model name and price key reported, preventing erroneous prices from entering runtime.
+After loading, BFE keeps prices as `float64` (RMB per token) and performs no fixed-point pre-conversion. Validation is performed on each model's `prices` and each tier's `tier_prices.<tier>`: all price keys (including `input_cost_per_image_token`, `output_cost_per_video`, etc.) default to 0 when absent, and a negative value fails the entire configuration load with the specific model name and price key reported, preventing erroneous prices from entering runtime. At billing time, each line item is converted via `quota.CalcCostUnits(usage, price)` (i.e. `round(usage × price × 1e8)`) into a 1e-8-RMB fixed-point integer and accumulated in int64; floating point participates only in the single multiplication per line item, avoiding floating-point accumulation errors.
 
 ### Runtime Tier Matching
 
@@ -338,7 +337,7 @@ Match ActiveTierName
    └── No tier match ──► take prices default prices
    │
    ▼
-Calculate per request mode (calcChatCost, etc., all in fixed-point integer arithmetic)
+Calculate per request mode (calcChatCost, etc., each line item rounded via usage × price × 1e8, then accumulated as integers)
    │
    ▼
 Accumulate into total request cost, used for RMB quota deduction and log output
@@ -548,7 +547,7 @@ After the above configuration is exported to BFE, calls to `deepseek-v3` between
 - `ModelPrice` uses `(provider, model, mode)` as its primary key and includes fields such as capabilities, limits, default prices, and tiered prices.
 - `model-list.yaml` provides bulk import capability, supports `replace` and `merge` modes, and is the main data source format for maintaining model prices in the current version.
 - RMB quota tiered pricing is implemented by combining the Provider time template with Model tier prices; BFE matches tiers such as `peak` based on when the request occurs and falls back to default prices when no tier matches.
-- The BFE Data Plane converts prices to fixed-point integers at load time (precision 1e-8 RMB; negative values fail loading) and performs pure-integer cost calculation at runtime based on Token usage and the active tier, avoiding floating-point errors.
+- The BFE Data Plane keeps prices as `float64` after loading (negative values fail loading); at runtime, based on Token usage and the active tier, each line item is converted via `quota.CalcCostUnits` into a 1e-8-RMB fixed-point integer and accumulated, while Redis deduction and the monetary semantics of existing configurations remain unchanged.
 - Chat billing starts from the total input Tokens and splits out cache read/write, image input, audio input, and other dimensions; when no refinement price keys are configured, it falls back to the legacy formula.
 - Anthropic usage is normalized at the protocol adapter layer to total-input semantics (`input_tokens + cache_read + cache_creation`), aligning with OpenAI's `prompt_tokens`; two billing modes are supported: `responses` (reusing chat billing) and `video_generation` (billed as `output_cost_per_video` × video count).
 - After the Provider and Cluster concepts were separated, `model-prices.provider` serves only as a price grouping identifier and has a weak reference relationship with `/providers`, making configuration more flexible; `AIConf.ModelTable` is assembled by the Control Plane by provider at export time.

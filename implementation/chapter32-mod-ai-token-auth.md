@@ -405,7 +405,7 @@ type ModelPrice struct {
 }
 ```
 
-配置加载时，所有浮点价格通过 `quota.RmbToFixedPoint` 转换为定点整数，存储在 `pricesInt` 与 `tierPricesInt` 中，避免运行时浮点运算。
+配置加载时价格保持 `float64` 原值（仅做非负校验），取值经 `ModelPrice.GetPrice(tier, key)`：tier 命中时取 `tier_prices.<tier>` 的价格，缺键或未命中 tier 回退默认 `prices`，未配置的键返回 0（该分项按 0 成本处理）。
 
 ### 时段匹配
 
@@ -468,7 +468,7 @@ default:
 - 图片输入 Token（`input_cost_per_image_token`）
 - 音频输入 / 输出 Token（`input_cost_per_audio_token`、`output_cost_per_audio_token`）
 
-计算时会先做卫生处理：确保各分项非负且不超过对应总量，再从总输入中依次拆出缓存读写、图片输入、音频输入 Token 分别计价。配置了 `input_cost_per_image_token` 或音频输入价格时，对应的输入 Token 从 `normalInput` 中拆出单独计价；未配置这些细化价格时，图片/音频输入 Token 按普通输入 Token 计价。所有 cache / audio / image 细化价格键均未配置时，回退 legacy 公式 `promptTokens × inputCost + completionTokens × outputCost`。所有运算均为定点整数运算，不会产生浮点误差。
+计算时会先做卫生处理：确保各分项非负且不超过对应总量，再从总输入中依次拆出缓存读写、图片输入、音频输入 Token 分别计价。配置了 `input_cost_per_image_token` 或音频输入价格时，对应的输入 Token 从 `normalInput` 中拆出单独计价；未配置这些细化价格时，图片/音频输入 Token 按普通输入 Token 计价。所有 cache / audio / image 细化价格键均未配置时，回退 legacy 公式 `promptTokens × inputCost + completionTokens × outputCost`。每个计费项经 `quota.CalcCostUnits(用量, 价格)` 换算（即 `round(用量 × 价格 × 1e8)`，1 个整数单位 = 1e-8 元）后以 int64 累加，浮点只参与单项乘法，不会产生浮点累加误差。
 
 需要特别说明的是缓存拆分的前提：`PromptTokens` 必须是总输入 Token 数。Anthropic 协议的 `input_tokens` 不含缓存读写 Token，协议适配层（`bfe/bfe_model_protocol/utils/usage_parse.go` 的 `ParseAnthropicUsageFields`）已将其归一化为 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`，与 OpenAI `prompt_tokens` 语义对齐；usage 字段的统一提取也已在协议适配层完成（详见[第七章 数据面转发设计：BFE](../design/chapter07-data-plane-design.md)与[第二十九章 AI 路由模块实现：mod_ai_route](./chapter31-mod-ai-route.md)），本章只关注结算逻辑。
 
@@ -719,7 +719,7 @@ type TokenAuthContext struct {
 - 通过 `HandleFoundProduct`、`HandleReadResponse`、`HandleRequestFinish` 三个回调，分别完成认证、用量解析、配额扣减。
 - API-Key 从 `Authorization: Bearer <api-key>` 中提取，校验项包括存在性、启用状态、过期时间、模型白名单/黑名单、来源子网以及各 `QuotaPlan` 的 Redis 余额。
 - `QuotaPlan.RedisKey` 由控制面生成并下发，BFE 直接使用，避免改名导致计数器重置；`total_token` 与 `RMB` 两种单位分别使用不同的 Lua 脚本扣减。
-- RMB 配额按 `AIConf.ModelTable` 中的模型价格与当前时段 tier 计算成本，所有运算使用定点整数，避免浮点误差；chat 计费从总输入中拆分缓存读写、图片/音频输入维度，均未配置时回退 legacy 公式，`responses` 复用 chat 计费，`video_generation` 按 `output_cost_per_video` × 视频数计费。
+- RMB 配额按 `AIConf.ModelTable` 中的模型价格（float64）与当前时段 tier 逐项 `quota.CalcCostUnits` 换算为 1e-8 元定点整数后累加扣减；chat 计费从总输入中拆分缓存读写、图片/音频输入维度，均未配置时回退 legacy 公式，`responses` 复用 chat 计费，`video_generation` 按 `output_cost_per_video` × 视频数计费。
 - 计费可靠性由 `AiBasicInfo` 的 `MarkResponseCompleted` / `MarkFinalUsageSeen` 两组标记支撑：客户端中断且未见到最终 usage 不扣费，估算值仅在响应正常完成时可用；`TokenAuthContext.deducted` 保证扣费幂等；`/count_tokens` 端点跳过计费。
 - `total_token` 配额允许为 0（无余额计划，绑定请求被 429 拒绝），Redis 余额 key 不存在视为无余额而非内部错误。
 - 流式响应的 Token 用量由 `mod_body_process` 解析并累计（`message_delta` 保留 `message_start` 的 prompt/cache 字段），非流式响应由 `mod_ai_token_auth` 直接解析；usage 提取统一委托给 `bfe_model_protocol` 协议适配层，最终统一在 `HandleRequestFinish` 中扣减。
