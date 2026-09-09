@@ -47,6 +47,6 @@
 
 ## 本书相关章节
 
-- [第十六章 安全设计](../design/chapter16-security-design.md) 中介绍了错误响应体与安全审计日志字段。
-- [第十八章 控制台基础操作](../operation/chapter18-dashboard-basics.md) 中介绍了常见控制台错误提示的对照思路。
-- [第二十一章 API-Key 与配额配置](../operation/chapter21-apikey-and-quota-config.md) 中介绍了配额耗尽、限流触发等问题的排查方法。
+- [第十六章 安全设计](../design/chapter17-security-design.md) 中介绍了错误响应体与安全审计日志字段。
+- [第十九章 控制台基础操作](../operation/chapter19-dashboard-basics.md) 中介绍了常见控制台错误提示的对照思路。
+- [第二十二章 API-Key 与配额配置](../operation/chapter22-apikey-and-quota-config.md) 中介绍了配额耗尽、限流触发等问题的排查方法。

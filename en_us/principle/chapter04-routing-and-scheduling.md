@@ -244,4 +244,4 @@ Understanding these principles helps you quickly locate root causes when configu
 - `bfe/bfe_basic/request_ai_route.go`
 - [Chapter 11: Provider and Cluster Design](../design/chapter10-provider-and-cluster.md)
 - [Chapter 11: AI Routing Rules Design](../design/chapter11-ai-route-rules.md)
-- [Chapter 31: AI Routing Module Implementation: mod_ai_route](../implementation/chapter29-mod-ai-route.md)
+- [Chapter 31: AI Routing Module Implementation: mod_ai_route](../implementation/chapter31-mod-ai-route.md)

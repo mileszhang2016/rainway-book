@@ -244,4 +244,4 @@ flowchart TD
 - `bfe/bfe_basic/request_ai_route.go`
 - [第十一章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)
 - [第十一章 AI 路由规则设计](../design/chapter11-ai-route-rules.md)
-- [第三十一章 AI 路由模块实现：mod_ai_route](../implementation/chapter29-mod-ai-route.md)
+- [第三十一章 AI 路由模块实现：mod_ai_route](../implementation/chapter31-mod-ai-route.md)

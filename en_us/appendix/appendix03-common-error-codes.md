@@ -47,6 +47,6 @@ Troubleshooting advice: when receiving a 409, first resolve the dependency ident
 
 ## Related Chapters in This Book
 
-- [Chapter 16: Security Design](../design/chapter16-security-design.md) introduces the error response body and security audit log fields.
-- [Chapter 18: Dashboard Basics](../operation/chapter18-dashboard-basics.md) introduces how to interpret common Dashboard error messages.
-- [Chapter 21: API-Key and Quota Configuration](../operation/chapter21-apikey-and-quota-config.md) introduces troubleshooting methods for issues such as quota exhaustion and rate limit triggers.
+- [Chapter 16: Security Design](../design/chapter17-security-design.md) introduces the error response body and security audit log fields.
+- [Chapter 19: Dashboard Basics](../operation/chapter19-dashboard-basics.md) introduces how to interpret common Dashboard error messages.
+- [Chapter 22: API-Key and Quota Configuration](../operation/chapter22-apikey-and-quota-config.md) introduces troubleshooting methods for issues such as quota exhaustion and rate limit triggers.

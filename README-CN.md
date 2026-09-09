@@ -41,32 +41,35 @@ v0.5.0 包含以下组件版本：
 - [第十三章 模型定价与成本核算设计](./design/chapter13-model-pricing.md)
 - [第十四章 配置导出与版本控制设计](./design/chapter14-config-export-and-version-control.md)
 - [第十五章 可观测性设计](./design/chapter15-observability.md)
-- [第十六章 安全设计](./design/chapter16-security-design.md)
+- [第十六章 EPP智能调度设计](./design/chapter16-epp-scheduling-design.md)
+- [第十七章 安全设计](./design/chapter17-security-design.md)
 
 ### 操作篇
-- [第十七章 安装部署](./operation/chapter17-installation-and-deployment.md)
-- [第十八章 控制台基础操作](./operation/chapter18-dashboard-basics.md)
-- [第十九章 Provider与模型配置](./operation/chapter19-provider-and-model-config.md)
-- [第二十章 Cluster与路由配置](./operation/chapter20-cluster-and-route-config.md)
-- [第二十一章 API-Key与配额配置](./operation/chapter21-apikey-and-quota-config.md)
-- [第二十二章 限流策略配置](./operation/chapter22-rate-limit-config.md)
-- [第二十三章 域名与证书配置](./operation/chapter23-domain-and-cert-config.md)
-- [第二十四章 配置热加载与升级](./operation/chapter24-hot-reload-and-upgrade.md)
+- [第十八章 安装部署](./operation/chapter18-installation-and-deployment.md)
+- [第十九章 控制台基础操作](./operation/chapter19-dashboard-basics.md)
+- [第二十章 Provider与模型配置](./operation/chapter20-provider-and-model-config.md)
+- [第二十一章 Cluster与路由配置](./operation/chapter21-cluster-and-route-config.md)
+- [第二十二章 API-Key与配额配置](./operation/chapter22-apikey-and-quota-config.md)
+- [第二十三章 限流策略配置](./operation/chapter23-rate-limit-config.md)
+- [第二十四章 域名与证书配置](./operation/chapter24-domain-and-cert-config.md)
+- [第二十五章 配置热加载与升级](./operation/chapter25-hot-reload-and-upgrade.md)
+- [第二十六章 EPP调度配置与运维](./operation/chapter26-epp-scheduling-operation.md)
 
 ### 实现篇
-- [第二十五章 代码组织与启动流程](./implementation/chapter25-code-layout-and-startup.md)
-- [第二十六章 接口层实现：OpenAPI与InnerAPI](./implementation/chapter26-endpoints-implementation.md)
-- [第二十七章 模型层实现：Manager与Storager模式](./implementation/chapter27-model-layer-implementation.md)
-- [第二十八章 存储层实现：DAO与Storage](./implementation/chapter28-storage-layer-implementation.md)
-- [第二十九章 AI路由模块实现：mod_ai_route](./implementation/chapter29-mod-ai-route.md)
-- [第三十章 Token认证与配额模块实现：mod_ai_token_auth](./implementation/chapter30-mod-ai-token-auth.md)
-- [第三十一章 限流模块实现：mod_ai_rate_limit](./implementation/chapter31-mod-ai-rate-limit.md)
-- [第三十二章 请求体处理模块实现：mod_body_process](./implementation/chapter32-mod-body-process.md)
-- [第三十三章 Conf Agent实现](./implementation/chapter33-conf-agent-implementation.md)
+- [第二十七章 代码组织与启动流程](./implementation/chapter27-code-layout-and-startup.md)
+- [第二十八章 接口层实现：OpenAPI与InnerAPI](./implementation/chapter28-endpoints-implementation.md)
+- [第二十九章 模型层实现：Manager与Storager模式](./implementation/chapter29-model-layer-implementation.md)
+- [第三十章 存储层实现：DAO与Storage](./implementation/chapter30-storage-layer-implementation.md)
+- [第三十一章 AI路由模块实现：mod_ai_route](./implementation/chapter31-mod-ai-route.md)
+- [第三十二章 Token认证与配额模块实现：mod_ai_token_auth](./implementation/chapter32-mod-ai-token-auth.md)
+- [第三十三章 限流模块实现：mod_ai_rate_limit](./implementation/chapter33-mod-ai-rate-limit.md)
+- [第三十四章 请求体处理模块实现：mod_body_process](./implementation/chapter34-mod-body-process.md)
+- [第三十五章 Conf Agent实现](./implementation/chapter35-conf-agent-implementation.md)
+- [第三十六章 EPP组件实现](./implementation/chapter36-epp-implementation.md)
 
 ### 开发篇
-- [第三十四章 如何扩展壬远AI网关](./develop/chapter34-how-to-extend.md)
-- [第三十五章 如何向壬远AI网关贡献代码](./develop/chapter35-how-to-contribute.md)
+- [第三十七章 如何扩展壬远AI网关](./develop/chapter37-how-to-extend.md)
+- [第三十八章 如何向壬远AI网关贡献代码](./develop/chapter38-how-to-contribute.md)
 
 ### 附录篇
 - [附1 OpenAPI接口速查](./appendix/appendix01-openapi-quick-reference.md)
@@ -82,6 +85,7 @@ v0.5.0 包含以下组件版本：
 
 - `ai-gateway-api/`：控制面核心组件
 - `bfe/`：数据面转发引擎
+- `ai-gateway-epp/`：EPP 智能调度组件（基于 llm-d，经 ext_proc 为 EPP 模式 Cluster 提供后端选择）
 - `conf-agent/`：配置代理
 - `ai-gateway-web/`：管理控制台（Dashboard）前端
   - 控制台详细使用说明见：<https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.8/docs/zh-cn>

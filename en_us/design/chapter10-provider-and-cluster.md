@@ -496,6 +496,6 @@ Understanding the boundary between Provider and Cluster is the foundation for co
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/cluster-table.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/ai-route.md`
 - [Chapter 6: Control Plane Core Design: AI Gateway API](./chapter06-control-plane-design.md)
-- [Chapter 21: Provider Configuration](../operation/chapter19-provider-and-model-config.md)
-- [Chapter 21: Cluster Configuration](../operation/chapter20-cluster-and-route-config.md)
-- [Chapter 31: mod_ai_route Implementation](../implementation/chapter29-mod-ai-route.md)
+- [Chapter 20: Provider Configuration](../operation/chapter20-provider-and-model-config.md)
+- [Chapter 21: Cluster Configuration](../operation/chapter21-cluster-and-route-config.md)
+- [Chapter 31: mod_ai_route Implementation](../implementation/chapter31-mod-ai-route.md)
