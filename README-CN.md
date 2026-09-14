@@ -6,18 +6,18 @@
 
 ## 版本说明
 
-本书会随着壬远AI网关的升级而持续更新。本书的当前版本对应 **壬远AI网关 v0.5.0**， release 地址：<https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.5.0>。
+本书会随着壬远AI网关的升级而持续更新。本书的当前版本对应 **壬远AI网关 v0.6.0**， release 地址：<https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.6.0>。
 
-v0.5.0 包含以下组件版本：
+v0.6.0 包含以下组件版本：
 
 | 组件 | 版本 | 说明 |
 |---|---|---|
 | AI Gateway API | v0.0.9 | 控制面 |
+| AI Gateway EPP | v0.0.1 | EPP 智能调度（新增组件） |
 | BFE | v1.8.7 | 数据面 |
-| Dashboard | v0.0.8 | 控制台（内嵌于 API 镜像） |
-| conf-agent | v0.0.6 | 配置热加载代理 |
-| Log Reader | v1.2.0 | 访问日志 → Kafka |
-| Observability | v0.0.1 | Doris + Grafana 可观测配置 |
+| Dashboard | v0.0.9 | 控制台（内嵌于 API 镜像） |
+| conf-agent | v0.0.7 | 配置热加载代理 |
+| Log Reader | v1.3.0 | 访问日志 → Kafka |
 
 ## 全书目录
 
@@ -88,7 +88,7 @@ v0.5.0 包含以下组件版本：
 - `ai-gateway-epp/`：EPP 智能调度组件（基于 llm-d，经 ext_proc 为 EPP 模式 Cluster 提供后端选择）
 - `conf-agent/`：配置代理
 - `ai-gateway-web/`：管理控制台（Dashboard）前端
-  - 控制台详细使用说明见：<https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.8/docs/zh-cn>
+  - 控制台详细使用说明见：<https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.9/docs/zh-cn>
 
 ## 版权许可
 
