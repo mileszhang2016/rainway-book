@@ -323,7 +323,7 @@ Production deployment points:
 - BFE is deployed across multiple availability zones, with Conf Agent pulling configurations independently;
 - Dashboard can be deployed standalone or run in the same container as AI Gateway API.
 
-For detailed deployment steps, see [Chapter 21: Installation and Deployment](../operation/chapter17-installation-and-deployment.md).
+For detailed deployment steps, see [Chapter 18: Installation and Deployment](../operation/chapter18-installation-and-deployment.md).
 
 ---
 

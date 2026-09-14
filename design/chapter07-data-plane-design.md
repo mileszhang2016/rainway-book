@@ -7,6 +7,7 @@
 - BFE 在壬远 AI 网关中承担的角色及其与控制面（AI Gateway API）的关系；
 - BFE 的请求处理生命周期，尤其是 AI 网关模式下的独立转发路径；
 - `mod_ai_route`、`mod_ai_token_auth`、`mod_ai_rate_limit`、`mod_body_process` 四个 AI 相关模块的执行顺序与协作方式；
+- 协议适配层 `bfe_model_protocol` 的职责、适配器接口与协议注册机制；
 - BFE 模块框架 `bfe_module` 的回调机制与模块注册方式；
 - AI 相关配置文件的加载、校验与热加载机制；
 - 关键配置示例与转发降级行为。
@@ -145,6 +146,70 @@ var moduleList = []bfe_module.BfeModule{
 - `mod_ai_rate_limit` 最后执行，依赖 `ClientApiKey`、目标模型等信息执行 TPM/RPM/并发限流。
 
 `mod_body_process` 主要在 `HandleReadResponse` 阶段执行，负责解析流式响应中的 Token 用量，其计算结果会供 `mod_ai_token_auth` 在 `HandleRequestFinish` 阶段进行最终配额扣减。任何顺序调整都会破坏这一依赖链，导致路由、限流或配额扣减行为异常。因此 `bfe_modules/bfe_modules.go` 中的注册位置与注释需要同步维护。
+
+### 协议适配层（bfe_model_protocol）
+
+AI 网关需要与多种大模型协议对接：OpenAI 兼容族（OpenAI、DeepSeek、Groq、Responses API 等）使用 `Authorization: Bearer` 认证，Anthropic（Claude）使用 `x-api-key` 认证并要求携带 `anthropic-version` 头，不同协议的 usage 字段路径也各不相同。在协议适配层承担这些职责之前，这些协议知识散落在四个包中：协议识别硬编码在 `bfe_basic`、认证头注入写在 `mod_ai_token_auth.SetApiKey`、版本头注入硬编码在 `bfe_server/reverseproxy.go`、usage 字段归一在 `mod_ai_token_auth` 与 `mod_body_process` 中各存在一份重复实现。
+
+协议适配层由 `bfe/bfe_model_protocol/` 包实现（与 `bfe_modules/` 平级），把全部协议知识收敛为按协议组织的适配器：
+
+```
+bfe/bfe_model_protocol/
+├── protocol.go          # ProtocolAdapter 接口 + 协议常量
+├── registry.go          # 编译期注册 + Get / Supports / ValidateProtocols
+├── usage.go             # UsageFields 等类型的根包 alias（实体在 utils）
+├── errors.go            # ProtocolError / ErrorNormalizer 的根包 alias
+├── detect.go            # 协议识别（DetectProtocol / DetectProtocolAndKey）
+├── utils/               # 叶子包：UsageFields、usage 解析、ProtocolError
+├── openai/              # openai 兼容协议族（含 DeepSeek/Groq/Responses）
+└── anthropic/           # anthropic messages 协议
+```
+
+每种协议由一个无状态单例适配器承载全部协议知识，接口定义在 `bfe/bfe_model_protocol/protocol.go`：
+
+```go
+type ProtocolAdapter interface {
+    Key() string
+
+    // InjectAuth 向出站请求注入上游凭证
+    InjectAuth(outreq *bfe_http.Request, key string) error
+
+    // ExtraHeaders 协议级补充 header（如 anthropic-version），无则返回 nil
+    ExtraHeaders() map[string]string
+
+    // ExtractUsageFields 从响应体/SSE 事件数据中提取 usage 字段
+    ExtractUsageFields(data []byte) UsageFields
+
+    // ErrorNormalizer 上游错误归一化；默认实现恒返回 nil（走现有状态码白名单）
+    ErrorNormalizer() ErrorNormalizer
+}
+```
+
+内置适配器在 `registry.go` 的 `init()` 中编译期注册（`Register(openai.New())`、`Register(anthropic.New())`），对外提供三个函数：
+
+- `Get(protocol)`：按协议名取适配器，未知或空协议名回退 openai 适配器，保持历史兜底行为；
+- `Supports(protocols, p)`：判断协议是否在 cluster 的 `ModelProtocols` 列表中，空列表默认仅 openai（向后兼容）；
+- `ValidateProtocols(protocols)`：校验列表中的协议名是否都为注册表已知，含未知协议名返回 error，空列表合法。
+
+协议选择是**按请求**进行的：`doSingleAIForward()` 根据请求的 `AiBasicInfo.AuthStyle` 取对应适配器，cluster 可以配置 `["openai", "anthropic"]` 同时支持多种协议。
+
+需要特别强调的概念边界是 **model_protocol（协议知识维度）≠ provider（用户自定义实体）**：provider 是 cluster 级的上游实体（名称、key 池、价格表、地址），由控制面 AI Gateway API 管理；model_protocol 描述的是认证头如何注入、补充什么版本头、usage 字段长什么样等协议知识。OpenAI 兼容生态中的 Groq、DeepSeek、OpenRouter 等品牌都走 `openai` 协议，接入这些 provider 无需新建适配器，只需在 cluster 配置 `model_protocols: ["openai"]` 即可，零代码改动。
+
+适配层在请求生命周期中的挂载点如下：
+
+```
+http_conn.serveRequest()
+  → GetApiKey / DetectAuthStyle（bfe_basic，内部委托 detect.go）   ← 协议识别
+  → reverseproxy.doSingleAIForward
+      → Supports(ModelProtocols, AuthStyle)                         ← 协议校验
+      → adapter.InjectAuth + ExtraHeaders                           ← 认证头/版本头注入
+  → mod_body_process QuotaUsageProcessor
+      → SSEEvent/RawEvent.GetQuotaUsage（经 extractUsageFields）     ← 流式 usage
+  → mod_ai_token_auth
+      → UpdateCtxByUsage（按 AuthStyle 取适配器 ExtractUsageFields） ← 非流式 usage
+```
+
+为保证依赖方向不出现环，`bfe_model_protocol` 只允许 import `bfe_http` 与 gjson，不许 import `bfe_basic` / `bfe_config` / `bfe_modules`；`bfe_basic.GetApiKey` / `DetectAuthStyle`、`mod_ai_token_auth.SetApiKey` 等历史入口保留原签名，内部委托给适配层，因此对既有模块行为完全兼容。模型名改写（prefix 剥离、`ModelMapping`）属于协议无关逻辑，仍留在 `computeTargetModel`，不在适配层职责范围内。
 
 ### 模块协作关系
 
@@ -294,6 +359,17 @@ GET /reload/mod_ai_route
 
 热加载的安全性体现在两个层面：一是配置语法与语义校验在替换前完成，避免非法配置进入内存；二是 `AiRouteTable.Update()` 使用读写锁保护，查找操作在 `RLock` 下读取旧表引用，更新操作在 `Lock` 下替换引用，二者互不阻塞。对于路由规则，条件表达式会在加载时由 `condition.Build()` 编译为可执行的 `Condition` 对象，并在 `ValidateRouteTable()` 中校验 target 权重总和为 100，确保运行时无需重复编译。
 
+### ModelProtocols 启动与热加载校验
+
+cluster 配置的 `AIConf.ModelProtocols` 字段声明该集群支持的模型协议列表，空列表默认 `["openai"]`。协议名会在配置加载期接受注册表校验：`bfe_server/bfe_confdata_load.go` 中的 `validateClusterModelProtocols()` 遍历每个 cluster 的 `AIConf.ModelProtocols`，调用 `modelprotocol.ValidateProtocols()` 检查协议名是否已知。
+
+该校验挂在两个路径上：
+
+- 启动时 `InitDataLoad()` 在校验失败时返回错误，BFE 启动失败；
+- 热加载时 `serverDataConfReload()` 在校验失败时记录错误日志并拒绝切换，当前运行中的配置保持不变。
+
+这样未知协议名的配置错误在启动或热加载阶段即可暴露，而不是在请求转发时才失败。
+
 ## 关键配置示例
 
 ### 启用 AI 网关模式
@@ -404,14 +480,41 @@ OpenDebug = false
 
 ### fallback 触发条件
 
-`ServeHTTPForAI()` 在目标转发失败时按 `fallbacks` 顺序降级。触发条件为：
+`ServeHTTPForAI()` 在目标转发失败时按 `fallbacks` 顺序降级。`shouldTriggerFallback()` 的判断逻辑（`bfe/bfe_server/reverseproxy.go`）为：
+
+```go
+func shouldTriggerFallback(res *bfe_http.Response, err error) bool {
+    if err != nil {
+        return true
+    }
+    code := getResponseStatus(res)
+
+    // 协议级错误归一化挂钩（默认实现恒返回 nil，保持状态码白名单行为）
+    if perr := modelprotocol.Get("").ErrorNormalizer().Normalize(code, nil, nil); perr != nil {
+        return perr.IsUpstream && (perr.SwapKey || perr.Retryable)
+    }
+
+    if code >= 500 {
+        return true
+    }
+    if _, ok := aiFallbackStatusCodes[code]; ok {
+        return true
+    }
+    return false
+}
+```
+
+触发条件为：
 
 - `clusterInvoke()` 返回错误（连接失败、超时、读写错误等）；
-- 后端返回状态码 `>= 500`。
+- 后端返回状态码 `>= 500`；
+- 后端返回状态码命中 `aiFallbackStatusCodes` 白名单（400/401/402/403/422/429）。
+
+在状态码白名单之前，`shouldTriggerFallback()` 先咨询协议适配层的 `ErrorNormalizer().Normalize` 挂钩：若协议适配器识别出上游错误并返回 `ProtocolError`，则按归一化结果决定是否降级；挂钩的默认实现恒返回 `nil`，实际判定仍由上述状态码白名单完成。该挂钩为新协议按错误体定制降级语义预留了扩展点。
 
 以下情况不触发 fallback：
 
-- 后端返回 `4xx` 客户端错误；
+- 后端返回的 `4xx` 状态码不在 `aiFallbackStatusCodes` 白名单中；
 - 请求在 `HandleFoundProduct` 阶段已被限流或鉴权失败。
 
 每次 fallback 前，`resetRequestForRetry()` 会重置 `OutRequest`、backend 连接、retry 计数与错误信息，并通过 `rewindRequestBody()` 将请求体重置到起始位置，确保下一次转发使用干净的请求状态。
@@ -459,6 +562,7 @@ prepareRequestBodyForRetry()
 - AI 网关模式下，请求进入独立的 `ServeHTTPForAI()` 路径，复用原有回调与转发基础设施。
 - `mod_ai_token_auth`、`mod_ai_rate_limit`、`mod_ai_route` 三个模块在 `HandleFoundProduct` 阶段按固定顺序执行，通过 `AiBasicInfo` 与 `Request.Context` 共享状态。
 - `mod_body_process` 在 `HandleReadResponse` 阶段解析 SSE 响应中的 token 使用量，供 `mod_ai_token_auth` 最终扣减配额。
+- `bfe_model_protocol` 协议适配层把散落在 `bfe_basic`、`mod_ai_token_auth`、`mod_body_process`、`bfe_server` 四处的协议知识收敛为按协议组织的适配器；`AIConf.ModelProtocols` 在启动与热加载时接受注册表校验，未知协议名会使加载失败。
 - BFE 的 `bfe_module` 框架通过回调点与返回值机制组织模块，`bfe_modules/bfe_modules.go` 中的注册顺序直接影响行为正确性。
 - 配置加载采用 INI + JSON 双层结构，支持通过 Web 接口热加载，新配置在校验完成后原子替换旧配置。
 - `mod_ai_route` 支持 `apikey → entity → global` 三级路由、`targets` 加权选择与 `fallbacks` 顺序降级，是 AI 网关转发的核心。
@@ -471,3 +575,4 @@ prepareRequestBodyForRetry()
 - `bfe/docs/zh_cn/modules/mod_ai_rate_limit/mod_ai_rate_limit.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route_bfe_changes.md`
+- `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`

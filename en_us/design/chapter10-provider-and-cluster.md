@@ -206,7 +206,7 @@ Before deleting a provider, the Control Plane must verify that the provider is n
 
 **Cluster deletion**
 
-When deleting a cluster, the system first checks whether the cluster is referenced by AI routing rules (global / entity / api-key level); if so, the deletion fails and a reference conflict error is returned. After passing the reference check, the system automatically cascades the cleanup of associated sub-clusters and instance pools.
+When deleting a cluster, the system first checks whether the cluster is referenced by AI routing rules (global / entity / api-key level); if so, the deletion fails with `409 Conflict`. After passing the reference check, the system automatically cascades the cleanup of associated sub-clusters and instance pools.
 
 **Name constraint on update APIs**
 
@@ -282,6 +282,8 @@ When `strip_prefix=true`, `match_prefix` is required, must be non-empty, and mus
 ### ModelProtocols
 
 `ModelProtocols` comes from the Provider's `model_protocols`; the Control Plane passes it through to `AIConf` according to the cluster's `provider` reference. BFE uses it to determine the request protocol style (such as the OpenAI-compatible format or the Anthropic Messages API).
+
+The data plane validates every cluster's `AIConf.ModelProtocols` at both startup load and hot reload: `validateClusterModelProtocols` in `bfe_server/bfe_confdata_load.go` calls `bfe_model_protocol.ValidateProtocols`, requiring every protocol in the list to be registered in the `bfe_model_protocol` adapter registry (built-in: `openai`, `anthropic`). If any unknown protocol name appears, the load or hot reload fails, reporting which cluster's configuration is invalid. An empty list is valid and treated as the default `["openai"]`. The design of the protocol adapter layer is covered in [Chapter 7: Data Plane Forwarding Design: BFE](./chapter07-data-plane-design.md).
 
 ## Model Discovery
 
@@ -494,6 +496,6 @@ Understanding the boundary between Provider and Cluster is the foundation for co
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/cluster-table.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/ai-route.md`
 - [Chapter 6: Control Plane Core Design: AI Gateway API](./chapter06-control-plane-design.md)
-- [Chapter 21: Provider Configuration](../operation/chapter19-provider-and-model-config.md)
-- [Chapter 21: Cluster Configuration](../operation/chapter20-cluster-and-route-config.md)
-- [Chapter 31: mod_ai_route Implementation](../implementation/chapter29-mod-ai-route.md)
+- [Chapter 20: Provider Configuration](../operation/chapter20-provider-and-model-config.md)
+- [Chapter 21: Cluster Configuration](../operation/chapter21-cluster-and-route-config.md)
+- [Chapter 31: mod_ai_route Implementation](../implementation/chapter31-mod-ai-route.md)

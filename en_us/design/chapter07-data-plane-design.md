@@ -7,6 +7,7 @@ This chapter focuses on BFE (Beyond Front End), the Data Plane component of the 
 - The role BFE plays in the Rainway AI Gateway and its relationship with the Control Plane (AI Gateway API);
 - The request processing lifecycle of BFE, especially the independent forwarding path in AI Gateway mode;
 - The execution order and collaboration of the four AI-related modules `mod_ai_route`, `mod_ai_token_auth`, `mod_ai_rate_limit`, and `mod_body_process`;
+- The responsibilities, adapter interface, and protocol registration mechanism of the protocol adapter layer `bfe_model_protocol`;
 - The callback mechanism and module registration of the BFE module framework `bfe_module`;
 - The loading, validation, and hot reload mechanisms of AI-related configuration files;
 - Key configuration examples and forwarding fallback behavior.
@@ -147,6 +148,72 @@ The constraints on the execution order are determined by data dependencies:
 - `mod_ai_rate_limit` runs last, relying on `ClientApiKey`, the target model, and other information to perform TPM/RPM/concurrency rate limiting.
 
 `mod_body_process` mainly executes at the `HandleReadResponse` stage, parsing token usage from streaming responses; its results are used by `mod_ai_token_auth` at the `HandleRequestFinish` stage for the final quota deduction. Any change to this order would break the dependency chain, causing abnormal routing, rate limiting, or quota deduction behavior. Therefore, the registration positions and comments in `bfe_modules/bfe_modules.go` must be maintained in sync.
+
+### Protocol Adapter Layer (bfe_model_protocol)
+
+The AI Gateway must interface with multiple LLM protocols: the OpenAI-compatible family (OpenAI, DeepSeek, Groq, the Responses API, etc.) authenticates with `Authorization: Bearer`, Anthropic (Claude) authenticates with `x-api-key` and requires the `anthropic-version` header, and usage field paths differ across protocols. Before the protocol adapter layer took over these responsibilities, this protocol knowledge was scattered across four packages: protocol detection was hard-coded in `bfe_basic`, credential injection lived in `mod_ai_token_auth.SetApiKey`, the version header was hard-coded in `bfe_server/reverseproxy.go`, and usage-field normalization was duplicated between `mod_ai_token_auth` and `mod_body_process`.
+
+The adapter layer lives in the `bfe/bfe_model_protocol/` package (at the same level as `bfe_modules/`), converging all protocol knowledge into per-protocol adapters:
+
+```
+bfe/bfe_model_protocol/
+├── protocol.go          # ProtocolAdapter interface + protocol constants
+├── registry.go          # compile-time registration + Get / Supports / ValidateProtocols
+├── usage.go             # root-package aliases of UsageFields et al. (entities live in utils)
+├── errors.go            # root-package aliases of ProtocolError / ErrorNormalizer
+├── detect.go            # protocol detection (DetectProtocol / DetectProtocolAndKey)
+├── utils/               # leaf package: UsageFields, usage parsing, ProtocolError
+├── openai/              # OpenAI-compatible family (incl. DeepSeek/Groq/Responses)
+└── anthropic/           # anthropic messages protocol
+```
+
+Each protocol is carried by a stateless singleton adapter; the interface is defined in `bfe/bfe_model_protocol/protocol.go`:
+
+```go
+type ProtocolAdapter interface {
+    Key() string
+
+    // InjectAuth writes the upstream credential into the outgoing request
+    InjectAuth(outreq *bfe_http.Request, key string) error
+
+    // ExtraHeaders returns protocol-level supplementary headers
+    // (e.g. anthropic-version), or nil when there are none
+    ExtraHeaders() map[string]string
+
+    // ExtractUsageFields extracts usage fields from a response body / SSE event data
+    ExtractUsageFields(data []byte) UsageFields
+
+    // ErrorNormalizer normalizes upstream errors; the default implementation
+    // always returns nil (falling back to the status-code whitelist)
+    ErrorNormalizer() ErrorNormalizer
+}
+```
+
+Built-in adapters are registered at compile time in the `init()` of `registry.go` (`Register(openai.New())`, `Register(anthropic.New())`). Three functions are exposed:
+
+- `Get(protocol)`: returns the adapter for a protocol name; unknown or empty names fall back to the openai adapter, preserving the historical fallback behavior;
+- `Supports(protocols, p)`: reports whether a protocol is in a cluster's `ModelProtocols` list; an empty list defaults to openai only (backward compatible);
+- `ValidateProtocols(protocols)`: verifies that every name is known to the registry, returning an error for unknown names; an empty list is valid.
+
+Protocol selection is **per request**: `doSingleAIForward()` picks the adapter matching the request's `AiBasicInfo.AuthStyle`, and a cluster may declare multiple protocols such as `["openai", "anthropic"]`.
+
+One conceptual boundary deserves emphasis: **model_protocol (protocol knowledge) ≠ provider (user-defined entity)**. A provider is a cluster-level upstream entity (name, key pool, price table, address) managed by the Control Plane AI Gateway API; a model_protocol describes protocol knowledge such as how credentials are injected, which version headers are added, and what usage fields look like. Brands in the OpenAI-compatible ecosystem such as Groq, DeepSeek, and OpenRouter all use the `openai` protocol: onboarding them requires no new adapter at all, only `model_protocols: ["openai"]` in the cluster configuration — a zero-code change.
+
+The adapter layer hooks into the request lifecycle as follows:
+
+```
+http_conn.serveRequest()
+  → GetApiKey / DetectAuthStyle (bfe_basic, delegating to detect.go)   ← protocol detection
+  → reverseproxy.doSingleAIForward
+      → Supports(ModelProtocols, AuthStyle)                            ← protocol validation
+      → adapter.InjectAuth + ExtraHeaders                              ← credential/version header injection
+  → mod_body_process QuotaUsageProcessor
+      → SSEEvent/RawEvent.GetQuotaUsage (via extractUsageFields)       ← streaming usage
+  → mod_ai_token_auth
+      → UpdateCtxByUsage (adapter ExtractUsageFields by AuthStyle)     ← non-streaming usage
+```
+
+To keep the dependency graph acyclic, `bfe_model_protocol` may only import `bfe_http` and gjson — never `bfe_basic`, `bfe_config`, or `bfe_modules`. Historical entry points such as `bfe_basic.GetApiKey` / `DetectAuthStyle` and `mod_ai_token_auth.SetApiKey` keep their original signatures and delegate to the adapter layer internally, so existing module behavior is fully preserved. Model name rewriting (prefix stripping, `ModelMapping`) is protocol-agnostic and stays in `computeTargetModel`, outside the adapter layer's responsibilities.
 
 ### Module Collaboration
 
@@ -296,6 +363,17 @@ This interface calls `loadRouteRuleConf()`: it first builds a new copy of the ro
 
 The safety of hot reload is reflected at two levels: first, configuration syntax and semantic validation is completed before replacement, preventing invalid configurations from entering memory; second, `AiRouteTable.Update()` is protected by a read-write lock — lookup operations read the old table reference under `RLock`, and update operations replace the reference under `Lock`, so the two do not block each other. For routing rules, condition expressions are compiled into executable `Condition` objects by `condition.Build()` at load time, and `ValidateRouteTable()` verifies that the sum of target weights is 100, ensuring no recompilation is needed at runtime.
 
+### ModelProtocols Validation at Startup and Hot Reload
+
+The `AIConf.ModelProtocols` field of a cluster configuration declares the model protocols supported by that cluster; an empty list defaults to `["openai"]`. Protocol names are validated against the registry at configuration load time: `validateClusterModelProtocols()` in `bfe_server/bfe_confdata_load.go` walks every cluster's `AIConf.ModelProtocols` and calls `modelprotocol.ValidateProtocols()` to check that each name is known.
+
+The validation is attached to two paths:
+
+- At startup, `InitDataLoad()` returns an error when validation fails, and BFE fails to start;
+- During hot reload, `serverDataConfReload()` logs the error and refuses to swap when validation fails, leaving the currently running configuration untouched.
+
+This way, configuration errors with unknown protocol names surface at startup or hot reload time instead of failing at request forwarding time.
+
 ## Key Configuration Examples
 
 ### Enabling AI Gateway Mode
@@ -406,14 +484,42 @@ The above configuration means: for requests with API-Key `ak_user_a`, look up th
 
 ### Fallback Trigger Conditions
 
-`ServeHTTPForAI()` degrades in the order of `fallbacks` when target forwarding fails. The trigger conditions are:
+`ServeHTTPForAI()` degrades in the order of `fallbacks` when target forwarding fails. The `shouldTriggerFallback()` logic (`bfe/bfe_server/reverseproxy.go`) is:
+
+```go
+func shouldTriggerFallback(res *bfe_http.Response, err error) bool {
+    if err != nil {
+        return true
+    }
+    code := getResponseStatus(res)
+
+    // Protocol-level error normalization seam. The default normalizer
+    // always returns nil, so the status-code whitelist below keeps deciding.
+    if perr := modelprotocol.Get("").ErrorNormalizer().Normalize(code, nil, nil); perr != nil {
+        return perr.IsUpstream && (perr.SwapKey || perr.Retryable)
+    }
+
+    if code >= 500 {
+        return true
+    }
+    if _, ok := aiFallbackStatusCodes[code]; ok {
+        return true
+    }
+    return false
+}
+```
+
+Fallback is triggered when:
 
 - `clusterInvoke()` returns an error (connection failure, timeout, read/write error, etc.);
-- The backend returns a status code `>= 500`.
+- The backend returns a status code `>= 500`;
+- The backend status code hits the `aiFallbackStatusCodes` whitelist (400/401/402/403/422/429).
+
+Before the status-code whitelist decides, `shouldTriggerFallback()` consults the protocol adapter layer's `ErrorNormalizer().Normalize` seam: if a protocol adapter recognizes the upstream error and returns a `ProtocolError`, the normalized result decides whether to degrade. The default normalizer always returns `nil`, so the actual decision is still made by the status-code whitelist above. The seam reserves an extension point for protocols to customize degradation semantics based on the error body.
 
 The following cases do not trigger a fallback:
 
-- The backend returns a `4xx` client error;
+- A backend `4xx` status code that is not in the `aiFallbackStatusCodes` whitelist;
 - The request has already been rate limited or failed authentication at the `HandleFoundProduct` stage.
 
 Before each fallback, `resetRequestForRetry()` resets the `OutRequest`, the backend connection, the retry count, and error information, and resets the request body to its starting position via `rewindRequestBody()`, ensuring that the next forwarding attempt uses a clean request state.
@@ -461,6 +567,7 @@ This chapter introduced the design of BFE, the Data Plane component of the Rainw
 - In AI Gateway mode, requests enter the independent `ServeHTTPForAI()` path, reusing the original callback and forwarding infrastructure.
 - `mod_ai_token_auth`, `mod_ai_rate_limit`, and `mod_ai_route` execute in a fixed order at the `HandleFoundProduct` stage, sharing state through `AiBasicInfo` and `Request.Context`.
 - `mod_body_process` parses token usage from SSE responses at the `HandleReadResponse` stage, for `mod_ai_token_auth` to perform the final quota deduction.
+- The `bfe_model_protocol` protocol adapter layer converges protocol knowledge scattered across `bfe_basic`, `mod_ai_token_auth`, `mod_body_process`, and `bfe_server` into per-protocol adapters; `AIConf.ModelProtocols` is validated against the registry at startup and hot reload, and unknown protocol names fail the load.
 - BFE's `bfe_module` framework organizes modules through callback points and return values; the registration order in `bfe_modules/bfe_modules.go` directly affects behavioral correctness.
 - Configuration loading adopts a two-layer INI + JSON structure, supports hot reload through the web interface, and new configurations atomically replace the old ones after validation completes.
 - `mod_ai_route` supports three-level routing of `apikey → entity → global`, weighted selection of `targets`, and sequential degradation of `fallbacks`, and is the core of AI Gateway forwarding.
@@ -473,3 +580,4 @@ This chapter introduced the design of BFE, the Data Plane component of the Rainw
 - `bfe/docs/zh_cn/modules/mod_ai_rate_limit/mod_ai_rate_limit.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route_bfe_changes.md`
+- `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`

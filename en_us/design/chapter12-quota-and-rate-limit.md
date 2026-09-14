@@ -7,6 +7,8 @@ By the end of this chapter, the reader will understand:
 - How Rainway AI Gateway uses `QuotaPlan` to allocate quotas in two units, Token or RMB, to API-Keys and Entities;
 - Why Redis serves as the single source of truth for quota balances, and how the management plane queries real-time balances by reading Redis directly;
 - The reset logic for calendar weeks and calendar months, and the role of `last_reset_at` in reset boundary determination;
+- How periodic reset is mutually exclusive across instances via a Redis distributed lock, and how atomic SET plus conditional updates keep the reset idempotent;
+- The consistent semantics of `quota=0` (a plan with no balance) on both the Control Plane and the Data Plane;
 - The TPM, RPM, and concurrency limit model of `RateLimitPolicy`, how policies merge upward along the Entity hierarchy, and how they are exported to BFE;
 - How RMB quotas combine Provider time-of-day templates with Model tiered prices to enable peak/off-peak differentiated billing;
 - Typical quota and rate limit configuration examples.
@@ -57,6 +59,15 @@ CREATE TABLE `quota_plans` (
 | `reset_period` | Reset period; one of `never`, `weekly`, `monthly`. |
 | `last_reset_at` | Time of the last reset; periodic reset uses this to determine whether a calendar week/month boundary has been crossed. |
 
+### The Semantics of quota=0: A Plan with No Balance
+
+Both `total_token` and `RMB` allow `quota = 0`, meaning "a plan with no balance": the configuration itself is valid, but requests bound to the plan are rejected because the balance is exhausted. This is fundamentally different from a negative value: a negative quota is an invalid configuration and fails at configuration load time, whereas `0` is a meaningful business value (for example, temporarily freezing a plan without unbinding it from its API-Keys / Entities). The handling on each side works as follows:
+
+- **Control Plane**: when the quota changes, `QuotaPlanManager.adjustQuota` (`ai-gateway-api/model/quota/quota_plan_manager.go`) computes `remaining = max(0, newQuota - used)` and writes the difference to Redis. When the quota is updated to 0, `remaining` is zeroed out and the Redis balance is synced to 0.
+- **Data Plane BFE**:
+  - At configuration load time, `quotaPlanCheck` in `token_rule_load.go` rejects only configurations with `Quota < 0`; `quota=0` loads as a valid configuration, and each no-balance plan takes effect independently without affecting other plans under the same Product.
+  - At request time, `QuotaPlan.HasBalance` (`bfe/bfe_modules/mod_ai_token_auth/token.go`) judges the balance: if the Redis balance key exists, it is evaluated by value; if the key is missing (`redis_client.IsKeyNotFound`), it is treated as a balance of 0 and likewise reported as "no balance", so requests hitting the plan receive 429 QuotaExhausted instead of an internal error.
+
 ### Applicable Scenarios for the Two Units
 
 - **`total_token`**: suitable for models billed by Token (e.g., OpenAI, Anthropic). Administrators can directly cap the total input + output Tokens available per month.
@@ -84,10 +95,10 @@ flowchart TD
     D[AI Gateway API<br/>Control Plane] -->|OpenAPI balance query| B
     E[QuotaResetScheduler<br/>triggers every minute] -->|ResetExpiredBalances| D
     D -->|Update last_reset_at| F[(quota_plans)]
-    D -->|SetRemaining / ResetToQuota| B
+    D -->|SetRemaining / ResetToQuota / ResetToQuotaAtomic| B
 ```
 
-In this architecture, the `QuotaCache` interface (defined in `ai-gateway-api/model/quotacache/quotacache.go`, implemented in `ai-gateway-api/model/quotacache/redis.go`) encapsulates all Redis operations, including `GetRemaining`, `BatchGetRemaining`, `SetRemaining`, `ResetToQuota`, and `DeleteKeys`.
+In this architecture, the `QuotaCache` interface (defined in `ai-gateway-api/model/quotacache/quotacache.go`, implemented in `ai-gateway-api/model/quotacache/redis.go`) encapsulates all Redis operations, including `GetRemaining`, `BatchGetRemaining`, `SetRemaining`, `ResetToQuota`, `ResetToQuotaAtomic`, and `DeleteKeys`.
 
 ### Redis Key Rules
 
@@ -109,11 +120,15 @@ The Key no longer appends the `KeyCreateAt` timestamp; its lifecycle matches tha
 
 ### Atomic Deduction and Zeroing Strategy
 
-Whether periodic or manual, resets always use atomic `IncrBy(delta)` instead of `SET 0`, for the following reasons:
+The system uses two different Redis write strategies for different scenarios.
+
+**Incremental adjustment (manual reset / initial balance write)**: `SetRemaining` and `ResetToQuota` use atomic `IncrBy(delta)` instead of `SET`:
 
 - Under concurrency, `SET` would overwrite the counts just deducted by other requests, causing quota overdraft;
 - `IncrBy(delta)` adjusts incrementally based on the current value and can be serialized with other deduction operations;
 - When the Key does not exist, a single `IncrBy(quotaTotal)` completes initialization.
+
+**Atomic SET (periodic reset)**: periodic reset uses `ResetToQuotaAtomic`, which executes `redis.call('set', KEYS[1], ARGV[1])` via a Lua script to set the balance directly to the total quota. `IncrBy(delta)` must first read the current value and then compute the difference before writing; there is a time window between the read and the write: if a request completes a deduction in between, the delta computed from the stale value makes the final result deviate from the total quota. Atomic SET does not depend on the current value — the final result is always exactly the total quota and depends only on the ordering between the SET and concurrent deductions — eliminating the read-modify-write race. Combined with the distributed lock (see below), which converges global resets onto a single instance, the contention window between the SET and request-path deductions is also minimal.
 
 ---
 
@@ -159,18 +174,26 @@ func (m *BalanceSyncManager) shouldResetByPeriod(
 ```mermaid
 sequenceDiagram
     participant S as QuotaResetScheduler
+    participant L as Redis Distributed Lock
     participant M as BalanceSyncManager
     participant DB as quota_plans
     participant R as Redis
 
-    S->>M: Trigger ResetExpiredBalances every minute
-    M->>DB: Query plans with reset_period=weekly/monthly and non-unlimited quota
-    loop Each plan
-        M->>M: shouldResetByPeriod(last_reset_at, now)
-        alt Reset needed
-            M->>R: IncrBy(delta) adjusts remaining balance to quota
-            M->>DB: Update last_reset_at = now()
+    S->>L: Acquire(quota:reset:scheduler:lock, token, TTL=5min)
+    alt Lock acquired
+        S->>S: Start watchdog renewing at TTL/3
+        S->>M: Trigger ResetExpiredBalances every minute
+        M->>DB: Query plans with reset_period=weekly/monthly and non-unlimited quota
+        loop Each plan
+            M->>M: shouldResetByPeriod(last_reset_at, now)
+            alt Reset needed
+                M->>R: ResetToQuotaAtomic atomically SETs balance to quota
+                M->>DB: Conditionally update last_reset_at=now (LastResetAtBefore=period start)
+            end
         end
+        S->>L: Release (delete only after verifying instance token)
+    else Lock not acquired
+        S->>S: Skip this round of reset
     end
 ```
 
@@ -183,9 +206,18 @@ In addition to periodic reset, the system provides manual reset APIs:
 
 Manual reset calls `QuotaPlanManager.ResetBalance(..., updateLastResetAt=false)`, i.e., it only resets the Redis balance without updating `last_reset_at`, so as not to interfere with the periodic scheduler's calendar week/month determination. If a new `quota` is passed, `quota_plans.quota` is updated as well.
 
-### Multi-Instance Deployment Notes
+### Manually Triggering Periodic Reset (Inner API)
 
-Currently, `QuotaResetScheduler` starts independently in every AI Gateway API instance. In a multi-instance deployment, all instances attempt to execute `ResetExpiredBalances()`, which risks duplicate resets. Because resets are based on the Redis `IncrBy(delta)` operation, duplicate execution usually does not cause data errors (it is idempotent), but it produces unnecessary logs and Redis operations. If duplicate execution must be strictly avoided in the future, a Redis distributed lock or a single-instance scheduler can be introduced.
+In addition to per-object resets, the Control Plane provides the Inner API `POST /inner-api/v1/quota/trigger-reset` (`ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`), which manually triggers one round of the exact same periodic reset flow as the scheduled task: it is likewise protected by the distributed lock and executes `ResetExpiredBalances`, but it does not affect the next execution time of the scheduled task. The API synchronously returns `{"status":"ok"}` and is intended for internal operations.
+
+### Multi-Instance Deployment and the Distributed Lock
+
+`QuotaResetScheduler` starts independently in every AI Gateway API instance, and in a multi-instance deployment all instances attempt to run the reset. The scheduler uses a Redis distributed lock to ensure that only one instance actually executes `ResetExpiredBalances()` at a time:
+
+- **Acquire**: each round first acquires a lock via `quotacache.DistributedLock` (`ai-gateway-api/model/quotacache/lock.go`), with the lock key `quota:reset:scheduler:lock` and a TTL of 5 minutes; if acquisition fails (held by another instance), the round is skipped and retried in the next round.
+- **Token and release**: each instance generates a unique `instanceToken` (UUID) at startup, which is written as the lock value; releasing the lock uses a Lua script that verifies `GET == token` before `DEL`, preventing the lock from being deleted by another instance after the holder crashes, and preventing an old holder from deleting a new holder's lock after expiration.
+- **Watchdog renewal**: while holding the lock, a watchdog goroutine renews it with `EXPIRE` at TTL/3 intervals (about 100 seconds), preventing the lock from expiring early if the reset takes longer than the TTL and another instance grabs it mid-reset.
+- **Idempotency backstop**: even if the lock fails and a duplicate reset occurs within the same period, the atomic SET is inherently idempotent; in addition, `last_reset_at` is updated conditionally (the `QuotaPlanFilter` has a `LastResetAtBefore = period start` field, `ai-gateway-api/model/quota/quota_plan.go`), so a second update within the same period matches zero rows and does not advance the reset watermark.
 
 ---
 
@@ -574,8 +606,10 @@ Model price:
 ## Chapter Summary
 
 - `QuotaPlan` supports two quota units, `total_token` and `RMB`, suitable for Token-based and cost-based billing respectively. RMB quotas are stored inside Redis as fixed-point integers in 1e-8 yuan and uniformly displayed externally with 4 decimal places.
-- Redis is the single source of truth for quota balances, and OpenAPI queries read Redis directly; both periodic and manual resets are performed via atomic `IncrBy(delta)`, avoiding concurrent overwrites.
-- Periodic reset supports `weekly` (every Monday) and `monthly` (the 1st of each month), triggered every minute by `QuotaResetScheduler`, with the period boundary determined based on `last_reset_at`; manual resets do not update `last_reset_at`, avoiding interference with periodic scheduling.
+- Redis is the single source of truth for quota balances, and OpenAPI queries read Redis directly; manual resets and initial writes use atomic `IncrBy(delta)`, while periodic resets switch to a Lua atomic SET (`ResetToQuotaAtomic`) under distributed-lock protection, eliminating the read-modify-write race.
+- Periodic reset supports `weekly` (every Monday) and `monthly` (the 1st of each month), triggered every minute by `QuotaResetScheduler`, with the period boundary determined based on `last_reset_at`; manual resets do not update `last_reset_at`, avoiding interference with periodic scheduling; `last_reset_at` is updated conditionally as an idempotency backstop against duplicate resets within the same period.
+- In multi-instance deployments, periodic reset is guaranteed to run on only one instance by a Redis distributed lock (key `quota:reset:scheduler:lock`, TTL 5 minutes, watchdog renewal at TTL/3, release guarded by the instance token); `POST /inner-api/v1/quota/trigger-reset` can manually trigger one round of equally protected periodic reset.
+- `quota=0` means a plan with no balance: the Control Plane computes and syncs the balance normally, while the Data Plane treats it as a valid configuration — requests hitting it receive 429 QuotaExhausted, and a missing Redis balance key is treated as exhausted rather than a 500.
 - `RateLimitPolicy` provides three types of limits — TPM, RPM, and concurrency — and rules support exact model names or the `*` default match; during export, policies merge upward along the Entity hierarchy, producing `rate_limit_policies.json` and `api_key_rl_policy_bindings.json`.
 - The Control Plane generates a stable Redis Key for each TPM/RPM rule (`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`), so modifying a rule name or `model` does not reset the counter.
 - RMB quotas support tiered pricing by time of day: the Provider maintains `time_zone` and `tiers`, the Model maintains `tier_prices`, and after export BFE matches the tier based on the request time and selects the corresponding price, falling back to the default price when no tier matches.
@@ -591,8 +625,13 @@ Model price:
 - `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`
 - `ai-gateway-api/model/quotacache/quotacache.go`
 - `ai-gateway-api/model/quotacache/redis.go`
+- `ai-gateway-api/model/quotacache/lock.go`
 - `ai-gateway-api/model/quota/balance_sync.go`
 - `ai-gateway-api/model/quota/scheduler.go`
+- `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`
+- `ai-gateway-api/model/quota/quota_plan.go`
+- `bfe/bfe_modules/mod_ai_token_auth/token_rule_load.go`
+- `bfe/bfe_modules/mod_ai_token_auth/token.go`
 - `ai-gateway-api/model/rate_limit_policy/rate_limit_policy.go`
 - `ai-gateway-api/model/rate_limit_policy/rate_limit_policy_manager.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/data_load.go`

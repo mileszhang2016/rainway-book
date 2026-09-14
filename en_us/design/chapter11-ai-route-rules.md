@@ -199,6 +199,15 @@ The OpenAPI layer additionally requires:
 
 > Note: at save time, `validate.ConditionExpression` performs BFE expression syntax validation on `cond` (internally calling `condition.Build`); expressions with syntax errors cannot be written to the database. The Dashboard or `RouteRuleManager.ExpressionVerify` provides the same pre-validation capability.
 
+### Deletion Protection
+
+AI route rules not only constrain their own writes but also protect the referenced clusters in reverse:
+
+- **Cluster deletion protection**: when a cluster is deleted, `RouteRulesManager.ClusterDeleteChecker` (`ai-gateway-api/model/route_rules/route_rules.go`) scans the `route_rules` table across the Global, Entity, and API-Key levels; if any rule's `targets` or `fallbacks` reference the cluster, the deletion is rejected with `409 Conflict`, and the error message names the referencing rule. The cluster can only be deleted after the related route rules are removed or modified.
+- **Cluster model update protection**: when a cluster's model list is updated, `ClusterModelUpdateChecker` checks whether any removed model is still referenced by a rule's `targets` or `fallbacks` (matched by `cluster_name` + `model`); if so, it likewise returns `409 Conflict`, preventing rules from pointing to models that no longer exist in the cluster.
+
+Both checkers are registered as delete/update hooks of the ClusterManager in `stateful/container/rdb/components.go` and run inside the transaction, keeping the reference check atomic with the delete/update operation.
+
 ### Lifecycle Consistency
 
 AI route rules keep their lifecycle consistent with that of API-Keys / Entities:
@@ -238,8 +247,6 @@ type AiRouteDataExport struct {
 | API-Key | `apikey_<api_key_value>` | The API-Key's key value | `apikey` |
 | Entity | `entity_<entity_name>` | The Entity's name | `entity` |
 | Global | `global_default` | `global` | `global` |
-
-> Note: the `RouteRulesTypeAPIKey` constant has been corrected from `"api_key"` to `"apikey"`, keeping it consistent with the export Key and the BFE-side convention. Historical records with `type="api_key"` should be migrated to `"apikey"`.
 
 ### Binding Order
 

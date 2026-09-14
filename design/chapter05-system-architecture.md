@@ -322,7 +322,7 @@ BFE /reload（热加载）
 - BFE 在多个可用区部署，Conf Agent 独立拉取配置；
 - Dashboard 可独立部署，也可与 AI Gateway API 同容器运行。
 
-详细部署步骤见 [第二十一章 安装部署](../operation/chapter17-installation-and-deployment.md)。
+详细部署步骤见 [第十八章 安装部署](../operation/chapter18-installation-and-deployment.md)。
 
 ---
 

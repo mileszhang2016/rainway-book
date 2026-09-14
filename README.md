@@ -6,18 +6,18 @@ This book is written for **users and developers of the Rainway AI Gateway**. It 
 
 ## Version Notes
 
-This book is continuously updated along with the Rainway AI Gateway releases. The current version of this book corresponds to **Rainway AI Gateway v0.5.0**. Release address: <https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.5.0>.
+This book is continuously updated along with the Rainway AI Gateway releases. The current version of this book corresponds to **Rainway AI Gateway v0.6.0**. Release address: <https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.6.0>.
 
-v0.5.0 includes the following component versions:
+v0.6.0 includes the following component versions:
 
 | Component | Version | Description |
 |---|---|---|
-| AI Gateway API | v0.0.8 | Control Plane |
-| BFE | v1.8.6 | Data Plane |
-| Dashboard | v0.0.8 | Management console (embedded in the API image) |
-| conf-agent | v0.0.6 | Configuration hot reload agent |
-| Log Reader | v1.2.0 | Access log → Kafka |
-| Observability | v0.0.1 | Doris + Grafana observability configuration |
+| AI Gateway API | v0.0.9 | Control Plane |
+| AI Gateway EPP | v0.0.1 | EPP scheduling (new component) |
+| BFE | v1.8.7 | Data Plane |
+| Dashboard | v0.0.9 | Management console (embedded in the API image) |
+| conf-agent | v0.0.7 | Configuration hot reload agent |
+| Log Reader | v1.3.0 | Access log → Kafka |
 
 ## Table of Contents
 
@@ -41,32 +41,35 @@ v0.5.0 includes the following component versions:
 - [Chapter 13: Model Pricing and Cost Accounting Design](./en_us/design/chapter13-model-pricing.md)
 - [Chapter 14: Config Export and Version Control Design](./en_us/design/chapter14-config-export-and-version-control.md)
 - [Chapter 15: Observability Design](./en_us/design/chapter15-observability.md)
-- [Chapter 16: Security Design](./en_us/design/chapter16-security-design.md)
+- [Chapter 16: EPP Scheduling Design](./en_us/design/chapter16-epp-scheduling-design.md)
+- [Chapter 17: Security Design](./en_us/design/chapter17-security-design.md)
 
 ### Operations
-- [Chapter 17: Installation and Deployment](./en_us/operation/chapter17-installation-and-deployment.md)
-- [Chapter 18: Dashboard Basics](./en_us/operation/chapter18-dashboard-basics.md)
-- [Chapter 19: Provider and Model Configuration](./en_us/operation/chapter19-provider-and-model-config.md)
-- [Chapter 20: Cluster and Route Configuration](./en_us/operation/chapter20-cluster-and-route-config.md)
-- [Chapter 21: API-Key and Quota Configuration](./en_us/operation/chapter21-apikey-and-quota-config.md)
-- [Chapter 22: Rate Limit Policy Configuration](./en_us/operation/chapter22-rate-limit-config.md)
-- [Chapter 23: Domain and Certificate Configuration](./en_us/operation/chapter23-domain-and-cert-config.md)
-- [Chapter 24: Configuration Hot Reload and Upgrade](./en_us/operation/chapter24-hot-reload-and-upgrade.md)
+- [Chapter 18: Installation and Deployment](./en_us/operation/chapter18-installation-and-deployment.md)
+- [Chapter 19: Dashboard Basics](./en_us/operation/chapter19-dashboard-basics.md)
+- [Chapter 20: Provider and Model Configuration](./en_us/operation/chapter20-provider-and-model-config.md)
+- [Chapter 21: Cluster and Route Configuration](./en_us/operation/chapter21-cluster-and-route-config.md)
+- [Chapter 22: API-Key and Quota Configuration](./en_us/operation/chapter22-apikey-and-quota-config.md)
+- [Chapter 23: Rate Limit Policy Configuration](./en_us/operation/chapter23-rate-limit-config.md)
+- [Chapter 24: Domain and Certificate Configuration](./en_us/operation/chapter24-domain-and-cert-config.md)
+- [Chapter 25: Configuration Hot Reload and Upgrade](./en_us/operation/chapter25-hot-reload-and-upgrade.md)
+- [Chapter 26: EPP Scheduling Configuration and Operations](./en_us/operation/chapter26-epp-scheduling-operation.md)
 
 ### Implementation
-- [Chapter 25: Code Layout and Startup Flow](./en_us/implementation/chapter25-code-layout-and-startup.md)
-- [Chapter 26: Interface Layer Implementation: OpenAPI and InnerAPI](./en_us/implementation/chapter26-endpoints-implementation.md)
-- [Chapter 27: Model Layer Implementation: The Manager and Storager Pattern](./en_us/implementation/chapter27-model-layer-implementation.md)
-- [Chapter 28: Storage Layer Implementation: DAO and Storage](./en_us/implementation/chapter28-storage-layer-implementation.md)
-- [Chapter 29: Implementing the AI Route Module: mod_ai_route](./en_us/implementation/chapter29-mod-ai-route.md)
-- [Chapter 30: Token Authentication and Quota Module Implementation: mod_ai_token_auth](./en_us/implementation/chapter30-mod-ai-token-auth.md)
-- [Chapter 31: Rate Limit Module Implementation: mod_ai_rate_limit](./en_us/implementation/chapter31-mod-ai-rate-limit.md)
-- [Chapter 32: Request Body Processing Module Implementation: mod_body_process](./en_us/implementation/chapter32-mod-body-process.md)
-- [Chapter 33: Conf Agent Implementation](./en_us/implementation/chapter33-conf-agent-implementation.md)
+- [Chapter 27: Code Layout and Startup Flow](./en_us/implementation/chapter27-code-layout-and-startup.md)
+- [Chapter 28: Interface Layer Implementation: OpenAPI and InnerAPI](./en_us/implementation/chapter28-endpoints-implementation.md)
+- [Chapter 29: Model Layer Implementation: The Manager and Storager Pattern](./en_us/implementation/chapter29-model-layer-implementation.md)
+- [Chapter 30: Storage Layer Implementation: DAO and Storage](./en_us/implementation/chapter30-storage-layer-implementation.md)
+- [Chapter 31: Implementing the AI Route Module: mod_ai_route](./en_us/implementation/chapter31-mod-ai-route.md)
+- [Chapter 32: Token Authentication and Quota Module Implementation: mod_ai_token_auth](./en_us/implementation/chapter32-mod-ai-token-auth.md)
+- [Chapter 33: Rate Limit Module Implementation: mod_ai_rate_limit](./en_us/implementation/chapter33-mod-ai-rate-limit.md)
+- [Chapter 34: Request Body Processing Module Implementation: mod_body_process](./en_us/implementation/chapter34-mod-body-process.md)
+- [Chapter 35: Conf Agent Implementation](./en_us/implementation/chapter35-conf-agent-implementation.md)
+- [Chapter 36: EPP Component Implementation](./en_us/implementation/chapter36-epp-implementation.md)
 
 ### Development
-- [Chapter 34: How to Extend the Rainway AI Gateway](./en_us/develop/chapter34-how-to-extend.md)
-- [Chapter 35: How to Contribute Code to Rainway AI Gateway](./en_us/develop/chapter35-how-to-contribute.md)
+- [Chapter 37: How to Extend the Rainway AI Gateway](./en_us/develop/chapter37-how-to-extend.md)
+- [Chapter 38: How to Contribute Code to Rainway AI Gateway](./en_us/develop/chapter38-how-to-contribute.md)
 
 ### Appendix
 - [Appendix 1: OpenAPI Quick Reference](./en_us/appendix/appendix01-openapi-quick-reference.md)
@@ -82,9 +85,10 @@ See [writing-guide.md](./writing-guide.md) (currently available in Chinese only)
 
 - `ai-gateway-api/`: Control Plane core component
 - `bfe/`: Data Plane forwarding engine
+- `ai-gateway-epp/`: EPP scheduling component (based on llm-d; provides backend selection for EPP-mode Clusters via ext_proc)
 - `conf-agent/`: Configuration agent
 - `ai-gateway-web/`: Management console (Dashboard) frontend
-  - Detailed console usage documentation: <https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.8/docs/zh-cn>
+  - Detailed console usage documentation: <https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.9/docs/zh-cn>
 
 ## License
 

@@ -9,6 +9,8 @@ Through this chapter, readers will understand:
 - The division of responsibilities and route organization between the management-plane OpenAPI and the data-plane InnerAPI;
 - How the unified `xreq.Endpoint` abstraction simplifies interface registration, authorization, and middleware handling;
 - The implementation of the global container (`stateful/container`) and manual dependency injection;
+- The write mechanism, masking rules, and audit value of the operation log module;
+- The 409 Conflict error convention for resource dependency conflicts;
 - The complete flow from `main.go` to HTTP service startup.
 
 ---
@@ -26,7 +28,7 @@ The relationship between the AI Gateway API and its surrounding components in th
 | Conf Agent | Configuration agent | Polls InnerAPI, pulls the latest configuration, and triggers BFE hot reload |
 | Service Controller | Service discovery | Syncs backend service instance information to the Control Plane |
 
-The current functional scope of the AI Gateway API covers: API-Key / Entity / Entity-Type management, Provider and Cluster management, model pricing management, QuotaPlan and RateLimitPolicy management, AI routing rule management, certificate and extra file management, authentication and authorization, and configuration export for the Data Plane.
+The current functional scope of the AI Gateway API covers: API-Key / Entity / Entity-Type management, Provider and Cluster management, model pricing management, QuotaPlan and RateLimitPolicy management, AI routing rule management, certificate and extra file management, authentication and authorization, configuration operation log auditing, and configuration export for the Data Plane.
 
 ### Boundary Between Control Plane and Data Plane
 
@@ -103,6 +105,7 @@ Key packages are as follows:
 | `model/quota/` | QuotaPlan, BalanceSync, QuotaResetScheduler |
 | `model/rate_limit_policy/` | RateLimitPolicy business logic and export |
 | `model/route_rules/` | Global / Entity / API-Key three-level AI routing rules |
+| `model/ioperlog/` | Operation log Manager, sensitive-field masking, and change summary diff_keys computation |
 | `model/imods/` | Export of module configurations such as mod-api-key, mod-body-process, and AI routing |
 | `model/itxn/` | Transaction abstraction interface `TxnStorager` |
 | `model/shared/` | Cross-package shared types and generic Storager interfaces |
@@ -129,6 +132,7 @@ Key packages are as follows:
 | `storage/rdb/rate_limit_policy/` | `model/rate_limit_policy` | `rate_limit_policies` |
 | `storage/rdb/route_conf/` | `model/iroute_conf` | `domains`, `route_*_rules` |
 | `storage/rdb/route_rules/` | `model/shared`, `model/route_rules` | `route_rules` |
+| `storage/rdb/ioperlog/` | `model/ioperlog` | `operation_logs` |
 | `storage/rdb/provider/` | `model/iprovider` | `providers` |
 
 ### Inter-Layer Interaction
@@ -214,6 +218,7 @@ OpenAPI v1 is responsible for exposing manageable resources. Typical modules inc
 | `route_tables` | `/route-tables` | Route table list |
 | `certificate` | `/certificates` | Certificate management |
 | `auth` | `/auth`, `/meta` | Users, Session Key, Token |
+| `operation_log` | `/operation-logs` | Configuration operation log queries |
 
 ### Main InnerAPI v1 Export Interfaces
 
@@ -230,6 +235,7 @@ InnerAPI v1 exports the configurations persisted by the Control Plane by topic, 
 | `/configs/mod-body-process` | Export request body processing configuration |
 | `/configs/rate-limit-policy` | Export rate limit policy configuration |
 | `/configs/ai-route` | Export AI routing configuration |
+| `/quota/trigger-reset` | Manually trigger a quota period reset (see the quota chapter) |
 
 All InnerAPI export interfaces support the `version` query parameter and implement incremental synchronization via `model/iversion_control`: when the requested version matches the current version, `Data: nil` is returned to avoid redundant distribution.
 
@@ -252,6 +258,115 @@ On top of this, the OpenAPI route subtree additionally mounts `McProductProbe` a
 | `MCCors` | Handles CORS preflight and response headers |
 | `McProductProbe` | Parses the product-line context from request headers |
 | `McUserProbe` | Parses user identity from Session Key or Token and performs permission checks |
+
+---
+
+## Operation Log Module and the 409 Conflict Convention
+
+### Positioning of the Operation Log Module
+
+The operation log module records all configuration write operations on the management plane (OpenAPI), providing traceable auditability for configuration changes. The module resides in `model/ioperlog/` and is designed as follows:
+
+- **Manager design**: `OperationLogManager` implements the two-level interfaces `OperationLogRecorder` (`Record`) and `OperationLogManagerInterface` (including `QueryLogs` and `Close`). Each business Manager injects the recorder via `SetOperationLogManager` and depends only on the minimal `OperationLogRecorder` interface, avoiding a reverse dependency on the query capability;
+- **Storage implementation**: `storage/rdb/ioperlog/operation_log.go` implements `BatchCreate` (batch insert) and `List` (filtered query with pagination). The DAO counterpart is `storage/rdb/internal/dao/table_operation_logs.go`;
+- **Query interface**: `endpoints/openapi_v1/operation_log/list.go` exposes `GET /open-api/v1/operation-logs`, authorized by `iauth.FeatureOperationLog + ActionReadAll`, so only callers with the full `ScopeSystem` permission can query it.
+
+### Asynchronous Buffered Write Mechanism
+
+`OperationLogManager` uses an "asynchronous buffer + batch persistence" write path, so that log writes do not amplify latency on management interfaces:
+
+```
+Business Manager ──Record()──▶ buffered channel (default 4096 entries)
+                                │
+                                ▼
+                    batchWorker: flush when 200 entries accumulate or 5s elapses
+                                │ BatchCreate
+                                ▼
+                    Retry 3 times on failure (100ms/200ms/300ms backoff)
+```
+
+Key parameters and behaviors (`model/ioperlog/manager.go`):
+
+| Parameter | Default | Description |
+|------|--------|------|
+| Buffer capacity | 4096 | `NewOperationLogManager(storager, bufferSize)`; the default is used when `bufferSize <= 0` |
+| Batch size | 200 | Flush as soon as the batch is full |
+| Flush interval | 5s | Periodic forced flush |
+| Retry count | 3 | Backoff increases by 100ms per attempt |
+| Overflow strategy | Sync fallback | When the buffer is full, `OverflowStrategySync` blocks the caller and writes synchronously by default; `OverflowStrategyDiscard` is also available to drop the log with a warning |
+
+On `Close`, the buffer is drained within a 500ms timeout so that buffered logs are persisted before exit.
+
+### Log Content and Correlation
+
+The fields of `OperationLogEntry` fall into four groups: operator, resource, result, and request context. Two design points deserve explanation:
+
+1. **Correlation with access logs**: `log_id` is identical to the `LogID` in the access log. The context extractor `operationLogContextExtractor` (`stateful/container/rdb/components.go`) pulls `LogID`, request path, method, ClientIP, and UserAgent from `xreq.GetRequestInfo(ctx)` into the entry, so operation logs can be cross-searched with access logs and deduplicated by `log_id`;
+2. **Operator extraction**: the operator is extracted from `iauth.MustGetVisitor(ctx)`; `operator_type` is `0` (user, taking `User.ID`) or `1` (token, taking `Token.ID`).
+
+Failed operations are also recorded: `status=2`, and `error_msg` is truncated to 1024 characters by `TruncateErrorMessageDefault` (appending `...` when truncated), aligned with the `error_msg varchar(1024)` column in the DDL.
+
+### Change Summary and Masking
+
+`change_summary` (a `mediumtext` column storing JSON) records before/after snapshots of the key fields involved in a change, constructed by `BuildChangeSummary` in `model/ioperlog/change_summary.go`:
+
+- `before` / `after`: field maps before and after the change, both passed through `MaskSensitiveFields` first;
+- `diff_keys`: present only on update actions. It lists the keys that are **newly added in after or whose values changed relative to before** (keys that exist only in before are excluded, so partial update requests do not produce false-positive diffs), stored in sorted order.
+
+Masking rules (`model/ioperlog/mask.go`) match lower-cased key names and recurse into nested maps:
+
+| Key name | Masked result |
+|------|----------|
+| `password` / `secret` / `session_key` / `private_key` (and their variants without underscores) | `******` |
+| `api_key` / `apikey` / `key` | First and last 4 characters kept, the middle replaced with `****`; fully masked when the length is 8 or less |
+| `certificate` / `cert` / `cert_body` / `private_key_body` | `[已更新]` |
+
+### Coverage
+
+The resources and actions that actually produce operation logs are as follows:
+
+| Resource | Actions |
+|------|------|
+| entities / entity-types | create / update / delete |
+| api-keys | create / update / delete |
+| clusters (POST/PUT/DELETE) | create / update / delete |
+| routes, global-route-rules (PUT) | update; updates to the Global route table are recorded as `resource_type=route, resource_id=global` |
+| certificates | create / update / delete |
+| quota-plans | create / update / delete / reset (quota balance reset) |
+| model-prices | create / update / delete / import (full-table import) |
+| auth/users (including session reset) | create / update / delete / reset |
+| auth/tokens | create / delete |
+
+Domains and rate_limit_policy currently do not produce operation logs.
+
+### Query Interface
+
+`GET /open-api/v1/operation-logs` supports the following query parameters (bound via `xreq.BindForm`):
+
+| Parameter | Description |
+|------|------|
+| `operator_name` | Operator name |
+| `action` / `resource_type` / `resource_id` / `resource_name` / `resource_parent_id` | Resource-dimension filters |
+| `status` | `1` = success, `2` = failed |
+| `start_time` / `end_time` | Unix timestamp in seconds |
+| `page` / `page_size` | Defaults 1 / 20; `page_size` capped at 100 |
+
+The response is `{list, pagination:{page, page_size, total}}`; each log entry carries `id, log_id, operator_type, operator_id, operator_name, action, resource_type, resource_id, resource_name, resource_parent_id, status, error_msg, change_summary, request_path, request_method, client_ip, user_agent, created_at` (with `created_at` as a Unix timestamp in seconds).
+
+Another detail on the query path: the DAO function `TOperationLogCount` removes `_limit` and `_orderby` from the where map before constructing the count SQL, so pagination parameters do not pollute `COUNT(*)` and `total` always reflects the full match count on any page.
+
+### The 409 Conflict Convention
+
+In `lib/xerror`, `WrapConflictErrorWithMsg` marks an error as `Model.Conflict`, which `resolve.go` maps uniformly to HTTP **409 Conflict**. It expresses the business semantics of "the resource is referenced by other resources and the operation has a dependency conflict":
+
+- A BFE cluster cannot be deleted while referenced by the `lb_matrix` (scheduler) of any AI cluster (`endpoints/openapi_v1/bfe_cluster/delete.go` calls `ClusterManager.IsBFEClusterUsed`; this previously returned 422);
+- A Pool cannot be deleted while referenced by a BFECluster / SubCluster;
+- A certificate cannot be deleted while referenced by a Product;
+- A product cluster cannot be deleted while referenced by routing rules (advance / basic);
+- A cluster cannot be deleted while referenced as the target / fallback of AI routing rules; updating cluster models also fails when they are referenced by rule target / fallback;
+- An Entity with children cannot be deleted.
+
+With the introduction of 409, 500 is restored as the fallback for unknown errors, while 422 remains reserved for parameter errors (`etParam`), so the semantics are no longer conflated with dependency conflicts.
 
 ---
 
@@ -356,6 +471,7 @@ var (
 `rdb.Init()` completes initialization in the following order:
 
 1. Transaction and basic Storage: `TxnStoragerSingleton`, and basic/cluster/auth Storages;
+2. Operation logs: `OperationLogStorager` and `OperationLogManager` (with the context extractor `operationLogContextExtractor`), initialized early so that it can be injected into all subsequent business Managers;
 2. Basic Managers: `ExtraFileManager`, `VersionControlManager`, `BFEClusterManager`, `CertificateManager`, `ProductManager`, `AIRouteRuleManager`, `RouteRuleManager`, etc.;
 3. Cluster-related Managers: `ClusterManager`, `SubClusterManager`, `DomainManager`, `PoolManager`;
 4. Authentication and authorization Managers: `AuthenticateManager`, `AuthorizeManager`;
@@ -566,6 +682,8 @@ When the local version matches the remote one, `ConfigExport` returns empty data
 - OpenAPI faces administrators and the Dashboard, and is responsible for resource configuration; InnerAPI faces BFE and Conf Agent, and is responsible for configuration export and incremental synchronization.
 - `xreq.Endpoint` unifies the description, registration, and authorization of interfaces, reducing boilerplate code in interface development.
 - `stateful/container` provides a global singleton container, and `stateful/container/rdb/components.go:Init()` performs manual dependency injection in dependency order.
+- The operation log module (`model/ioperlog`) records management-plane write operations via asynchronous buffering and batch persistence; `log_id` correlates with access logs, and sensitive fields are masked before being stored in the `operation_logs` table.
+- Resource dependency conflicts uniformly return 409 Conflict (`xerror.WrapConflictErrorWithMsg`), while 500 is restored as the fallback for unknown errors.
 - The startup flow begins with configuration loading in `main.go`, goes through database initialization, dependency injection, and route registration, and finally starts the HTTP service via `graceful.Run`.
 
 ---
@@ -576,5 +694,7 @@ When the local version matches the remote one, `ConfigExport` returns empty data
 - `ai-gateway-api/design-docs/sys-design/接口层设计文档.md`
 - `ai-gateway-api/design-docs/sys-design/模型层设计文档.md`
 - `ai-gateway-api/design-docs/sys-design/存储层设计文档.md`
+- `ai-gateway-api/design-docs/sys-design/details/操作日志模块.md`
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/operation-logs.md`
 - `ai-gateway-api/AGENTS.md`
 - `ai-gateway-api/conf/ai_gateway_api.toml`

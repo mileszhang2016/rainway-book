@@ -7,6 +7,8 @@
 - 壬远AI网关如何通过 `QuotaPlan` 为 API-Key 与 Entity 分配 Token 或 RMB 两种单位的配额；
 - 为什么把 **Redis** 作为配额余额的唯一真实来源，以及管理面如何通过直接读取 Redis 查询实时余额；
 - 自然周、自然月的周期重置逻辑，以及 `last_reset_at` 在重置边界判断中的作用；
+- 周期重置如何通过 Redis 分布式锁在多实例部署下互斥执行，以及原子 SET 与条件更新如何保证重置幂等；
+- `quota=0`（无余额计划）在控制面与数据面两侧的一致语义；
 - `RateLimitPolicy` 的 TPM、RPM、并发限制模型，以及策略如何按 Entity 层级向上合并并导出到 BFE；
 - RMB 配额如何结合 Provider 时段模板与 Model 分时段价格实现高峰/空闲差异化计费；
 - 典型的配额与限流配置示例。
@@ -57,6 +59,15 @@ CREATE TABLE `quota_plans` (
 | `reset_period` | 重置周期，可选 `never`、`weekly`、`monthly`。 |
 | `last_reset_at` | 上次重置时间，周期重置据此判断是否跨越自然周/月边界。 |
 
+### quota=0 的语义：无余额计划
+
+`total_token` 与 `RMB` 两种单位都允许 `quota = 0`，表示"无余额计划"：配置本身合法，但绑定该计划的请求会因余额耗尽被拒绝。这与负值有本质区别——负值是非法配置，会在配置加载阶段直接报错；而 `0` 是一个有意义的业务取值（例如临时冻结某个计划，但不解绑其与 API-Key / Entity 的绑定关系）。两侧的处理机制如下：
+
+- **控制面**：`QuotaPlanManager.adjustQuota`（`ai-gateway-api/model/quota/quota_plan_manager.go`）在配额变化时按 `remaining = max(0, newQuota - used)` 计算并把差额写入 Redis。配额更新为 0 时 remaining 随之清零、Redis 余额同步为 0。
+- **数据面 BFE**：
+  - 配置加载阶段，`token_rule_load.go` 的 `quotaPlanCheck` 只拒绝 `Quota < 0` 的配置，`quota=0` 作为合法配置正常加载，每个无余额计划独立生效，不影响同产品（Product）下的其他计划；
+  - 请求阶段，`QuotaPlan.HasBalance`（`bfe/bfe_modules/mod_ai_token_auth/token.go`）判定余额：Redis 余额 key 存在时按值判断；key 缺失（`redis_client.IsKeyNotFound`）时视为余额 0，同样返回"无余额"，命中该计划的请求返回 429 QuotaExhausted，而不是内部错误。
+
 ### 两种单位的适用场景
 
 - **`total_token`**：适用于按 Token 计费的模型（如 OpenAI、Anthropic）。管理员可以直接限制每月可用的输入+输出 Token 总量。
@@ -84,10 +95,10 @@ flowchart TD
     D[AI Gateway API<br/>控制面] -->|OpenAPI 查询余额| B
     E[QuotaResetScheduler<br/>每分钟触发] -->|ResetExpiredBalances| D
     D -->|更新 last_reset_at| F[(quota_plans)]
-    D -->|SetRemaining / ResetToQuota| B
+    D -->|SetRemaining / ResetToQuota / ResetToQuotaAtomic| B
 ```
 
-在该架构中，`QuotaCache` 接口（定义于 `ai-gateway-api/model/quotacache/quotacache.go`，实现于 `ai-gateway-api/model/quotacache/redis.go`）封装了对 Redis 的所有操作，包括 `GetRemaining`、`BatchGetRemaining`、`SetRemaining`、`ResetToQuota` 和 `DeleteKeys`。
+在该架构中，`QuotaCache` 接口（定义于 `ai-gateway-api/model/quotacache/quotacache.go`，实现于 `ai-gateway-api/model/quotacache/redis.go`）封装了对 Redis 的所有操作，包括 `GetRemaining`、`BatchGetRemaining`、`SetRemaining`、`ResetToQuota`、`ResetToQuotaAtomic` 和 `DeleteKeys`。
 
 ### Redis Key 规则
 
@@ -109,11 +120,15 @@ Key 不再拼接 `KeyCreateAt` 时间戳，生命周期与 API-Key / Entity 保�
 
 ### 原子扣减与归零策略
 
-无论是周期重置还是手动重置，系统都使用原子 `IncrBy(delta)` 而非 `SET 0`。原因如下：
+不同场景下系统采用两种不同的 Redis 写入策略。
+
+**增量调整（手动重置 / 初始余额写入）**：`SetRemaining` 与 `ResetToQuota` 使用原子 `IncrBy(delta)` 而非 `SET`：
 
 - 并发场景下，`SET` 会覆盖其他请求刚刚扣减的计数，导致配额透支；
 - `IncrBy(delta)` 基于当前值做增量调整，可与其他扣减操作串行化；
 - Key 不存在时直接 `IncrBy(quotaTotal)` 即可完成初始化。
+
+**原子 SET（周期重置）**：周期重置使用 `ResetToQuotaAtomic`，通过 Lua 脚本执行 `redis.call('set', KEYS[1], ARGV[1])` 把余额直接置为配额总量。`IncrBy(delta)` 需要先读出当前值、再计算差值后写入，读与写之间存在时间窗：若期间有请求完成扣减，基于旧值算出的 delta 会使最终结果偏离配额总量；原子 SET 不依赖当前值，最终结果恒等于配额总量，只取决于 SET 与并发扣减的先后次序，从而消除了 read-modify-write 竞争。配合分布式锁（见下文）把全局重置收敛到单一实例后，SET 与请求链路扣减的竞争窗口也极小。
 
 ---
 
@@ -159,18 +174,26 @@ func (m *BalanceSyncManager) shouldResetByPeriod(
 ```mermaid
 sequenceDiagram
     participant S as QuotaResetScheduler
+    participant L as Redis 分布式锁
     participant M as BalanceSyncManager
     participant DB as quota_plans
     participant R as Redis
 
-    S->>M: 每分钟触发 ResetExpiredBalances
-    M->>DB: 查询 reset_period=weekly/monthly 且非无限配额的计划
-    loop 每个计划
-        M->>M: shouldResetByPeriod(last_reset_at, now)
-        alt 需要重置
-            M->>R: IncrBy(delta) 将剩余量调整为 quota
-            M->>DB: 更新 last_reset_at = now()
+    S->>L: Acquire(quota:reset:scheduler:lock, token, TTL=5min)
+    alt 加锁成功
+        S->>S: 启动看门狗按 TTL/3 续期
+        S->>M: 每分钟触发 ResetExpiredBalances
+        M->>DB: 查询 reset_period=weekly/monthly 且非无限配额的计划
+        loop 每个计划
+            M->>M: shouldResetByPeriod(last_reset_at, now)
+            alt 需要重置
+                M->>R: ResetToQuotaAtomic 原子 SET 余额为 quota
+                M->>DB: 条件更新 last_reset_at=now（LastResetAtBefore=周期起点）
+            end
         end
+        S->>L: Release（校验 instance token 后删除）
+    else 加锁失败
+        S->>S: 跳过本轮重置
     end
 ```
 
@@ -183,9 +206,18 @@ sequenceDiagram
 
 手动重置调用 `QuotaPlanManager.ResetBalance(..., updateLastResetAt=false)`，即只重置 Redis 余额，不更新 `last_reset_at`，避免干扰周期调度器对自然周/月的判断。若传入新的 `quota`，则同时更新 `quota_plans.quota`。
 
-### 多实例部署说明
+### 手动触发周期重置（Inner API）
 
-当前 `QuotaResetScheduler` 在每个 AI Gateway API 实例中独立启动。多实例部署时，所有实例都会尝试执行 `ResetExpiredBalances()`，存在重复重置的风险。由于重置基于 Redis 的 `IncrBy(delta)` 操作，重复执行通常不会导致数据错误（幂等），但会产生不必要的日志和 Redis 操作。后续如需严格避免重复执行，可引入 Redis 分布式锁或单实例调度器。
+除按对象重置外，控制面还提供 Inner API `POST /inner-api/v1/quota/trigger-reset`（`ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`），手动触发一次与定时任务完全相同的周期重置流程：同样经过分布式锁保护、执行 `ResetExpiredBalances`，但不影响定时任务的下次执行时间。接口同步返回 `{"status":"ok"}`，主要供内部运维使用。
+
+### 多实例部署与分布式锁
+
+`QuotaResetScheduler` 在每个 AI Gateway API 实例中独立启动，多实例部署时所有实例都会尝试执行重置。调度器通过 Redis 分布式锁保证同一时刻仅一个实例真正执行 `ResetExpiredBalances()`：
+
+- **加锁**：每轮先通过 `quotacache.DistributedLock`（`ai-gateway-api/model/quotacache/lock.go`）申请锁，锁 key 为 `quota:reset:scheduler:lock`，TTL 5 分钟；加锁失败（其他实例持有）则跳过本轮，等待下一轮再竞争。
+- **令牌与释放**：每个实例启动时生成唯一的 `instanceToken`（UUID），加锁时写入锁 value；释放锁时通过 Lua 脚本校验 `GET == token` 后才 `DEL`，避免持锁实例宕机后锁被其他实例误删，也避免过期后旧持有者误删新持有者的锁。
+- **看门狗续期**：持锁期间启动看门狗协程，按 TTL/3（约 100 秒）周期对锁执行 `EXPIRE` 续期，防止重置耗时超过 TTL 导致锁提前过期、其他实例中途抢锁造成并发重置。
+- **幂等兜底**：即使锁意外失效出现同周期重复重置，原子 SET 本身幂等；同时 `last_reset_at` 采用条件更新（`QuotaPlanFilter` 带有 `LastResetAtBefore = 周期起点` 字段，`ai-gateway-api/model/quota/quota_plan.go`），同周期内第二次更新的影响行数为 0，不再推进重置水位。
 
 ---
 
@@ -574,8 +606,10 @@ Model 价格：
 ## 本章小结
 
 - `QuotaPlan` 支持 `total_token` 与 `RMB` 两种配额单位，分别适用于按 Token 计费和按成本计费场景。RMB 配额在 Redis 内部以 1e-8 元定点整数存储，对外统一按 4 位小数展示。
-- Redis 是配额余额的唯一真实来源，OpenAPI 查询直接读取 Redis；周期重置与手动重置都通过原子 `IncrBy(delta)` 完成，避免并发覆盖。
-- 周期重置支持 `weekly`（每周一）和 `monthly`（每月 1 日），由 `QuotaResetScheduler` 每分钟触发，基于 `last_reset_at` 判断周期边界；手动重置不更新 `last_reset_at`，避免干扰周期调度。
+- Redis 是配额余额的唯一真实来源，OpenAPI 查询直接读取 Redis；手动重置/初始写入使用原子 `IncrBy(delta)`，周期重置在分布式锁保护下改用 Lua 原子 SET（`ResetToQuotaAtomic`），消除 read-modify-write 竞争。
+- 周期重置支持 `weekly`（每周一）和 `monthly`（每月 1 日），由 `QuotaResetScheduler` 每分钟触发，基于 `last_reset_at` 判断周期边界；手动重置不更新 `last_reset_at`，避免干扰周期调度；`last_reset_at` 采用条件更新作为同周期重复重置的幂等兜底。
+- 多实例部署下，周期重置由 Redis 分布式锁（key `quota:reset:scheduler:lock`，TTL 5 分钟，按 TTL/3 看门狗续期，instance token 校验释放）保证仅一个实例执行；`POST /inner-api/v1/quota/trigger-reset` 可手动触发一次同等保护的周期重置。
+- `quota=0` 表示无余额计划：控制面正常计算并同步余额，数据面将其视为合法配置，命中请求返回 429 QuotaExhausted，Redis 余额 key 缺失视为耗尽而非 500。
 - `RateLimitPolicy` 提供 TPM、RPM、并发数三类限制，规则支持具体模型名或 `*` 默认匹配；导出时按 Entity 层级向上合并，生成 `rate_limit_policies.json` 与 `api_key_rl_policy_bindings.json`。
 - 控制面为每条 TPM/RPM 规则生成稳定的 Redis Key（`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`），修改规则名或 `model` 不会导致计数器重置。
 - RMB 配额支持分时段定价：Provider 维护 `time_zone` 与 `tiers`，Model 维护 `tier_prices`，导出后由 BFE 根据请求时刻匹配 tier 并选择对应价格，未命中时 fallback 到默认价格。
@@ -591,8 +625,13 @@ Model 价格：
 - `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`
 - `ai-gateway-api/model/quotacache/quotacache.go`
 - `ai-gateway-api/model/quotacache/redis.go`
+- `ai-gateway-api/model/quotacache/lock.go`
 - `ai-gateway-api/model/quota/balance_sync.go`
 - `ai-gateway-api/model/quota/scheduler.go`
+- `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`
+- `ai-gateway-api/model/quota/quota_plan.go`
+- `bfe/bfe_modules/mod_ai_token_auth/token_rule_load.go`
+- `bfe/bfe_modules/mod_ai_token_auth/token.go`
 - `ai-gateway-api/model/rate_limit_policy/rate_limit_policy.go`
 - `ai-gateway-api/model/rate_limit_policy/rate_limit_policy_manager.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/data_load.go`

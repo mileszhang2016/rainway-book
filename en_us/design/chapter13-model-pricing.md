@@ -99,7 +99,9 @@ The keys allowed in `prices` and `tier_prices.<tier>` include:
 | `cache_creation_input_token_cost` | Cost of cache-creation input Tokens |
 | `input_cost_per_token_above_200k_tokens` | Input cost above 200k Tokens |
 | `output_cost_per_token_above_200k_tokens` | Output cost above 200k Tokens |
-| `output_cost_per_image` | Cost per output image |
+| `output_cost_per_image` | Cost per output image (image_generation mode) |
+| `input_cost_per_image_token` | Cost per image input Token (available in both chat and image_generation modes) |
+| `output_cost_per_video` | Cost per generated video (video_generation mode) |
 | `output_cost_per_pixel` | Output cost per pixel |
 | `input_cost_per_audio_per_second` | Input cost per second of audio |
 | `input_cost_per_video_per_second` | Input cost per second of video |
@@ -107,11 +109,11 @@ The keys allowed in `prices` and `tier_prices.<tier>` include:
 | `ocr_cost_per_page` | OCR cost per page |
 | `output_cost_per_character` | Output cost per character |
 
-The current version primarily uses Token-based price fields; the remaining fields are reserved for future multimodal billing.
+The current version has enabled Token-based, cache, image, and video billing price fields; the remaining fields are reserved for future multimodal billing. `input_cost_per_image_token` and `output_cost_per_video` are two price keys configurable at both the global `prices` level and the `tier_prices.<tier>` level; they default to 0 when absent (meaning that dimension is not billed) and cause a configuration load error when negative.
 
 ### Price Precision
 
-Price fields in `prices` and `tier_prices` are floating-point numbers; 8 or more decimal digits are supported, e.g. `0.0000015`, `0.00000075`. To prevent the default JSON encoder from outputting very small values in scientific notation (e.g. `1.5e-6`), both AI Gateway API and BFE implement a custom `MarshalJSON` for `PriceMap` / `TierPriceMap`, forcing decimal representation. This representation only affects the readability of the configuration text; it does not change the `float64` value semantics nor affect BFE's internal fixed-point integer deduction logic.
+Price fields in `prices` and `tier_prices` are `float64` floating-point numbers (about 15 significant digits), which in practice support far more than 8 decimal digits of precision, e.g. `0.0000015`, `7.6234102728e-08` (catalog prices with 10–12 decimal digits are represented losslessly). Both the input side (OpenAPI request bodies, `model-list.yaml` import) accept either decimal notation or scientific notation, which are equivalent; the output side is serialized by the standard encoder, where very small values appear in scientific notation (e.g. `1.5e-6`). Both forms are valid JSON numbers with unchanged numeric semantics. The validation rules are: the price must be non-negative, and `|price × 1e8| < 2^53` (about 9e15), ensuring that downstream BFE floating-point billing does not overflow.
 
 ---
 
@@ -275,12 +277,11 @@ AIConf.ModelTable
        │
        ▼
 ┌──────────────┐
-│ Convert prices │───  prices / tier_prices converted to integer units
-│ to fixed point │
+│ Validate prices │───  non-negative validation; prices stay float64, no fixed-point conversion
 └──────────────┘
 ```
 
-BFE stores prices as fixed-point integers to avoid errors introduced by floating-point arithmetic at runtime. All price fields are scaled by a unified precision before participating in deduction calculations.
+After loading, BFE keeps prices as `float64` (RMB per token) and performs no fixed-point pre-conversion. Validation is performed on each model's `prices` and each tier's `tier_prices.<tier>`: all price keys (including `input_cost_per_image_token`, `output_cost_per_video`, etc.) default to 0 when absent, and a negative value fails the entire configuration load with the specific model name and price key reported, preventing erroneous prices from entering runtime. At billing time, each line item is converted via `quota.CalcCostUnits(usage, price)` (i.e. `round(usage × price × 1e8)`) into a 1e-8-RMB fixed-point integer and accumulated in int64; floating point participates only in the single multiplication per line item, avoiding floating-point accumulation errors.
 
 ### Runtime Tier Matching
 
@@ -321,28 +322,80 @@ The cost calculation flow is as follows:
 Request ends
    │
    ▼
-Parse TokenUsage
-   ├── prompt_tokens
-   ├── completion_tokens
-   └── cached_tokens
+Parse TokenUsage (uniformly extracted by the protocol adapter layer bfe_model_protocol)
+   ├── PromptTokens (total input, including cache read/write and image/audio input)
+   ├── CompletionTokens
+   ├── CacheReadTokens / CacheWriteTokens
+   ├── AudioInputTokens / AudioOutputTokens
+   ├── ImageInputTokens / ImageCount
+   └── VideoCount
    │
    ▼
 Match ActiveTierName
    │
-   ├── Tier matched ──► take tier_prices.<tier> prices
+   ├── Tier matched ──► take tier_prices.<tier> prices, falling back to default prices for missing keys
    └── No tier match ──► take prices default prices
    │
    ▼
-Calculate separately
-   ├── Cache-hit input = cached_tokens × cache_read_input_token_cost
-   ├── Regular input   = (prompt_tokens - cached_tokens) × input_cost_per_token
-   └── Output          = completion_tokens × output_cost_per_token
+Calculate per request mode (calcChatCost, etc., each line item rounded via usage × price × 1e8, then accumulated as integers)
    │
    ▼
 Accumulate into total request cost, used for RMB quota deduction and log output
 ```
 
-If a tier does not define a specific price key, it automatically falls back to the corresponding key in the default `prices`. After `TokenUsage` adds the `CachedTokens` field, cache-hit and cache-miss input Tokens can be priced separately.
+#### Chat Billing Formula
+
+`calcChatCost` (`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`) starts from the total input Tokens and splits them into billing dimensions:
+
+```
+normalInput = PromptTokens                          // when no cache price is configured
+            = max(PromptTokens - CacheRead - CacheWrite, 0)   // when a cache price is configured
+
+When input_cost_per_image_token is configured:
+    imageInputTokens = min(ImageInputTokens, normalInput)
+    normalInput -= imageInputTokens
+
+When an audio input price is configured:
+    audioInputTokens = min(AudioInputTokens, normalInput)
+    normalInput -= audioInputTokens
+
+When an audio output price is configured:
+    normalOutput = CompletionTokens - AudioOutputTokens
+    (audioOutputTokens capped at CompletionTokens)
+
+cost = normalInput  × input_cost_per_token
+     + CacheRead    × cache_read_input_token_cost
+     + CacheWrite   × cache_creation_input_token_cost
+     + imageInput   × input_cost_per_image_token
+     + audioInput   × input_cost_per_audio_token
+     + normalOutput × output_cost_per_token
+     + audioOutput  × output_cost_per_audio_token
+```
+
+When none of the cache / audio / image refinement price keys is configured, it falls back to the legacy formula `PromptTokens × input_cost_per_token + CompletionTokens × output_cost_per_token`, keeping the behavior of old configurations unchanged.
+
+#### Anthropic Usage Semantics Normalization
+
+In the Anthropic protocol, `input_tokens` only counts fresh (cache-missing) Tokens and excludes `cache_read_input_tokens` and `cache_creation_input_tokens`, which differs from the OpenAI semantics of `prompt_tokens` (total input). This normalization is performed at the parsing layer (`ParseAnthropicUsageFields` in `bfe/bfe_model_protocol/utils/usage_parse.go`):
+
+```
+PromptTokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+```
+
+This makes the downstream "total input minus cache" splitting logic identical for OpenAI and Anthropic. In streaming responses, the usage of the `message_start` event is nested under `message.usage`, which the parsing layer also accepts; the `message_delta` event carries only the final output tokens, and the billing module retains the prompt/cache fields parsed at the `message_start` stage, avoiding cache Token loss or double counting. Cache-creation Tokens are billed exactly once at `cache_creation_input_token_cost`, preventing fresh tokens from being truncated to 0 and never billed in high cache-hit scenarios.
+
+#### Other Request Modes
+
+Billing is also defined for two more request modes:
+
+| Mode | Path prefix | Billing formula |
+|------|-------------|-----------------|
+| `responses` | `/v1/responses` | Reuses chat billing (`calcResponsesCost` delegates directly to `calcChatCost`) |
+| `video_generation` | `/v1/video/generations` | `VideoCount × output_cost_per_video` |
+
+`VideoCount` is taken from `usage.video_count` in the response, falling back to `data.#` (number of generated results); the authentication stage also pre-reads the `n` field of the request body as a fallback (taking 1 when `n <= 0`) to prevent under-billing when the response carries no usage. For image generation mode (`image_generation`), the cost is `ImageCount × output_cost_per_image + ImageInputTokens × input_cost_per_image_token`, where `ImageInputTokens` comes from `usage.input_token_details.image_tokens`, falling back to `usage.image_input_tokens`.
+
+If a tier does not define a specific price key, it automatically falls back to the corresponding key in the default `prices`. Fields in `TokenUsage` such as `CacheReadTokens`, `ImageInputTokens`, and `VideoCount` allow cache hits, image input, and video generation to be priced separately.
 
 ### Backward Compatibility
 
@@ -351,6 +404,8 @@ The tiered pricing design maintains backward compatibility with fixed pricing:
 - When `time_zone` / `tiers` are not set on `/providers`, `ModelTable.TimeZone` / `ModelTable.Tiers` are empty, and behavior is identical to fixed pricing;
 - When `tier_prices` is not set on `/model-prices`, billing always uses the default `Prices`;
 - When a tier is matched but a price key is not configured for that tier, it automatically falls back to the default `Prices`;
+- In chat billing, when none of the cache / audio / image refinement price keys is configured, it falls back to the legacy formula, so existing fixed-price configurations require no changes;
+- When `input_cost_per_image_token` / audio prices are not configured, image/audio input Tokens are billed as regular input Tokens, consistent with the old version;
 - `TokenUsage.UsedCost`, the Lua deduction logic, and Redis fixed-point number storage require no changes.
 
 This compatibility allows existing deployments to enable tiered pricing smoothly, without a one-time full configuration adjustment.
@@ -492,7 +547,9 @@ After the above configuration is exported to BFE, calls to `deepseek-v3` between
 - `ModelPrice` uses `(provider, model, mode)` as its primary key and includes fields such as capabilities, limits, default prices, and tiered prices.
 - `model-list.yaml` provides bulk import capability, supports `replace` and `merge` modes, and is the main data source format for maintaining model prices in the current version.
 - RMB quota tiered pricing is implemented by combining the Provider time template with Model tier prices; BFE matches tiers such as `peak` based on when the request occurs and falls back to default prices when no tier matches.
-- The BFE Data Plane converts prices to fixed-point integers at load time and performs pure-integer cost calculation at runtime based on Token usage and the active tier, avoiding floating-point errors.
+- The BFE Data Plane keeps prices as `float64` after loading (negative values fail loading); at runtime, based on Token usage and the active tier, each line item is converted via `quota.CalcCostUnits` into a 1e-8-RMB fixed-point integer and accumulated, while Redis deduction and the monetary semantics of existing configurations remain unchanged.
+- Chat billing starts from the total input Tokens and splits out cache read/write, image input, audio input, and other dimensions; when no refinement price keys are configured, it falls back to the legacy formula.
+- Anthropic usage is normalized at the protocol adapter layer to total-input semantics (`input_tokens + cache_read + cache_creation`), aligning with OpenAI's `prompt_tokens`; two billing modes are supported: `responses` (reusing chat billing) and `video_generation` (billed as `output_cost_per_video` × video count).
 - After the Provider and Cluster concepts were separated, `model-prices.provider` serves only as a price grouping identifier and has a weak reference relationship with `/providers`, making configuration more flexible; `AIConf.ModelTable` is assembled by the Control Plane by provider at export time.
 
 ---
@@ -502,3 +559,6 @@ After the above configuration is exported to BFE, calls to `deepseek-v3` between
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/model-prices.md`
 - `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`
 - `ai-gateway-api/design-docs/sys-design/details/provider与cluster概念分离.md`
+- `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`
+- `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`
+- `bfe/bfe_model_protocol/utils/usage_parse.go`

@@ -19,7 +19,7 @@ The industry typically divides observability into three pillars: Logs, Metrics, 
 
 ### Logs
 
-Logs are used to record the complete lifecycle of every request. The BFE Data Plane outputs key information about each stage of a request — authentication, routing, forwarding, and billing — through the Access Log, enabling downstream troubleshooting, billing reconciliation, and security auditing. AI-specific fields uniformly occupy field numbers 701-900 of the `bfe-access-pb` protocol; 27 fields are currently defined. For details, see [BFE AI Access Log Observability Fields Design](../../../bfe/docs/zh_cn/sys_design/ai_access_log_fields.md).
+Logs are used to record the complete lifecycle of every request. The BFE Data Plane outputs key information about each stage of a request — authentication, routing, forwarding, and billing — through the Access Log, enabling downstream troubleshooting, billing reconciliation, and security auditing. AI-specific fields uniformly occupy field numbers 701-900 of the `bfe-access-pb` protocol; 29 fields are currently defined. For details, see [BFE AI Access Log Observability Fields Design](../../../bfe/docs/zh_cn/sys_design/ai_access_log_fields.md).
 
 ### Metrics
 
@@ -52,7 +52,7 @@ AI observability fields uniformly occupy field numbers 701-900 of `bfe-access-pb
 |----------|------|
 | 701 - 713 | Fields in use, such as API Key identifier, model name, token counts, rate limit hits |
 | 714 - 760 | Model and request basic information, such as provider, protocol, stream, retry, cache |
-| 761 - 800 | Token and cost metering, including regular token/cost and cache/audio/image sub-items |
+| 761 - 800 | Token and cost metering, including regular token/cost and cache/audio/image/video sub-items |
 | 801 - 840 | Routing, transformation, and plugins, such as route rule hits, cluster/key attempt lists |
 | 841 - 880 | Security, compliance, and privacy, such as hit/rejected Quota Plan IDs |
 | 881 - 900 | Vendor extensions and reserved |
@@ -87,6 +87,34 @@ The following table lists the most commonly used fields in daily troubleshooting
 | `ai_auth_hit_quota_plans` | 841 | repeated | List of Quota Plan IDs hit by normal requests | `mod_ai_token_auth` |
 
 It is worth emphasizing that `ai_apikey_id` in the access log only records the internal identifier of the API Key and never the raw key value, thereby avoiding leakage of sensitive information. The raw key is still kept in memory for injection into upstream requests, but it is never written to the logs.
+
+In addition to the core fields listed above, the 781-790 sub-range of the 761-800 range is used for metering sub-items, covering cache, audio, image, and video generation scenarios:
+
+| Field Name | Number | Type | Description |
+|--------|------|------|------|
+| `ai_cache_read_tokens` | 781 | int64 | Tokens read from cache (already included in `ai_input_tokens`) |
+| `ai_cache_write_tokens` | 782 | int64 | Tokens written to cache (independent add-on item) |
+| `ai_audio_input_tokens` | 783 | int64 | Audio input tokens (already included in `ai_input_tokens`) |
+| `ai_audio_output_tokens` | 784 | int64 | Audio output tokens (already included in `ai_output_tokens`) |
+| `ai_image_count` | 785 | int64 | Number of images generated (image_generation mode) |
+| `ai_image_input_tokens` | 786 | int64 | Image input tokens (already included in `ai_input_tokens`) |
+| `ai_video_count` | 787 | int64 | Number of videos generated (video_generation mode) |
+
+`ai_image_input_tokens` and `ai_video_count` depend on `bfe-access-pb` v0.3.5. Their collection logic is located in `reqAiInfoGen()` of `bfe_modules/mod_access_pb3/request_log.go`; the values come from `ImageInputTokens` and `VideoCount` of `bfe_basic.TokenUsage`, which are filled by `mod_ai_token_auth` when parsing the usage in the response phase.
+
+### Control Plane Operation Logs (Audit Data Source)
+
+The access log captures the request lifecycle of the Data Plane, while every configuration change in the Control Plane (AI Gateway API) is recorded by the Operation Log module, forming an audit observability data source. The Control Plane records every configuration change via the `operation_logs` module and exposes the query interface `GET /open-api/v1/operation-logs` (see [Appendix 1: OpenAPI Quick Reference](../appendix/appendix01-openapi-quick-reference.md) for the interface definition).
+
+Write operations on each resource (covering create/update/delete on modules such as `/entities`, `/api-keys`, `/providers`, `/clusters`, `/routes`, `/global-route-rules`, `/certificates`, `/quota-plans`, `/model-prices`, and `/auth`) automatically produce an operation log entry upon success or failure; no write interface is exposed at the API layer. Each log entry records:
+
+- Operator information: `operator_type` (user/token), `operator_id`, `operator_name`;
+- Resource information: `action` (create/update/delete/reset/import/bind/unbind), `resource_type`, `resource_id`, `resource_name`, `resource_parent_id`;
+- Execution result: `status` (1 success / 2 failed), with `error_msg` attached on failure;
+- Change summary: `change_summary`, including the content before and after the change (`before`/`after`) and the list of changed fields (`diff_keys`); sensitive fields such as API-Key tokens, passwords, and certificate private keys are masked;
+- Request context: `request_path`, `request_method`, `client_ip`, `user_agent`, and `created_at`.
+
+Operation logs are stored in the `operation_logs` table of the Control Plane database. The `log_id` is consistent with the LogID in the BFE access log, so audit scenarios can query by operator, resource, time range, and other criteria with pagination, enabling two-way tracing between "configuration changes" and "request behavior".
 
 ## Key Monitoring Metrics
 
@@ -284,7 +312,8 @@ Since BFE access logs are encoded with Protocol Buffers, the log platform needs 
 This chapter introduced the observability design of the Rainway AI Gateway. The key points are as follows:
 
 - Observability consists of three pillars: logs, metrics, and traces. The BFE Data Plane currently has deep customization in logs and metrics;
-- The AI access log contains 27 AI-specific fields covering the full lifecycle information of authentication, routing, rate limiting, token metering, and cost estimation, and it does not record the raw API Key;
+- The AI access log contains 29 AI-specific fields covering the full lifecycle information of authentication, routing, rate limiting, token metering (including image/video generation sub-items), and cost estimation, and it does not record the raw API Key;
+- Control Plane operation logs record the operator, resource, change summary (with diff_keys), and request context of every configuration change, with sensitive fields masked, and can be queried for audit via `GET /open-api/v1/operation-logs`;
 - Key monitoring metrics include `REQ_TOTAL`, route hit/miss/fallback, rate limit triggers, quota hits and rejections, token consumption rate, TTFT/TPOT, etc.;
 - Prometheus can collect BFE metrics via pull, and Zabbix can integrate via HTTP agent or custom scripts;
 - The error code system is divided into four layers: authentication and admission, rate limit check, quota deduction, and forwarding and protocol adaptation, with a clear correspondence to access log fields;
@@ -299,5 +328,6 @@ Observability is not a one-time effort; it evolves continuously as business scal
 - `bfe/docs/zh_cn/modules/mod_ai_route/mod_ai_route.md` — AI Routing Module Documentation
 - `bfe/docs/zh_cn/modules/mod_ai_rate_limit/mod_ai_rate_limit.md` — AI Rate Limit Module Documentation
 - `ai-gateway-api/docs/zh_cn/config_param.md` — AI Gateway API Configuration File Documentation
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/operation-logs.md` — Operation Log Interface Definition
 - `bfe_basic/request_ai_basic.go` — AI Context and Error Code Definitions in Go
 - `bfe_modules/mod_access_pb3/` — Access Log Output Module

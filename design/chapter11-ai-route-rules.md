@@ -199,6 +199,15 @@ OpenAPI 层面额外要求：
 
 > 注意：保存阶段会通过 `validate.ConditionExpression` 对 `cond` 做 BFE 表达式语法校验（内部调用 `condition.Build`），语法错误的表达式无法写入数据库。Dashboard 或 `RouteRuleManager.ExpressionVerify` 也提供了同样的前置校验能力。
 
+### 删除保护
+
+AI 路由规则不仅约束自身的写入，还反向保护被引用的集群：
+
+- **集群删除保护**：删除集群时，`RouteRulesManager.ClusterDeleteChecker`（`ai-gateway-api/model/route_rules/route_rules.go`）会扫描 `route_rules` 表中 Global、Entity、API-Key 各级规则，只要某条规则的 `targets` 或 `fallbacks` 引用了该集群，删除即被拒绝并返回 `409 Conflict`，错误信息指明引用规则名；需先删除或修改相关路由规则后才能删除集群。
+- **集群模型更新保护**：更新集群模型列表时，`ClusterModelUpdateChecker` 会检查被移除的模型是否仍被某条规则的 `targets` 或 `fallbacks` 引用（按 `cluster_name` + `model` 匹配），若存在引用同样返回 `409 Conflict`，避免规则指向集群中已不存在的模型。
+
+两个检查器在 `stateful/container/rdb/components.go` 中注册为 ClusterManager 的删除/更新 hook，在事务内执行，保证引用检查与删除/更新操作的原子性。
+
 ### 生命周期一致性
 
 AI 路由规则与 API-Key / Entity 的生命周期保持一致：
@@ -238,8 +247,6 @@ type AiRouteDataExport struct {
 | API-Key | `apikey_<api_key_value>` | API-Key 的 key 值 | `apikey` |
 | Entity | `entity_<entity_name>` | Entity 的 name | `entity` |
 | Global | `global_default` | `global` | `global` |
-
-> 注：`RouteRulesTypeAPIKey` 常量已由 `"api_key"` 修正为 `"apikey"`，与导出 Key 及 BFE 侧约定保持一致。历史 `type="api_key"` 记录建议迁移为 `"apikey"`。
 
 ### 绑定顺序
 
