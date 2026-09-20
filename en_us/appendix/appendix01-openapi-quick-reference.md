@@ -25,6 +25,7 @@ The OpenAPI v1 interface definitions of the Rainway AI Gateway Control Plane (AI
 | `/auth` | [auth.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/auth.md) |
 | `/expression/verify` | [expression-verify.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/expression-verify.md) |
 | `/operation-logs` | [operation-logs.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/develop/design-docs/api-define/OpenAPI接口定义/operation-logs.md) (link points to the develop branch for now) |
+| `/report/overview`, `/report/timeseries`, `/report/rankings`, `/report/distribution`, `/report/logs` | [report.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/develop/design-docs/api-define/OpenAPI接口定义/report.md) (added in v0.0.10; link points to the develop branch for now; endpoints return 404 when `[Report]` is not configured) |
 
 ## Notes
 

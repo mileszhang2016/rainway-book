@@ -363,6 +363,22 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 
 从映射关系可以看出，Storage 子包的划分依据是业务域而非数据库表数量。例如 `cluster_conf` 子包同时管理 `clusters`、`sub_clusters`、`pools`、`lb_matrices` 四张表，因为这几张表共同服务于集群配置这一业务概念；`route_conf` 子包同时管理 `domains`、`route_basic_rules`、`route_advance_rules`、`route_default_rules`，因为它们共同组成产品级路由规则（AI 网关模式下不用于 AI 请求的 Cluster 选择，仅用于产品线识别上下文或非 AI 流量场景）。这种按业务域聚合的方式，让 Storage 接口更贴近模型层 Manager 的调用需求，避免了 Manager 同时依赖多个细粒度 Storage 的复杂局面。
 
+## 报表存储实现（独立报表库）
+
+报表数据存放在独立于控制面库的报表库中（MySQL `bfe_report` 或 Doris `bfe_observability`），不在上述控制面 26 张表之列，DDL 由 ai-gateway-api 仓库单独发布（`db_ddl_report_mysql.sql`，schema-first）。查询侧实现为 `storage/mysqlreport` 与 `storage/dorisreport` 两个 Storage 包（DAO 惯例与 gendry 构建器同控制面一致），SQL 方言差异封在各自包内。
+
+两张表的设计要点：
+
+- **明细表 `bfe_ai_request_log`**（89 列，与 Doris 同名同列）：唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model)` 与 Doris UNIQUE KEY 一致，log-reader 以 `INSERT ... ON DUPLICATE KEY UPDATE` 幂等覆盖写入；`ARRAY<STRUCT>` 类字段在 MySQL 侧为 JSON 列（仅明细展示用，不做过滤条件）；长文本列使用 TEXT 以规避 utf8mb4 行长度上限；按天 RANGE 分区滚动。
+- **聚合表 `bfe_ai_metrics_1m`**（37 维 + 24 指标，维度集合与 Doris 聚合表一致）：不设唯一键——维度列过多无法构成 InnoDB 唯一键，且幂等性由聚合 JOB 的事务语义保证。
+
+MySQL 形态的两个后台 JOB（`storage/mysqlreport/job.go`，Doris 形态不启动）：
+
+- **分钟聚合 JOB**：`DELETE` 上一整分钟窗口 + `INSERT SELECT` 单事务写入，窗口重放幂等；维度列写入时 `IFNULL(col,'')` 归一（与 Doris JOB 的 COALESCE 语义对齐）；多副本部署用 MySQL `GET_LOCK('report_agg_job', 0)` 抢锁防重；进程重启不补历史窗口（接受 ≤1 分钟空洞，与 Doris INSERT JOB 语义对称）。
+- **分区管理 JOB**：每 6h 巡检，向前预建 3 天分区、DROP 超出 `RetentionDays` 的过期分区，非分区形态自动降级 `DELETE ... LIMIT` 分批清理。MySQL 的 `information_schema.PARTITIONS` 对表达式边界回显求值后的整数（如 `TO_DAYS('2026-09-18')` 回显 `738886`），解析需同时支持整数反解、字面文本与 `MAXVALUE` 三种形态，否则会把现有分区误判为缺失而重复 `ADD PARTITION`（Error 1493），或让初始分区永远不参与过期 DROP。
+
+另一个跨方言的口径要点是时间渲染：DATETIME → Unix 秒统一用 `TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', col)` 算术差（两条 DATETIME 的整数秒差，不做时区解读），避免 `UNIX_TIMESTAMP()` 按会话时区解读墙钟导致的偏移——log-reader 按 UTC 墙钟写入，MySQL 与 Doris 两侧实现保持同一口径。
+
 ## 事务实现（storage/rdb/txn）
 
 模型层不直接操作数据库事务，而是通过 `model/itxn.TxnStorager` 接口：

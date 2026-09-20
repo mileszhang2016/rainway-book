@@ -364,6 +364,22 @@ The project provides no incremental migration scripts; `db_ddl.sql` (with `db_dd
 
 From the mapping it can be seen that Storage subpackages are divided by business domain rather than by the number of database tables. For example, the `cluster_conf` subpackage manages four tables — `clusters`, `sub_clusters`, `pools`, and `lb_matrices` — because these tables jointly serve the business concept of cluster configuration. The `route_conf` subpackage manages `domains`, `route_basic_rules`, `route_advance_rules`, and `route_default_rules` at the same time, because together they form the product-level route rules (in AI gateway mode they are not used for Cluster selection of AI requests, and are only used for product line identification context or non-AI traffic scenarios). This business-domain aggregation makes Storage interfaces closer to the call patterns of the model-layer Manager, avoiding the complexity of a Manager depending on multiple fine-grained Storages simultaneously.
 
+## Report Storage Implementation (Standalone Report Database)
+
+Report data lives in a report database separate from the Control Plane database (MySQL `bfe_report` or Doris `bfe_observability`). It is not part of the 26 Control Plane tables above; its DDL is released separately from the ai-gateway-api repository (`db_ddl_report_mysql.sql`, schema-first). The query side is implemented as two Storage packages — `storage/mysqlreport` and `storage/dorisreport` — following the same DAO and gendry builder conventions as the Control Plane, with SQL dialect differences encapsulated in their respective packages.
+
+Design highlights of the two tables:
+
+- **Detail table `bfe_ai_request_log`** (89 columns, same name and columns as Doris): the unique key `(hostid, log_time, ai_apikey_id, ai_requested_model)` matches the Doris UNIQUE KEY, and log-reader writes idempotently via `INSERT ... ON DUPLICATE KEY UPDATE`; `ARRAY<STRUCT>`-like fields are JSON columns on the MySQL side (detail display only, never filter conditions); long-text columns use TEXT to avoid the utf8mb4 row-size limit; daily RANGE partitions roll over.
+- **Aggregation table `bfe_ai_metrics_1m`** (37 dimensions + 24 metrics, same dimension set as the Doris aggregation table): no unique key — the dimension columns are too wide for an InnoDB unique key, and idempotency is guaranteed by the aggregation JOB's transaction semantics.
+
+Two background JOBs run for the MySQL form (`storage/mysqlreport/job.go`; they do not start in the Doris form):
+
+- **Minute aggregation JOB**: a single transaction of `DELETE` for the previous full minute window plus `INSERT SELECT`, making window replays idempotent; dimension columns are normalized with `IFNULL(col,'')` on write (aligned with the COALESCE semantics of the Doris JOB); multi-replica deployments elect a single runner via MySQL `GET_LOCK('report_agg_job', 0)`; process restarts do not backfill historical windows (accepting a ≤1-minute gap, symmetric with the Doris INSERT JOB semantics).
+- **Partition management JOB**: inspects every 6 hours, pre-creates partitions 3 days ahead, and DROPs expired partitions beyond `RetentionDays`; it automatically falls back to batched `DELETE ... LIMIT` cleanup when the target table is non-partitioned. MySQL's `information_schema.PARTITIONS` echoes evaluated integers for expression boundaries (e.g. `TO_DAYS('2026-09-18')` echoes as `738886`), so the parser must support three forms — integer back-conversion, literal text, and `MAXVALUE` — otherwise existing partitions are misjudged as missing and `ADD PARTITION` is repeated (Error 1493), or the initial partition never participates in expired DROP.
+
+Another cross-dialect concern is time rendering: DATETIME → Unix seconds uniformly uses `TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', col)` arithmetic (the integer-second difference between two DATETIME values, with no timezone interpretation), avoiding offsets caused by `UNIX_TIMESTAMP()` interpreting wall-clock in the session timezone — log-reader writes UTC wall-clock, and the MySQL and Doris implementations keep the same convention.
+
 ## Transaction Implementation (storage/rdb/txn)
 
 The model layer does not operate database transactions directly; instead it goes through the `model/itxn.TxnStorager` interface:

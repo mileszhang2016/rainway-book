@@ -205,6 +205,50 @@ Driver = "sqlite3"
 
 SQLite is suitable for functional validation and development debugging; it is not recommended for high-concurrency production scenarios.
 
+## Deploying the Reporting Lightweight Form (Optional)
+
+If you want usage reports in the console without introducing Kafka/Doris/Grafana, enable the reporting lightweight form: the log-reader `mod_log_mysql` plugin writes access logs directly to MySQL, AI Gateway API provides the `/report/*` queries and built-in aggregation JOBs, and the console renders the pages directly. The standard form (with an existing Doris pipeline) skips this section — it only requires `[Report].Backend = "doris"`.
+
+The deployment follows a schema-first order:
+
+1. **Execute the report DDL**: obtain `db_ddl_report_mysql.sql` from the ai-gateway-api repository, replace `${INIT_DATE}` with a date after the table-creation day (recommended +3 days), and run it in the report database to create the detail table `bfe_ai_request_log` and the aggregation table `bfe_ai_metrics_1m`:
+
+   ```bash
+   mysql -ureport -p bfe_report < db_ddl_report_mysql.sql
+   ```
+
+2. **Create least-privilege accounts**: the log-reader write account is granted only INSERT/UPDATE on the target table (overwrite for idempotency requires UPDATE), with no DDL/DELETE; the API query/aggregation account is granted SELECT on detail/aggregation tables, INSERT/DELETE on the aggregation table, DELETE on the detail table (non-partitioned fallback cleanup), and ALTER TABLE (partition management).
+
+3. **Enable the log-reader plugin**: set `Modules = mod_log_mysql` in the log-reader `conf/config.conf` (choose either this or `mod_kafka`), and fill in the MySQL address, database/table, and batching parameters (QueueSize/BatchSize/FlushIntervalMs/MaxRetries) following the `conf/mod_log_mysql/mod_log_mysql.conf` sample.
+
+4. **Configure AI Gateway API**: add the report datasource and `[Report]` section to `ai_gateway_api.toml`:
+
+   ```toml
+   [Databases.report_db]
+   Driver = "mysql"
+   DBName = "bfe_report"
+   Addr = "127.0.0.1:3306"
+   User = "report_read"
+   Passwd = "******"
+
+   [Report]
+   Backend = "mysql"        # mysql | doris; if absent, the report module stays unassembled and /report/* returns 404
+   Datasource = "report_db"
+   EnableAggregateJob = true
+   AggregateIntervalSec = 60
+   RetentionDays = 7        # detail retention (partition DROP / DELETE window)
+   EnablePartitionMgmt = true
+   ```
+
+5. **Verify**: after restarting log-reader, check `http://<log-reader>:8992/monitor/mod_log_mysql` — `SENT_TO_MYSQL` should grow steadily with `SEND_MYSQL_FAILED`/`SENT_MYSQL_CHN_FULL` at zero; then open the report pages in the console and confirm the overview cards have data.
+
+Notes:
+
+- **One form per cluster**: do not enable `mod_kafka` (→ Doris) and `mod_log_mysql` (→ MySQL) on the same cluster — the data-gap windows of the two pipelines make the two reports inconsistent.
+- **Partitions before data**: MySQL has no dynamic partitioning; the partition management JOB must create partitions before data arrives (writes to a missing partition fail outright). The JOB inspects every 6 hours and pre-creates partitions immediately at startup.
+- **Capacity guidance**: the MySQL form targets up to roughly one million log entries per day; beyond that, use the Doris standard form.
+- The MySQL backend does not provide P50/P90/P99 percentile latency; the corresponding cards are automatically hidden in the console.
+
 ## Configuration File Description and Minimal Runnable Configuration
 
 The main configuration file of AI Gateway API is `conf/ai_gateway_api.toml`, specified by the `-sc` startup parameter. The configuration root directory must also contain `nav_tree.toml` and the `i18n/` directory.

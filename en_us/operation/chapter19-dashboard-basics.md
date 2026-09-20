@@ -2,7 +2,7 @@
 
 ## Chapter Goals
 
-Through this chapter, readers will learn how to access the Rainway AI Gateway Dashboard, how its interface is organized, and the basic operation workflow. They will understand the core concepts behind the Dashboard (AI gateway instance pool, model provider, AI business cluster, Entity, API Key, route tables, etc.) and be able to complete a first-time configuration independently. Specifically, this includes:
+Through this chapter, readers will learn how to access the Rainway AI Gateway Dashboard, how its interface is organized, and the basic operation workflow. They will understand the core concepts behind the Dashboard (model provider, AI business cluster, Entity, API Key, route tables, etc.) and be able to complete a first-time configuration independently. Specifically, this includes:
 
 - How to log in to the Dashboard and change the default account;
 - The responsibilities of each navigation entry and the data each corresponds to;
@@ -41,7 +41,6 @@ After logging in, the Dashboard presents a layout of "left navigation + right co
 ```
 AI Gateway
 ├─ Resource Management
-│   ├─ AI Gateway Instance Pool   Registration of Data Plane engine addresses
 │   ├─ Model Providers            Instance pools, protocols, models, and Keys
 │   ├─ AI Business Clusters       Reference providers, configure forwarding policies
 │   └─ Model Pricing              Model price maintenance and cost accounting
@@ -57,7 +56,6 @@ Each navigation item corresponds to a set of OpenAPI resources:
 
 | Navigation Item | Corresponding OpenAPI Endpoint | Main Responsibility |
 |--------|-------------------|----------|
-| AI Gateway Instance Pool | `/server-data` (export side) | Register Data Plane BFE engine addresses for the Control Plane to push configurations |
 | Model Providers | `/providers` | Maintain model providers, backend instance pools, plaintext API-Keys, and model protocols |
 | AI Business Clusters | `/clusters` | Maintain forwarding clusters, LLM configurations, Key weights, and routing policies |
 | Model Pricing | `/model-prices` | Maintain model prices under different providers and tiers |
@@ -77,13 +75,12 @@ Each navigation item corresponds to a set of OpenAPI resources:
 
 ## Core Concepts in the Dashboard
 
-Many operations in the Dashboard revolve around the following concepts: AI gateway instance pool, Provider (model provider), Cluster (AI business cluster), Entity (organization), API-Key, route tables, quota plans, and rate limit policies.
+Many operations in the Dashboard revolve around the following concepts: Provider (model provider), Cluster (AI business cluster), Entity (organization), API-Key, route tables, quota plans, and rate limit policies.
 
 The complete definitions, relationships, and design motivations of these concepts have been introduced together in [Chapter 5: Rainway AI Gateway Architecture and Core Concepts](../design/chapter05-system-architecture.md#core-concepts). This section only explains their corresponding entries in the Dashboard:
 
 | Dashboard Navigation Item | Corresponding Concept | Description |
 |---|---|---|
-| Resource Management → AI Gateway Instance Pool | AI gateway instance pool | Register Data Plane BFE engine addresses |
 | Resource Management → Model Providers | Provider | Maintain model providers, backend instance pools, model protocols, and authentication keys |
 | Resource Management → AI Business Clusters | Cluster | Reference Providers; configure forwarding policies, Key weights, and timeouts |
 | Resource Management → Model Pricing | Model Price | Maintain model unit prices under different Providers and time periods |
@@ -125,7 +122,6 @@ Each module of the Dashboard is managed through its own list page and form page.
 
 | Module Path | List Page Capabilities | Key Operations |
 |----------|-----------|---------|
-| Resource Management → AI Gateway Instance Pool | View registered Data Plane BFE addresses | Add, edit, and delete instance pools |
 | Resource Management → Model Providers | View Provider list and reference relationships | Create Providers; maintain instance pools / models / Keys |
 | Resource Management → AI Business Clusters | View Cluster list and their providers | Create Clusters; configure forwarding policies and Key weights |
 | Resource Management → Model Pricing | View model price list | Import / edit model prices; maintain Provider time-period templates |
@@ -180,13 +176,7 @@ Below is a minimal configuration flow from an empty environment to the first suc
 
 After logging in with the default account `admin/admin`, go to "User Management → Users", change the `admin` password to a strong password, and create other administrator accounts as needed by the team.
 
-### Step 2: Confirm the AI Gateway Instance Pool
-
-Go to "Resource Management → AI Gateway Instance Pool" and confirm that the Data Plane BFE engine addresses are registered. In a single-machine deployment there is usually already one default record; if it is empty, click edit to add a row and fill in the IP and port of the machine where BFE runs (default `8080`).
-
-> Note: what is registered here is the Data Plane forwarding engine address, not the backend model service address.
-
-### Step 3: Create a Model Provider
+### Step 2: Create a Model Provider
 
 Go to "Resource Management → Model Providers" and click "Create Provider":
 
@@ -198,7 +188,7 @@ Go to "Resource Management → Model Providers" and click "Create Provider":
 
 After creation succeeds, the Control Plane automatically generates backend instance pools and sub-clusters based on the instance pool.
 
-### Step 4: Create an AI Business Cluster
+### Step 3: Create an AI Business Cluster
 
 Go to "Resource Management → AI Business Clusters" and click "Create Cluster"; complete the wizard step by step:
 
@@ -210,24 +200,24 @@ Go to "Resource Management → AI Business Clusters" and click "Create Cluster";
 
 After submission, the new cluster appearing in the list indicates successful creation.
 
-### Step 5: Create an Entity Organization (Optional)
+### Step 4: Create an Entity Organization (Optional)
 
 If you need to configure quota, rate limiting, or model access control uniformly by organization, go to "Consumer Management → Entity Management":
 
 - First create an Entity type (e.g. `team`);
 - Then create an Entity organization (e.g. `dev-team`) and bind the quota plan, rate limit policy, and model allowlist/blocklist.
 
-### Step 6: Issue an API Key
+### Step 5: Issue an API Key
 
 Go to "Consumer Management → API Key Management" and click "Create":
 
 - Name: the identifier of the API Key;
-- Owning organization: select the Entity created in Step 5 (optional);
+- Owning organization: select the Entity created in Step 4 (optional);
 - Expiration time, allowed subnets, allowed models, etc. as needed.
 
 After creation succeeds, the Dashboard displays the plaintext of the API Key. Be sure to keep it safe, as the full key cannot be viewed again later.
 
-### Step 7: Configure API-Key Routing Rules
+### Step 6: Configure API-Key Routing Rules
 
 Go to "Route Management → Route Tables", find the `apikey` route table corresponding to the API Key, enter edit mode, and add a rule. For example:
 
@@ -249,7 +239,7 @@ Go to "Route Management → Route Tables", find the `apikey` route table corresp
 
 Save locally and then click "Submit and Apply"; nothing affects online traffic until it is submitted.
 
-### Step 8: Verify the Configuration Takes Effect
+### Step 7: Verify the Configuration Takes Effect
 
 After completing the above steps, verify as follows:
 
@@ -264,6 +254,28 @@ curl -H "Authorization: <API Key>" \
 ```
 
 ---
+
+## Reports and Usage Analysis
+
+The Dashboard has built-in report pages (since AI Gateway API v0.0.10), providing administrators with a unified view of usage, latency, cost, and log details — no Grafana deployment required. The report pages consume the `/open-api/v1/report/*` APIs and require the reporting form to be configured as described in "Chapter 18: Installation and Deployment": the lightweight form (`[Report].Backend = "mysql"` plus the log-reader `mod_log_mysql` plugin) or the standard form (`Backend = "doris"` connecting an existing Doris). Without the `[Report]` configuration the module stays unassembled: the console shows no report entry and the APIs return 404.
+
+The report pages are organized into the following views:
+
+| View | Content | API |
+|------|------|------|
+| Overview | Total requests, error rate, token totals, average/percentile latency, TTFT/TPOT, cost (by currency), rate limit hits, and auth rejections | `GET /report/overview` |
+| Time series | Bucketed curves for QPS, token throughput, latency, TTFT/TPOT, and cost growth rate; time buckets adapt to the window (1-minute buckets within 6h) | `GET /report/timeseries` |
+| Rankings | TopN request-count rankings by model, provider, API Key, host, status code, etc. | `GET /report/rankings` |
+| Distribution | Pie charts for status code, protocol, mode, and stream share | `GET /report/distribution` |
+| Log details | Per-request details (model, tokens, latency, cost, routing tags), with error-only and error-keyword filters, ordered by time descending with pagination | `GET /report/logs` |
+
+Usage notes:
+
+- **Time window**: all views share a time picker; the window is up to 7 days (aligned with the detail retention period).
+- **Filters**: filter by model, API Key, provider, host, status code, and stream flag in combination; log details additionally support `requested_models`, error-only (`err_only`), and error-message keyword search.
+- **Permissions**: reports are an administrator feature requiring `FeatureReport + ActionReadAll` (current console users are all System scope and therefore qualify).
+- **Form differences**: the MySQL lightweight form does not provide P50/P90/P99 percentile latency, and the corresponding cards are hidden automatically; the Doris standard form shows full percentiles.
+- **Consistent definitions**: report metrics are derived from the same source as the existing Grafana Dashboard panels, so the two views reconcile under the same data source.
 
 ## Operational Notes
 
@@ -286,11 +298,12 @@ This chapter introduced the basic operations of the Rainway AI Gateway Dashboard
 
 - The Dashboard is accessed by default at `http://api-server:8183/login`, with the initial account `admin/admin`;
 - The console has a "left navigation + right content area" layout, covering four major modules: Resource Management, Consumer Management, Route Management, and User Management;
-- AI gateway instance pool, model providers, AI business clusters, model pricing, Entity organizations, API Keys, and route tables are the core concepts of the console; understanding their responsibilities and reference relationships is a prerequisite for correct configuration;
+- Model providers, AI business clusters, model pricing, Entity organizations, API Keys, and route tables are the core concepts of the console; understanding their responsibilities and reference relationships is a prerequisite for correct configuration;
 - The console adopts common interactions such as drawer forms, list pages, and edit mode; routing rules must be saved locally first and then submitted to take effect;
 - Users, Session Keys, and Tokens form the authentication system of the Dashboard and the API; Tokens come in two Scopes: `System` and `Support`;
 - Configuration versioning is based on MD5 signatures and `YYYYMMDDHHMMSS` version numbers, enabling incremental synchronization, and is mainly exposed to InnerAPI and Conf Agent;
-- The first-time configuration should follow the order "instance pool → model provider → AI business cluster → Entity (optional) → API Key → routing rules → curl verification";
+- The first-time configuration should follow the order "model provider → AI business cluster → Entity (optional) → API Key → routing rules → curl verification";
+- The report pages provide five views — overview, time series, rankings, distribution, and log details — covering usage, latency, cost, and troubleshooting scenarios, and require the reporting form to be deployed first;
 - Daily operations require attention to default account security, cascading reference checks, routing rule edit mode, configuration propagation delay, and the principle of least privilege for Tokens.
 
 After mastering this chapter, readers can complete the initialization and basic management of the Rainway AI Gateway in the Dashboard, laying a foundation for the specialized configuration topics in subsequent chapters, such as Providers, Clusters, API-Keys, and rate limiting.

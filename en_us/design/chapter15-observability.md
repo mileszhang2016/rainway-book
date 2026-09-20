@@ -9,7 +9,9 @@ An AI Gateway carries a large volume of large-model call traffic, and the reques
 - Which key monitoring metrics should be tracked, covering route hits, quota hits, and rate limit triggers;
 - How to integrate BFE with monitoring systems such as Prometheus and Zabbix;
 - The classification of the AI Gateway error code system and troubleshooting approaches;
-- Recommended alert configurations based on logs and metrics.
+- Recommended alert configurations based on logs and metrics;
+- The two deployment forms of the reporting system (lightweight form and standard form) and the differences in their data pipelines;
+- The capabilities and key design of the built-in report query API (`/report/*`): query-layer abstraction, minute-level aggregation, partition management, and dual-backend consistency.
 
 After reading this chapter, readers should be able to independently plan, configure, and troubleshoot the observability solution of the AI Gateway.
 
@@ -207,6 +209,63 @@ In Zabbix, you can create a monitoring item of type `HTTP agent`:
 
 For complex metric parsing, you can also use Zabbix UserParameter to call a local script that converts the BFE monitoring interface output into a format acceptable to Zabbix Sender.
 
+## Reporting System: Lightweight and Standard Forms
+
+Logs and metrics solve "data collection"; reporting solves "data consumption". In the traditional pipeline, access logs only become readable dashboards after passing through three external components: Kafka, Doris, and Grafana — too heavy for small-scale or private deployments. Therefore, the Rainway AI Gateway provides two switchable deployment forms for reporting, sharing the same query API and console pages:
+
+| Item | Lightweight Form | Standard Form |
+|----|----------|----------|
+| Data pipeline | BFE access logs → log-reader `mod_log_mysql` plugin → MySQL | BFE access logs → log-reader `mod_kafka` → Kafka → Doris Routine Load → Doris |
+| Detail table | MySQL `bfe_ai_request_log` (89 columns, **same name and columns** as Doris) | Doris `bfe_ai_request_log` |
+| Pre-aggregation | Built-in minute-level aggregation JOB in AI Gateway API | Doris-side INSERT JOB |
+| Presentation | ai-gateway-web report pages (calling `/report/*`) | Grafana Dashboard (`/report/*` can also query Doris directly) |
+| External dependencies | MySQL only | Kafka + Doris (+ Grafana) |
+| Applicable scenarios | Small-scale / private deployments, recommended for up to ~1M log entries per day | Large-scale deployments where MySQL capacity is exceeded |
+
+Key design trade-offs of the two pipelines:
+
+- **The plugin writes directly to the database, without routing through the Control Plane**. log-reader is deployed with BFE in the Data Plane, and the availability of the log pipeline must not depend on the release and load of the Control Plane (AI Gateway API). Access logs are the highest-throughput data stream of the Data Plane; relaying them through the API would create a convergence bottleneck. This is consistent with the existing convention of `mod_kafka` writing directly to Kafka.
+- **Same-name, same-column table design**. The MySQL detail table has the same name and columns as the Doris one; `ARRAY<STRUCT>` columns are carried as JSON columns on the MySQL side (for detail display only, never used as filter conditions). The query API returns identically structured responses for both backends, differing only in the presence of optional fields.
+- **Idempotent writes**. The unique key `(hostid, log_time, ai_apikey_id, ai_requested_model)` matches the Doris UNIQUE KEY. Writes use `INSERT ... ON DUPLICATE KEY UPDATE` overwrite semantics, so log-reader redeliveries or `-b` re-reads produce no duplicates.
+- **One form per cluster**. If both forms are enabled for the same cluster, the two reports become inconsistent due to their respective data-gap windows; deployments should choose exactly one.
+- **Schema-first**. The DDL of the two report tables (detail table + minute aggregation table) is released with the ai-gateway-api repository (`db_ddl_report_mysql.sql`). The deployment pipeline creates the tables before enabling the log-reader plugin; the plugin itself provides no auto table creation.
+- **Least-privilege accounts**. The log-reader write account holds only INSERT/UPDATE on the target table (overwrite needs UPDATE), with no DDL/DELETE. The AI Gateway API query/aggregation account holds SELECT on detail/aggregation tables, INSERT/DELETE on the aggregation table, DELETE on the detail table (non-partitioned fallback cleanup), and ALTER TABLE (partition management).
+
+## Report Query API Design
+
+The report query API is provided since AI Gateway API v0.0.10, mounted uniformly under `/open-api/v1/report/*`. Its metric definitions are aligned with the existing Grafana Dashboard panels (QPS, error rate, token throughput, average/percentile latency, cost, etc.). The same API and console pages work regardless of whether MySQL or Doris is the backend.
+
+### Endpoint Overview
+
+| Endpoint | Function | Description |
+|------|------|------|
+| `GET /report/overview` | Overview metric cards | Total requests, error rate, token totals, average/percentile latency, TTFT/TPOT, cost (by currency), rate limit hits, auth rejections |
+| `GET /report/timeseries` | Time series | Bucketed series per `metric` (`qps`/`tokens`/`latency`/`ttft`/`tpot`/`cost`); buckets computed server-side by window (≤6h→1min, ≤3d→5min, ≤7d→30min) |
+| `GET /report/rankings` | TopN rankings | Rankings by dimension (model/requested model/provider/API Key/host/status code/protocol/mode), default 10, up to 50 |
+| `GET /report/distribution` | Ratio distribution | Pie chart data for status code, protocol, mode, and stream flag; empty values normalized to `unknown` |
+| `GET /report/logs` | Log detail pagination | Detail-row projection (field names identical to table column names), supporting `err_only` and `keyword` fuzzy match, ordered by `log_time` descending |
+
+Common conventions: `start`/`end` are Unix seconds with a maximum 7-day window; filters such as `models`, `apikey_ids`, `providers`, `hosts`, `stream`, and `status_codes` can be combined; all endpoints require `FeatureReport + ActionReadAll` (System scope grants it to administrators; Product scope reserves `Read` for tenant self-service usage reports).
+
+### Query-Layer Abstraction and Dual Backends
+
+The query layer defines a `ReportStorager` interface (`Overview`/`TimeSeries`/`Rankings`/`Distribution`/`Logs`), with one implementation per backend (`storage/mysqlreport`, `storage/dorisreport`), switched by `[Report].Backend`. `ReportManager` (`model/ireport`) only performs parameter binding validation (go-playground/validator convention), window and enum validation, bucket calculation, and metric definition constants (error rate = `error_count/request_count`; TTFT/TPOT aggregated over streaming requests only); it contains no SQL. SQL dialect differences (time-bucket functions, percentile functions) are encapsulated in the respective implementations:
+
+- **Percentile degradation**: MySQL has no native percentile functions; `latency_p50/p90/p99` fields are always absent, and the frontend degrades accordingly. The Doris backend returns full percentiles.
+- **Timezone-neutral rendering**: DATETIME → Unix seconds uniformly uses `TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', col)` arithmetic (no timezone interpretation), avoiding offsets caused by session timezone — log-reader stores UTC wall-clock, and both backends use the same convention.
+
+### Background JOBs of the MySQL Form (Lightweight Form Only)
+
+MySQL lacks Doris's scheduled INSERT aggregation, so pre-aggregation is performed by JOBs embedded in AI Gateway API (the Doris form does not start these JOBs):
+
+- **Minute aggregation JOB**: on each `AggregateIntervalSec` cycle (default 60s), it writes the previous full minute's detail rows into the aggregation table `bfe_ai_metrics_1m` (37 dimensions + 24 metrics, same dimension set as the Doris aggregation table) via `GROUP BY` over 37 dimensions. The write uses a "DELETE time window + INSERT SELECT" single transaction, making window replays idempotent. Multi-replica deployments use MySQL `GET_LOCK('report_agg_job', 0)` to elect a single runner. Process restarts do not backfill historical windows (accepting a ≤1-minute gap, symmetric with the Doris INSERT JOB semantics).
+- **Partition management JOB**: inspects every 6 hours, pre-creates partitions 3 days ahead, and DROPs partitions older than `RetentionDays` (default 7 days); it automatically falls back to batched `DELETE ... LIMIT` when the target table is non-partitioned. Partitions must exist before data arrives (MySQL has no dynamic partitioning; writes to a missing partition fail outright), so the JOB pre-creates them immediately at startup.
+- **DDL ownership**: the DDL of both tables is released from the ai-gateway-api repository, because it has the widest schema dependency surface (the aggregation JOB reads by column, partition management executes ALTER, and detail queries) and is the only repository in the codebase with a MySQL DDL management tradition.
+
+### Module Assembly and Release Order
+
+If the `[Report]` configuration is absent, the report module is not assembled at all and the `/report/*` routes are not registered (404) — a purely incremental capability. The release order is: release the API version containing the DDL and the report module → the deployment pipeline executes the DDL (schema-first, with the initial partition covering 3 days after table creation) → enable the log-reader `mod_log_mysql` plugin → configure `[Report].Backend = "mysql"` (or `"doris"` to connect an existing Doris) → release the ai-gateway-web report pages in sync.
+
 ## Error Code System
 
 In the AI Gateway scenario, the BFE Data Plane returns unified OpenAI-compatible format error responses. The error code definitions are located in `bfe_basic/request_ai_basic.go` and are mainly produced by `mod_ai_token_auth`, `mod_ai_rate_limit`, and `bfe_server/reverseproxy.go`.
@@ -316,6 +375,8 @@ This chapter introduced the observability design of the Rainway AI Gateway. The 
 - Control Plane operation logs record the operator, resource, change summary (with diff_keys), and request context of every configuration change, with sensitive fields masked, and can be queried for audit via `GET /open-api/v1/operation-logs`;
 - Key monitoring metrics include `REQ_TOTAL`, route hit/miss/fallback, rate limit triggers, quota hits and rejections, token consumption rate, TTFT/TPOT, etc.;
 - Prometheus can collect BFE metrics via pull, and Zabbix can integrate via HTTP agent or custom scripts;
+- The reporting system offers a lightweight form (log-reader writes directly to MySQL, no Kafka/Doris/Grafana required) and a standard form (Kafka → Doris → Grafana); only one form should be enabled per cluster. Both forms share the same detail table schema and the same set of `/report/*` query APIs and console report pages;
+- The report query API shields MySQL/Doris dialect differences behind the `ReportStorager` interface; the MySQL form relies on built-in minute-aggregation and partition-management JOBs, and the module stays unassembled (endpoints 404) when `[Report]` is absent;
 - The error code system is divided into four layers: authentication and admission, rate limit check, quota deduction, and forwarding and protocol adaptation, with a clear correspondence to access log fields;
 - Alerts should cover error rate, rate limiting, quota, route hit rate, latency, and retries, and notifications should be split by product line or tenant.
 
@@ -329,5 +390,9 @@ Observability is not a one-time effort; it evolves continuously as business scal
 - `bfe/docs/zh_cn/modules/mod_ai_rate_limit/mod_ai_rate_limit.md` — AI Rate Limit Module Documentation
 - `ai-gateway-api/docs/zh_cn/config_param.md` — AI Gateway API Configuration File Documentation
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/operation-logs.md` — Operation Log Interface Definition
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/report.md` — Report Query Interface Definition
+- `ai-gateway-api/design-docs/modifications/2026-09-15-report-query-api/change-summary.md` — Report Query API Change Summary
+- `ai-gateway-api/db_ddl_report_mysql.sql` — Report Detail and Aggregation Table DDL (MySQL Form)
+- `log-reader/doc/modules/mod_log_mysql/mod_log_mysql.md` — mod_log_mysql Plugin Documentation
 - `bfe_basic/request_ai_basic.go` — AI Context and Error Code Definitions in Go
 - `bfe_modules/mod_access_pb3/` — Access Log Output Module

@@ -43,6 +43,7 @@ ai-gateway-api/endpoints/
 │   ├── operation_log/        # /operation-logs
 │   ├── product_cluster/      # /clusters
 │   ├── provider/             # /providers
+│   ├── report/               # /report/* (conditionally assembled, see below)
 │   ├── route/                # /expression/verify
 │   ├── route_tables/         # /route-tables
 │   ├── subcluster/           # Not currently registered
@@ -386,6 +387,16 @@ func merge(rss ...[]*xreq.Endpoint) (rs []*xreq.Endpoint) {
         rs = append(rs, r...)
     }
     return
+}
+```
+
+The report module (`/report/*`) is a typical example of conditional assembly: the Control Plane only assembles `ReportManager` when the `[Report].Backend` configuration exists, and route registration appends the report endpoints accordingly; without the configuration the module stays unassembled and the endpoints remain 404 (a purely incremental release that does not affect existing endpoints):
+
+```go
+// The report module only registers when it is assembled
+// ([Report].Backend configured); otherwise /report/* stay 404.
+if container.ReportManager != nil {
+    rs = append(rs, report.Endpoints...)
 }
 ```
 

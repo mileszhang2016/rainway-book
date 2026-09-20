@@ -650,6 +650,25 @@ _, err = m.planStorager.UpdateQuotaPlan(ctx, &QuotaPlanFilter{
 
 Note that the manual reset path (`QuotaPlanManager.ResetBalance`) still goes through `ResetToQuota` (internally the `IncrBy(delta)` of `SetRemaining`), because a manual reset must bring the remaining amount up to the total quota based on the current value; a periodic reset, by contrast, must "unconditionally zero the balance to the total quota." The two semantics differ, and their implementations are deliberately kept separate.
 
+## Reporting Module: ReportManager and Dual-Backend Storagers
+
+The report queries (`/report/*`) are an application of the Manager + Storager pattern across multiple data sources. The report database (MySQL `bfe_report` or Doris `bfe_observability`) is queried read-only and sits outside the Control Plane database, so it does not go through the `itxn.TxnStorager` transaction system; the model layer defines a query interface directly and the storage layer implements it:
+
+```go
+// ai-gateway-api/model/ireport/types.go
+type ReportStorager interface {
+    Overview(ctx context.Context, f *Filter) (*OverviewResult, error)
+    TimeSeries(ctx context.Context, metric string, f *Filter, bucketSec int) ([]*MetricPoint, error)
+    Rankings(ctx context.Context, dimension string, f *Filter, limit int) ([]*RankingItem, error)
+    Distribution(ctx context.Context, dimension string, f *Filter) ([]*DistItem, error)
+    Logs(ctx context.Context, f *LogFilter) (*LogQueryResult, error)
+}
+```
+
+`ReportManager` (`model/ireport/manager.go`) has the same responsibilities as other Managers at this layer — parameter binding validation (go-playground/validator convention), enum and window validation (time window ≤7 days), bucket calculation (≤6h→60s, ≤3d→300s, ≤7d→1800s), and metric definition constants (error rate = `error_count/request_count`; TTFT/TPOT aggregated over streaming requests only). It contains no SQL; all queries are delegated to `ReportStorager`. The two backends (`storage/mysqlreport`, `storage/dorisreport`) share the same interface, with SQL dialect differences (time-bucket functions, percentile functions) encapsulated in the respective implementations, so neither the Manager nor the endpoint layer is backend-aware.
+
+Assembly is done by `stateful/container/rdb/components.go` based on `[Report].Backend`: with `mysql` it assembles the MySQL implementation and starts the aggregation/partition JOBs; with `doris` it assembles the Doris implementation (aggregation is handled by the existing Doris INSERT JOB, so no JOBs start); when the configuration is absent, `ReportManager` is nil and the interface layer skips registering the `/report/*` routes accordingly (see the conditional assembly in Chapter 28). For authorization, a new `FeatureReport` is added: System scope is granted `ReadAll` (the console is currently administrator-only), and Product scope is granted `Read` as a reservation for tenant self-service usage reports.
+
 ## Key Code Snippets
 
 ### 1. Transaction Abstraction Interface

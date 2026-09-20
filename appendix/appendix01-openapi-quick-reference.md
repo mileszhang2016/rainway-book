@@ -25,6 +25,7 @@
 | `/auth` | [auth.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/auth.md) |
 | `/expression/verify` | [expression-verify.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/expression-verify.md) |
 | `/operation-logs` | [operation-logs.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/develop/design-docs/api-define/OpenAPI接口定义/operation-logs.md)（暂指向 develop 分支） |
+| `/report/overview`、`/report/timeseries`、`/report/rankings`、`/report/distribution`、`/report/logs` | [report.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/develop/design-docs/api-define/OpenAPI接口定义/report.md)（v0.0.10 新增，暂指向 develop 分支；`[Report]` 未配置时端点 404） |
 
 ## 说明
 

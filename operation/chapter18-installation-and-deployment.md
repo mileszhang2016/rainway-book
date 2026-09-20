@@ -205,6 +205,50 @@ Driver = "sqlite3"
 
 SQLite 适用于功能验证与开发调试，不建议用于生产高并发场景。
 
+## 报表轻量形态部署（可选）
+
+若需要在控制台查看用量报表而不引入 Kafka/Doris/Grafana，可启用报表轻量形态：访问日志由 log-reader `mod_log_mysql` 插件直写 MySQL，AI Gateway API 提供 `/report/*` 查询与内置聚合 JOB，控制台直接展示。标准形态（已有 Doris 链路）无需本步骤，仅需在 `[Report]` 中配置 `Backend = "doris"`。
+
+部署遵循 schema-first 顺序：
+
+1. **执行报表 DDL**：在 ai-gateway-api 仓库取 `db_ddl_report_mysql.sql`，替换 `${INIT_DATE}` 为建表日之后（建议 +3 天）后在 report 库执行，创建明细表 `bfe_ai_request_log` 与聚合表 `bfe_ai_metrics_1m`：
+
+   ```bash
+   mysql -ureport -p bfe_report < db_ddl_report_mysql.sql
+   ```
+
+2. **创建最小权限账号**：log-reader 写入账号仅授予目标表 INSERT/UPDATE（幂等覆盖需要 UPDATE），无 DDL/DELETE；api 查询/聚合账号授予明细表/聚合表 SELECT、聚合表 INSERT/DELETE、明细表 DELETE（非分区降级清理）与 ALTER TABLE（分区管理）。
+
+3. **启用 log-reader 插件**：在 log-reader `conf/config.conf` 中配置 `Modules = mod_log_mysql`（与 `mod_kafka` 二选一），并按 `conf/mod_log_mysql/mod_log_mysql.conf` 样例填写 MySQL 地址、库表与攒批参数（QueueSize/BatchSize/FlushIntervalMs/MaxRetries）。
+
+4. **配置 AI Gateway API**：在 `ai_gateway_api.toml` 中新增报表数据源与 `[Report]` 段：
+
+   ```toml
+   [Databases.report_db]
+   Driver = "mysql"
+   DBName = "bfe_report"
+   Addr = "127.0.0.1:3306"
+   User = "report_read"
+   Passwd = "******"
+
+   [Report]
+   Backend = "mysql"        # mysql | doris；缺省则报表模块不装配，/report/* 返回 404
+   Datasource = "report_db"
+   EnableAggregateJob = true
+   AggregateIntervalSec = 60
+   RetentionDays = 7        # 明细保留天数（分区 DROP / DELETE 窗口）
+   EnablePartitionMgmt = true
+   ```
+
+5. **验证**：重启 log-reader 后观察 `http://<log-reader>:8992/monitor/mod_log_mysql`，`SENT_TO_MYSQL` 持续增长且 `SEND_MYSQL_FAILED`/`SENT_MYSQL_CHN_FULL` 为零；登录控制台打开报表页确认总览指标有数据。
+
+注意事项：
+
+- **单集群单形态**：同一集群不要同时启用 `mod_kafka`（→ Doris）与 `mod_log_mysql`（→ MySQL），两条链路各自的数据缺口窗口会导致两套报表口径不一致。
+- **分区先于数据**：MySQL 无动态分区，分区管理 JOB 先于数据到达建好分区（缺分区写入直接报错）；JOB 每 6h 巡检并在启动时立即补建一次。
+- **容量建议**：MySQL 形态面向日均百万级以下日志量，超量请使用 Doris 标准形态。
+- MySQL 后端不提供 P50/P90/P99 分位数延迟，控制台对应卡片自动降级隐藏。
+
 ## 配置文件说明与最小可运行配置
 
 AI Gateway API 的主配置文件为 `conf/ai_gateway_api.toml`，该文件由启动参数 `-sc` 指定。配置文件根路径下还需要包含 `nav_tree.toml` 与 `i18n/` 目录。

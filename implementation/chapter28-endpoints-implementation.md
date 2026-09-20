@@ -43,6 +43,7 @@ ai-gateway-api/endpoints/
 │   ├── operation_log/        # /operation-logs
 │   ├── product_cluster/      # /clusters
 │   ├── provider/             # /providers
+│   ├── report/               # /report/*（条件装配，见下文）
 │   ├── route/                # /expression/verify
 │   ├── route_tables/         # /route-tables
 │   ├── subcluster/           # 当前未注册
@@ -386,6 +387,16 @@ func merge(rss ...[]*xreq.Endpoint) (rs []*xreq.Endpoint) {
         rs = append(rs, r...)
     }
     return
+}
+```
+
+报表模块（`/report/*`）是条件装配的典型例子：`[Report].Backend` 配置存在时控制面才装配 `ReportManager`，路由注册据此追加报表端点；配置缺省时模块不装配，端点保持 404（纯增量发布，不影响既有接口）：
+
+```go
+// The report module only registers when it is assembled
+// ([Report].Backend configured); otherwise /report/* stay 404.
+if container.ReportManager != nil {
+    rs = append(rs, report.Endpoints...)
 }
 ```
 
