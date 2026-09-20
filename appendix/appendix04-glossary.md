@@ -90,6 +90,9 @@
 **Product（产品线）**
 ：BFE 中的顶层资源隔离单位，AI 网关模式下主要用于产品线识别与配置上下文加载。
 
+**protocol_paths（协议路径映射）**
+：Provider 上的可选字段，声明各模型协议（`openai`/`anthropic`）对应的上游 base path；BFE 据此将标准入口 `/v1/...` 改写为 provider 原生前缀，未配置则原样透传。
+
 ## Q
 
 **Quota Plan（配额计划）**

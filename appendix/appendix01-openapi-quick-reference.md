@@ -18,7 +18,7 @@
 | `/entities` | [entities.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/entities.md) |
 | `/global-route-rules` | [global-route-rules.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/global-route-rules.md) |
 | `/route-tables` | [route-tables.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/route-tables.md) |
-| `/providers` | [providers.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/providers.md) |
+| `/providers` | [providers.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/providers.md)（v0.0.10 新增 `protocol_paths` 字段，最新定义见 [develop 分支](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/develop/design-docs/api-define/OpenAPI接口定义/providers.md)） |
 | `/clusters` | [clusters.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/clusters.md) |
 | `/model-prices` | [model-prices.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/model-prices.md) |
 | `/certificates` | [certificates.md](https://github.com/rainway-ai-gateway/ai-gateway-api/blob/refs/tags/v0.0.8/design-docs/api-define/OpenAPI接口定义/certificates.md) |

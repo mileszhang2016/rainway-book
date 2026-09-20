@@ -2,7 +2,7 @@
 
 ## 本章目标
 
-通过本章学习，读者将掌握 Provider 在壬远 AI 网关中的定位与作用，熟练使用 Dashboard 与 OpenAPI 创建和维护 Provider，正确配置模型端点、模型列表、Provider Keys 与后端实例池，使用模型发现工具自动探测模型，理解支持的模型协议差异，掌握通过 model-list.yaml 批量导入模型定价的方法，并厘清 Provider 与 Cluster 的关联关系及变更影响。
+通过本章学习，读者将掌握 Provider 在壬远 AI 网关中的定位与作用，熟练使用 Dashboard 与 OpenAPI 创建和维护 Provider，正确配置模型端点、模型列表、Provider Keys 与后端实例池，使用模型发现工具自动探测模型，理解支持的模型协议差异，掌握通过 model-list.yaml 批量导入模型定价的方法，并厘清 Provider 与 Cluster 的关联关系及变更影响，以及为多协议 provider 配置 `protocol_paths` 协议路径映射的方法与注意事项。
 
 ## Provider 的概念与作用
 
@@ -15,7 +15,7 @@ Provider 与 Cluster 分离后，二者职责更加清晰：
 
 这种分离带来了多方面好处：同一 Provider 被多个 Cluster 引用时，实例池和密钥只需维护一份，避免重复配置；Cluster 不再存储 API Key 明文，只通过 name 引用 Provider 中的 Key，提升了安全性；Provider 可独立创建、更新、删除，Cluster 通过引用获取后端能力，生命周期更独立；新增协议时只需扩展 Provider 的 model_protocols，不会导致 Cluster 模型持续膨胀。
 
-Provider 的核心字段包括：全局唯一的 `name`、可选的 `description`、模型发现端点 `model_endpoint`、支持的模型列表 `models`、API Key 列表 `keys`、后端实例池 `instance_pool`、支持的协议 `model_protocols`、时区 `time_zone` 与分时段模板 `tiers`。其中 `instance_pool` 必填且至少包含一个权重大于 0 的实例，`model_protocols` 必填且至少包含一个协议。
+Provider 的核心字段包括：全局唯一的 `name`、可选的 `description`、模型发现端点 `model_endpoint`、支持的模型列表 `models`、API Key 列表 `keys`、后端实例池 `instance_pool`、支持的协议 `model_protocols`、可选的协议路径映射 `protocol_paths`、时区 `time_zone` 与分时段模板 `tiers`。其中 `instance_pool` 必填且至少包含一个权重大于 0 的实例，`model_protocols` 必填且至少包含一个协议。
 
 `time_zone` 默认值为 `Asia/Shanghai`，用于计算当前时间属于哪个 tier。`tiers` 初期只支持 `name=peak`，每个 tier 包含若干 `time_ranges`，采用左闭右开语义。通过 `PUT /v1/providers/{provider_name}/pricing-tiers` 可单独维护时区与 tier，无需在创建 Provider 时传入。
 
@@ -123,6 +123,49 @@ Provider 通过 `model_protocols` 字段声明支持的模型访问协议。首�
 一个 Provider 可同时支持多种协议，例如聚合平台可配置 `["openai", "anthropic"]`，但至少包含一个协议。
 
 `model_protocols` 会影响 BFE 数据面的转发行为。认证头注入方面，`openai` 使用 `Authorization: Bearer`，`anthropic` 使用 `x-api-key`；Claude 请求还需要额外注入 `anthropic-version`。Usage 解析会按协议风格处理不同响应格式，例如 OpenAI 风格的 `usage` 字段与 Claude 风格的 `usage` 字段结构不同。协议匹配校验会检查请求协议风格是否在目标 Cluster 对应 Provider 的 `model_protocols` 中，若不匹配则直接拒绝。控制面生成 BFE 配置时，会将 `provider.model_protocols` 透传到 `AIConf.ModelProtocols`，供数据面使用。
+
+## 协议路径配置（protocol_paths）
+
+不同 provider 的上游路径前缀各不相同，且同一 provider 的不同协议常挂在不同前缀下：百炼 DashScope 的 OpenAI 兼容在 `/compatible-mode/v1`、Anthropic 兼容在 `/apps/anthropic`；火山方舟按量在 `/api/v3` 与 `/api/compatible`；Kimi Code 会员（api.kimi.com）在 `/coding/v1` 与 `/coding`。不配 `protocol_paths` 时 BFE 对上游路径纯透传，客户端必须按 provider 原生路径发起请求；配置后客户端可以统一用标准入口 `/v1/...` 访问所有 provider，由 BFE 在转发时改写路径。
+
+`protocol_paths` 是"协议 → 上游 base path"的映射，取值为该协议官方 SDK `base_url` 的 path 部分：`openai` 含 `/v1` 尾（如 `/compatible-mode/v1`），`anthropic` 不含 `/v1`（如 `/apps/anthropic`，Anthropic SDK 会自拼 `/v1/messages`）。配置时可直接照抄 provider 官方文档的 base_url 一栏。常见 provider 的参考值：
+
+| provider | protocol_paths |
+|----------|----------------|
+| 百炼 DashScope | `{"openai": "/compatible-mode/v1", "anthropic": "/apps/anthropic"}` |
+| Kimi 开放平台（api.moonshot.cn） | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| Kimi Code 会员（api.kimi.com） | `{"openai": "/coding/v1", "anthropic": "/coding"}` |
+| DeepSeek | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| 火山方舟·按量 | `{"openai": "/api/v3", "anthropic": "/api/compatible"}` |
+| 火山方舟·Coding Plan | `{"openai": "/api/coding/v3", "anthropic": "/api/coding"}` |
+
+配置约束：
+
+- key 必须是该 provider `model_protocols` 已声明的 `openai` 或 `anthropic`，未声明的协议不允许配置路径；
+- value 必须 `/` 开头、不以 `/` 结尾、不含 `..`/`?`/`#`、长度不超过 128；
+- 缺省（不配置）表示关闭，请求路径原样转发；
+- PATCH 更新遵循部分更新约定：不显式携带则保持原值，显式传 `null` 清空（恢复透传）。
+
+转发行为：仅标准入口被改写（anthropic 请求 `/v1/messages` → `{anthropic 值}/v1/messages`；openai 请求 `/v1/chat/completions` → `{openai 值}/chat/completions`）；未配置对应协议、或请求本就按 provider 原生路径（非标准入口）发起时原样透传，兼容存量客户端。
+
+注意事项：
+
+- **计费域错配**：path 在部分 provider 上挂计费语义（火山 `/api/v3` 按量 vs `/api/coding` 订阅），订阅 Key 误配按量前缀会错扣费，配置前需核对 Key 类型与 path 的对应关系；
+- **模型发现端点不联动**：`model_endpoint` 不随 `protocol_paths` 自动生成，例如百炼 Anthropic 协议的模型发现需手工把 `model_endpoint.uri` 配为 `/apps/anthropic/v1/models`；
+- **发布顺序**：`protocol_paths` 依赖 BFE 数据面支持 `AIConf.ProtocolPaths` 改写，BFE 版本过旧时配置不生效。
+
+配置示例（百炼）：
+
+```json
+{
+    "name": "bailian",
+    "model_protocols": ["openai", "anthropic"],
+    "protocol_paths": {
+        "openai": "/compatible-mode/v1",
+        "anthropic": "/apps/anthropic"
+    }
+}
+```
 
 ## 模型定价导入
 
@@ -247,6 +290,10 @@ BFE 最终接收到的配置由控制面自动合并生成：`AIConf.Keys` 通�
 
 检查 `/model-prices` 中是否存在对应的 `(provider, model, mode)` 记录；`model-list.yaml` 导入是否成功，关注 `errors` 列表；`price_currency` 是否为 `RMB`； prices 与 tier_prices 中价格字段是否为非负数。
 
+### 7. 配置了 protocol_paths 但请求未被改写（上游 404）
+
+确认请求走的是标准入口 `/v1/...`（非标准入口永不改写，原样透传）；确认请求协议已在 `model_protocols` 中声明且 `protocol_paths` 有对应条目；确认 BFE 版本已支持 `AIConf.ProtocolPaths`（加载期会做 key 白名单校验，非法配置拒绝加载并指明 cluster）；若发生了 fallback，切换到未配置 `protocol_paths` 的备用 cluster 后透传属预期行为。
+
 ## 配置示例
 
 ### 完整 Provider JSON 配置
@@ -318,7 +365,7 @@ Cluster 不声明 `instance_pool`、`model_endpoint` 或 `provider_type`，这�
 
 Provider 是壬远 AI 网关控制面中描述下游模型提供方的核心资源。Provider 与 Cluster 职责分离后，Cluster 专注转发策略，Provider 专注接入信息，提升了配置复用性、安全性与可维护性。
 
-本章重点包括：Provider 的数据模型与字段含义；通过 Dashboard 与 OpenAPI 创建、更新 Provider 的流程；模型端点、模型列表、Provider Keys 的配置方法与约束；`/providers/tools/discover-models` 无状态模型发现工具的使用；`openai` 与 `anthropic` 协议对认证头、版本头、Usage 解析与协议匹配的影响；通过 `model-list.yaml` 批量导入模型定价的流程与注意事项；图片输入 token 与视频按个计费等价格字段及 `responses`、`video_generation` 计费模式；Provider 与 Cluster 的强引用关系以及变更时的同步与冲突处理；常见问题的排查思路与配置示例。
+本章重点包括：Provider 的数据模型与字段含义；通过 Dashboard 与 OpenAPI 创建、更新 Provider 的流程；模型端点、模型列表、Provider Keys 的配置方法与约束；`/providers/tools/discover-models` 无状态模型发现工具的使用；`protocol_paths` 协议路径映射的配置方法、约束与转发行为；`openai` 与 `anthropic` 协议对认证头、版本头、Usage 解析与协议匹配的影响；通过 `model-list.yaml` 批量导入模型定价的流程与注意事项；图片输入 token 与视频按个计费等价格字段及 `responses`、`video_generation` 计费模式；Provider 与 Cluster 的强引用关系以及变更时的同步与冲突处理；常见问题的排查思路与配置示例。
 
 合理规划 Provider 与 Cluster 的拆分，是后续路由规则、API-Key 配额、限流策略生效的重要前提。建议在生产环境中先统一维护 Provider 与模型价格，再按需创建不同业务线的 Cluster。定期对比 `/providers` 与 `/model-prices/actions/get-providers` 返回的 provider 列表，可及时发现并补录价格记录与实际 Provider 脱节的问题，确保成本核算准确。
 

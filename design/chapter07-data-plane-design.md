@@ -11,6 +11,7 @@
 - BFE 模块框架 `bfe_module` 的回调机制与模块注册方式；
 - AI 相关配置文件的加载、校验与热加载机制；
 - 关键配置示例与转发降级行为。
+- 上游路径按协议改写（`ProtocolPaths`）的执行时机、透传兼容语义与 fallback 重算行为。
 
 ## BFE 在壬远 AI 网关中的角色
 
@@ -554,6 +555,17 @@ prepareRequestBodyForRetry()
 
 该流程确保只有在后端不可用或出现服务端错误时才尝试降级，而客户端错误不会触发无意义的 fallback，避免将错误请求扩散到备用集群。
 
+## 上游路径按协议改写（ProtocolPaths）
+
+不同 provider 的上游路径前缀各不相同（如百炼 `/compatible-mode/v1`、火山 `/api/v3`、Kimi Code `/coding/v1`），同一 provider 的不同协议还常挂在不同前缀下。为了让客户端统一使用标准入口 `/v1/...` 发起请求，BFE 在转发循环内按 cluster 的 `AIConf.ProtocolPaths` 改写出站请求的 URL path：
+
+- anthropic 请求：`/v1/messages` → `{ProtocolPaths[anthropic]}/v1/messages`（如 `/apps/anthropic/v1/messages`）；
+- openai 请求：`/v1/chat/completions` → `{ProtocolPaths[openai]}/chat/completions`（如 `/compatible-mode/v1/chat/completions`）。
+
+改写由 `bfe_server/ai_path_rewrite.go` 中的纯函数 `rewriteUpstreamPath` 计算，在 `doSingleAIForward` 创建出站请求拷贝之后、`clusterInvoke` 之前执行，仅对标准入口（`/v1` 精确值或 `/v1/` 前缀）生效。未配置 `ProtocolPaths` 或对应协议无条目时原样透传；`/v10/xxx`、gemini 风格的 `/v1beta/...` 等非标准入口永不改写。改写只落在出站拷贝上、不改入站请求，因此 fallback 的每次 attempt 都基于原始客户端路径重算——切换到不同前缀配置的备用 cluster 后，上游路径自动跟随新 cluster 的配置。
+
+`ProtocolPaths` 由控制面按 cluster 引用的 provider 恒透传（配置入口为 Provider 的 `protocol_paths` 字段，见[第十章 Provider 与 Cluster 设计](./chapter10-provider-and-cluster.md)）。BFE 在配置加载与热加载时校验 key 白名单（`openai`/`anthropic`）与 value 格式，非法配置拒绝加载，作为控制面校验被手工配置等路径绕过时的兜底。
+
 ## 本章小结
 
 本章介绍了壬远 AI 网关数据面组件 BFE 的设计。
@@ -566,6 +578,7 @@ prepareRequestBodyForRetry()
 - BFE 的 `bfe_module` 框架通过回调点与返回值机制组织模块，`bfe_modules/bfe_modules.go` 中的注册顺序直接影响行为正确性。
 - 配置加载采用 INI + JSON 双层结构，支持通过 Web 接口热加载，新配置在校验完成后原子替换旧配置。
 - `mod_ai_route` 支持 `apikey → entity → global` 三级路由、`targets` 加权选择与 `fallbacks` 顺序降级，是 AI 网关转发的核心。
+- 上游路径按协议改写：`AIConf.ProtocolPaths` 将标准入口 `/v1/...` 改写为 provider 前缀，未配置则纯透传；改写只作用于出站拷贝，fallback 每次 attempt 独立重算，非标准入口永不改写。
 
 ## 参考文档
 
@@ -576,3 +589,4 @@ prepareRequestBodyForRetry()
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route_bfe_changes.md`
 - `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
+- `bfe/docs/zh_cn/sys_design/ai_protocol_paths.md`

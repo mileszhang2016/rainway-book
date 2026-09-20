@@ -2,7 +2,7 @@
 
 ## Chapter Goals
 
-Through this chapter, readers will learn the role and positioning of the Provider in the Rainway AI Gateway, become proficient in creating and maintaining Providers via the Dashboard and OpenAPI, correctly configure the model endpoint, model list, Provider Keys, and backend instance pool, use the model discovery tool to automatically probe models, understand the differences among supported model protocols, master the method of batch-importing model pricing via model-list.yaml, and clarify the relationship between Provider and Cluster and the impact of changes.
+Through this chapter, readers will learn the role and positioning of the Provider in the Rainway AI Gateway, become proficient in creating and maintaining Providers via the Dashboard and OpenAPI, correctly configure the model endpoint, model list, Provider Keys, and backend instance pool, use the model discovery tool to automatically probe models, understand the differences among supported model protocols, master the method of batch-importing model pricing via model-list.yaml, and clarify the relationship between Provider and Cluster and the impact of changes, as well as how to configure the `protocol_paths` protocol path mapping for multi-protocol providers and its caveats.
 
 ## The Concept and Role of the Provider
 
@@ -15,7 +15,7 @@ After Provider and Cluster are separated, their responsibilities become clearer:
 
 This separation brings many benefits: when the same Provider is referenced by multiple Clusters, the instance pool and keys only need to be maintained in one place, avoiding duplicate configuration; the Cluster no longer stores API Key plaintext and only references Keys in the Provider by name, improving security; the Provider can be created, updated, and deleted independently, while Clusters obtain backend capability by reference, making their lifecycles more independent; when a new protocol is added, only the Provider's model_protocols needs to be extended, without causing the Cluster model list to continuously grow.
 
-The core fields of a Provider include: a globally unique `name`, an optional `description`, the model discovery endpoint `model_endpoint`, the supported model list `models`, the API Key list `keys`, the backend instance pool `instance_pool`, the supported protocols `model_protocols`, the time zone `time_zone`, and the time-of-day templates `tiers`. Among them, `instance_pool` is required and must contain at least one instance with weight greater than 0, and `model_protocols` is required and must contain at least one protocol.
+The core fields of a Provider include: a globally unique `name`, an optional `description`, the model discovery endpoint `model_endpoint`, the supported model list `models`, the API Key list `keys`, the backend instance pool `instance_pool`, the supported protocols `model_protocols`, the optional protocol path mapping `protocol_paths`, the time zone `time_zone`, and the time-of-day templates `tiers`. Among them, `instance_pool` is required and must contain at least one instance with weight greater than 0, and `model_protocols` is required and must contain at least one protocol.
 
 The default value of `time_zone` is `Asia/Shanghai`, used to determine which tier the current time belongs to. In the initial phase, `tiers` only supports `name=peak`, and each tier contains several `time_ranges` with a left-closed, right-open semantics. The time zone and tiers can be maintained separately via `PUT /v1/providers/{provider_name}/pricing-tiers`, without being passed when the Provider is created.
 
@@ -123,6 +123,49 @@ A Provider declares the supported model access protocols via the `model_protocol
 A Provider can support multiple protocols at the same time; for example, an aggregation platform can be configured with `["openai", "anthropic"]`, but at least one protocol is required.
 
 `model_protocols` affects the forwarding behavior of the BFE Data Plane. For authentication header injection, `openai` uses `Authorization: Bearer` and `anthropic` uses `x-api-key`; Claude requests also require injecting `anthropic-version`. Usage parsing handles different response formats by protocol style—for example, the OpenAI-style `usage` field and the Claude-style `usage` field have different structures. Protocol matching validation checks whether the request's protocol style is in the `model_protocols` of the Provider corresponding to the target Cluster; if not, the request is rejected directly. When the Control Plane generates the BFE configuration, it passes `provider.model_protocols` through to `AIConf.ModelProtocols` for the Data Plane to use.
+
+## Protocol Path Configuration (protocol_paths)
+
+Different providers use different upstream path prefixes, and different protocols of the same provider often live under different prefixes: Bailian DashScope exposes OpenAI compatibility at `/compatible-mode/v1` and Anthropic compatibility at `/apps/anthropic`; Volcano Ark pay-as-you-go uses `/api/v3` and `/api/compatible`; Kimi Code membership (api.kimi.com) uses `/coding/v1` and `/coding`. Without `protocol_paths`, BFE forwards the upstream path unchanged and clients must send requests using the provider's native paths; with it, clients can uniformly access all providers through the standard entry `/v1/...`, and BFE rewrites the path during forwarding.
+
+`protocol_paths` is a mapping of "protocol -> upstream base path", whose value is the path part of the protocol's official SDK `base_url`: `openai` includes the `/v1` tail (e.g., `/compatible-mode/v1`), while `anthropic` does not (e.g., `/apps/anthropic`, since the Anthropic SDK appends `/v1/messages` itself). When configuring, you can copy the base_url column directly from the provider's official documentation. Reference values for common providers:
+
+| Provider | protocol_paths |
+|----------|----------------|
+| Bailian DashScope | `{"openai": "/compatible-mode/v1", "anthropic": "/apps/anthropic"}` |
+| Kimi Open Platform (api.moonshot.cn) | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| Kimi Code Membership (api.kimi.com) | `{"openai": "/coding/v1", "anthropic": "/coding"}` |
+| DeepSeek | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| Volcano Ark · Pay-as-you-go | `{"openai": "/api/v3", "anthropic": "/api/compatible"}` |
+| Volcano Ark · Coding Plan | `{"openai": "/api/coding/v3", "anthropic": "/api/coding"}` |
+
+Configuration constraints:
+
+- The key must be `openai` or `anthropic` already declared in the Provider's `model_protocols`; paths cannot be configured for undeclared protocols.
+- The value must start with `/`, must not end with `/`, must not contain `..`/`?`/`#`, and must be no longer than 128 characters.
+- Omitting the field means it is disabled and request paths are forwarded unchanged.
+- PATCH updates follow the partial-update convention: omitting the field keeps the current value; explicitly passing `null` clears it (restoring pass-through).
+
+Forwarding behavior: only the standard entry is rewritten (an anthropic request `/v1/messages` -> `{anthropic value}/v1/messages`; an openai request `/v1/chat/completions` -> `{openai value}/chat/completions`). When the protocol has no configured entry, or the request was sent using the provider's native path (a non-standard entry), the path is forwarded unchanged, remaining compatible with existing clients.
+
+Caveats:
+
+- **Billing-domain mismatch**: on some providers the path carries billing semantics (Volcano `/api/v3` pay-as-you-go vs `/api/coding` subscription). A subscription Key mistakenly configured with a pay-as-you-go prefix will be billed incorrectly, so verify the Key type matches the path before configuring.
+- **Model discovery endpoint is not linked**: `model_endpoint` is not derived from `protocol_paths`. For example, Anthropic-protocol model discovery on Bailian requires manually setting `model_endpoint.uri` to `/apps/anthropic/v1/models`.
+- **Release ordering**: `protocol_paths` depends on the BFE Data Plane supporting the `AIConf.ProtocolPaths` rewrite; the configuration has no effect on older BFE versions.
+
+Configuration example (Bailian):
+
+```json
+{
+    "name": "bailian",
+    "model_protocols": ["openai", "anthropic"],
+    "protocol_paths": {
+        "openai": "/compatible-mode/v1",
+        "anthropic": "/apps/anthropic"
+    }
+}
+```
 
 ## Model Pricing Import
 
@@ -247,6 +290,10 @@ Check whether the Cluster's `llm_config.models` is a subset of the Provider's `m
 
 Check whether a `(provider, model, mode)` record exists in `/model-prices`; whether the `model-list.yaml` import succeeded, paying attention to the `errors` list; whether `price_currency` is `RMB`; and whether the price fields in prices and tier_prices are non-negative.
 
+### 7. protocol_paths is configured but requests are not rewritten (upstream 404)
+
+Confirm that the request uses the standard entry `/v1/...` (non-standard entries are never rewritten and are forwarded unchanged); that the request protocol is declared in `model_protocols` and has a corresponding `protocol_paths` entry; and that the BFE version supports `AIConf.ProtocolPaths` (a key whitelist is validated at load time, and invalid configurations are rejected with the offending cluster identified). If a fallback occurred, pass-through after switching to a backup cluster without `protocol_paths` is expected behavior.
+
 ## Configuration Examples
 
 ### Complete Provider JSON Configuration
@@ -318,7 +365,7 @@ A Cluster does not declare `instance_pool`, `model_endpoint`, or `provider_type`
 
 The Provider is the core resource in the Control Plane of the Rainway AI Gateway for describing downstream model providers. After the responsibilities of Provider and Cluster are separated, the Cluster focuses on forwarding policies while the Provider focuses on access information, improving configuration reusability, security, and maintainability.
 
-Key points of this chapter: the data model and field meanings of the Provider; the flows for creating and updating Providers via the Dashboard and OpenAPI; the configuration methods and constraints of the model endpoint, model list, and Provider Keys; using the stateless model discovery tool `/providers/tools/discover-models`; the impact of the `openai` and `anthropic` protocols on authentication headers, version headers, usage parsing, and protocol matching; the process and caveats of batch-importing model pricing via `model-list.yaml`; the price fields for image input tokens and per-video billing, and the `responses` and `video_generation` billing modes; the strong reference relationship between Provider and Cluster and the synchronization and conflict handling during changes; and troubleshooting ideas for common issues plus configuration examples.
+Key points of this chapter: the data model and field meanings of the Provider; the flows for creating and updating Providers via the Dashboard and OpenAPI; the configuration methods and constraints of the model endpoint, model list, and Provider Keys; using the stateless model discovery tool `/providers/tools/discover-models`; the configuration methods, constraints, and forwarding behavior of the `protocol_paths` protocol path mapping; the impact of the `openai` and `anthropic` protocols on authentication headers, version headers, usage parsing, and protocol matching; the process and caveats of batch-importing model pricing via `model-list.yaml`; the price fields for image input tokens and per-video billing, and the `responses` and `video_generation` billing modes; the strong reference relationship between Provider and Cluster and the synchronization and conflict handling during changes; and troubleshooting ideas for common issues plus configuration examples.
 
 Properly planning the separation of Provider and Cluster is an important prerequisite for subsequent route rules, API-Key quotas, and rate limiting policies to take effect. It is recommended that in production you first maintain Providers and model prices in a unified way, and then create Clusters for different business lines as needed. Regularly comparing the provider lists returned by `/providers` and `/model-prices/actions/get-providers` helps promptly detect and backfill cases where price records drift from actual Providers, ensuring accurate cost accounting.
 

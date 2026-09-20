@@ -361,6 +361,8 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 
 项目不提供增量 migration 脚本，`db_ddl.sql`（SQLite 对应 `db_ddl_sqlite.sql`）为全量建表脚本。从旧版本升级时，需要手工在现有库中执行新增表的建表语句（如 `operation_logs`、`entity_id_seq`），应用层不会自动补表。
 
+新增可选字段通过加列方式演进，例如 `providers` 表在 v0.0.10 增加 `protocol_paths` TEXT 列（JSON，存"协议 → 上游 base path"映射），存量数据为 NULL 即未配置，无需数据迁移，应用层不读即忽略。
+
 从映射关系可以看出，Storage 子包的划分依据是业务域而非数据库表数量。例如 `cluster_conf` 子包同时管理 `clusters`、`sub_clusters`、`pools`、`lb_matrices` 四张表，因为这几张表共同服务于集群配置这一业务概念；`route_conf` 子包同时管理 `domains`、`route_basic_rules`、`route_advance_rules`、`route_default_rules`，因为它们共同组成产品级路由规则（AI 网关模式下不用于 AI 请求的 Cluster 选择，仅用于产品线识别上下文或非 AI 流量场景）。这种按业务域聚合的方式，让 Storage 接口更贴近模型层 Manager 的调用需求，避免了 Manager 同时依赖多个细粒度 Storage 的复杂局面。
 
 ## 报表存储实现（独立报表库）

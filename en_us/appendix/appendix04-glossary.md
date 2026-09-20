@@ -90,6 +90,9 @@
 **Product (Product Line)**
 : The top-level resource isolation unit in BFE; in AI Gateway mode it is mainly used for product line identification and configuration context loading.
 
+**protocol_paths (Protocol Path Mapping)**
+: An optional field on a Provider declaring the upstream base path for each model protocol (`openai`/`anthropic`); BFE rewrites the standard entry `/v1/...` to the provider's native prefix based on it, and forwards unchanged when it is unconfigured.
+
 ## Q
 
 **Quota Plan**

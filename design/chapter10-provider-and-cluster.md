@@ -8,6 +8,7 @@
 - 理解二者解耦的设计动机、实现方式和带来的收益。
 - 掌握控制面如何根据 Provider + Cluster 生成 BFE 数据面所需的 `AIConf`。
 - 了解模型发现、Key 引用与权重、Key Policy、Key Affinity 等关键机制。
+- 了解 `protocol_paths` 协议路径改写的语义、校验规则与数据面执行方式。
 - 能够写出符合规范的实际配置。
 
 ## Provider 的设计目标与数据模型
@@ -65,6 +66,7 @@ Provider（提供商）回答的是“下游是谁、能访问哪些模型、如
 - `keys`：API-Key 列表，每项包含 `name` 与 `key` 明文。`name` 用于 cluster 引用。
 - `instance_pool`：后端实例池，至少包含一个实例，且至少有一个实例的 `weight > 0`。
 - `model_protocols`：支持的模型访问协议，首期枚举为 `openai`、`anthropic`。
+- `protocol_paths`：可选，协议 → 上游 base path 的声明式映射，用于将标准入口 `/v1/...` 改写为 provider 原生前缀，详见下文「协议路径改写」。
 - `time_zone` / `tiers`：用于高峰/闲时价格匹配，初期只支持 `peak` tier。
 
 ## Cluster 的设计目标与数据模型
@@ -223,6 +225,7 @@ flowchart LR
         P2[keys 明文]
         P3[model_protocols]
         P4[models]
+        P5[protocol_paths]
     end
     subgraph Cluster
         C1[models]
@@ -240,11 +243,13 @@ flowchart LR
         A5[Provider / MatchPrefix / StripPrefix]
         A6[ModelProtocols]
         A7[ModelTable]
+        A8[ProtocolPaths]
     end
     P1 -->|生成实例池/子集群/集群| CT[cluster_table]
     P2 -->|按 name join| A3
     C3 -->|按 name join| A3
     P3 --> C6 --> A6
+    P5 -->|按 provider 引用透传| A8
     C1 --> A1
     C2 --> A2
     C4 --> A4
@@ -264,6 +269,7 @@ flowchart LR
 | `AIConf.Provider` | `cluster.llm_config.provider` |
 | `AIConf.MatchPrefix` / `StripPrefix` | `cluster.llm_config.match_prefix` / `strip_prefix` |
 | `AIConf.ModelProtocols` | `provider.model_protocols` 按 cluster 的 provider 引用透传 |
+| `AIConf.ProtocolPaths` | `provider.protocol_paths` 按 cluster 的 provider 引用透传 |
 | `AIConf.ModelTable` | 由 provider 查询 `model-prices` 自动填充 |
 
 ### ModelTable 的自动填充
@@ -284,6 +290,31 @@ flowchart LR
 `ModelProtocols` 来自 Provider 的 `model_protocols`，控制面按 cluster 的 `provider` 引用透传到 `AIConf`。BFE 据此判断请求协议风格（如 OpenAI 兼容格式或 Anthropic Messages API）。
 
 数据面在启动加载与热加载时都会校验每个 cluster 的 `AIConf.ModelProtocols`：`bfe_server/bfe_confdata_load.go` 中的 `validateClusterModelProtocols` 调用 `bfe_model_protocol.ValidateProtocols`，要求列表中的每个协议都已在 `bfe_model_protocol` 协议适配层注册表中注册（内置 `openai`、`anthropic`）；只要出现未知协议名，启动加载或热加载就会失败，并指明是哪个集群配置非法。空列表视为合法，按默认 `["openai"]` 处理。协议适配层的设计详见[第七章 数据面转发设计：BFE](./chapter07-data-plane-design.md)。
+
+### 协议路径改写（protocol_paths）
+
+不同 provider（以及同一 provider 的不同协议）的上游路径前缀各不相同：百炼 OpenAI 兼容挂在 `/compatible-mode/v1`、Anthropic 兼容挂在 `/apps/anthropic`，Kimi Code 会员是 `/coding/v1` 与 `/coding`，火山方舟按量是 `/api/v3` 与 `/api/compatible`。BFE 数据面对上游路径默认纯透传，若不加处理，客户端必须按 provider 原生路径发起请求，同一套客户端 SDK 配置（统一打标准入口 `/v1/...`）无法复用到多家 provider。
+
+为此，Provider 新增可选字段 `protocol_paths`：协议 → 上游 base path 的声明式映射。语义约定：`protocol_paths[protocol]` = 该协议官方 SDK `base_url` 的 path 部分——`openai` 含 `/v1` 尾（`/compatible-mode/v1`、`/api/v3`、`/coding/v1`）；`anthropic` 不含 `/v1`（`/apps/anthropic`、`/coding`、`/anthropic`，Anthropic SDK 会自拼 `/v1/messages`）。配置值可直接照抄 provider 官方文档的 base_url 一栏。
+
+BFE 在转发时按检测到的请求协议改写标准入口路径：anthropic 请求 `/v1/messages` → `{anthropic 值}/v1/messages`；openai 请求 `/v1/chat/completions` → `{openai 值}/chat/completions`。未配置 `protocol_paths` 或对应协议无条目时原样透传；非标准入口路径（provider 原生路径、`/v10/xxx`、gemini 风格的 `/v1beta/...`）永不改写。改写只改出站请求的 URL path：不改请求/响应体、不改 host/scheme；gemini 协议也不进入 `protocol_paths`（其原生路径本身就是标准路径，透传已可用）。
+
+控制面校验规则：key 必须是 `model_protocols` 已声明的 `openai` 或 `anthropic`；value 必须 `/` 开头、不以 `/` 结尾、不含 `..`/`?`/`#`、长度不超过 128。导出方面，`provider.protocol_paths` 按 cluster 的 provider 引用恒透传至 `AIConf.ProtocolPaths`（与 `ModelProtocols` 同模式，cluster 不单独持有路径配置，保持单一事实来源）；BFE 加载期另做 key 白名单与 value 格式校验兜底，非法配置拒绝加载。
+
+常见 provider 的参考值：
+
+| provider | protocol_paths |
+|----------|----------------|
+| 百炼 DashScope | `{"openai": "/compatible-mode/v1", "anthropic": "/apps/anthropic"}` |
+| Kimi 开放平台（api.moonshot.cn） | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| Kimi Code 会员（api.kimi.com） | `{"openai": "/coding/v1", "anthropic": "/coding"}` |
+| DeepSeek | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| 火山方舟·按量 | `{"openai": "/api/v3", "anthropic": "/api/compatible"}` |
+| 火山方舟·Coding Plan | `{"openai": "/api/coding/v3", "anthropic": "/api/coding"}` |
+
+两点注意：path 在部分 provider 上挂计费语义（火山 `/api/v3` 按量 vs `/api/coding` 订阅），订阅 Key 误配按量前缀会错扣费，配置时需核对 Key 类型与 path 的对应关系；模型发现端点（`model_endpoint`）不随 `protocol_paths` 自动生成，例如百炼 Anthropic 协议的模型发现需手工配置 `/apps/anthropic/v1/models`。
+
+改写执行细节与 fallback 重算语义见[第七章 数据面转发设计：BFE](./chapter07-data-plane-design.md)。
 
 ## 模型发现机制
 

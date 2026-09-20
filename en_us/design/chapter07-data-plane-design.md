@@ -11,6 +11,7 @@ This chapter focuses on BFE (Beyond Front End), the Data Plane component of the 
 - The callback mechanism and module registration of the BFE module framework `bfe_module`;
 - The loading, validation, and hot reload mechanisms of AI-related configuration files;
 - Key configuration examples and forwarding fallback behavior.
+- The execution timing, pass-through compatibility, and fallback recomputation behavior of upstream path rewriting by protocol (`ProtocolPaths`).
 
 ## The Role of BFE in the Rainway AI Gateway
 
@@ -559,6 +560,17 @@ Return the final response or 500
 
 This flow ensures that degradation is attempted only when the backend is unavailable or returns a server error, while client errors do not trigger meaningless fallbacks, avoiding the spread of erroneous requests to backup clusters.
 
+## Upstream Path Rewriting by Protocol (ProtocolPaths)
+
+Different providers use different upstream path prefixes (e.g., Bailian `/compatible-mode/v1`, Volcano `/api/v3`, Kimi Code `/coding/v1`), and different protocols of the same provider often live under different prefixes. To let clients send requests uniformly through the standard entry `/v1/...`, BFE rewrites the URL path of outbound requests inside the forwarding loop according to the cluster's `AIConf.ProtocolPaths`:
+
+- anthropic request: `/v1/messages` -> `{ProtocolPaths[anthropic]}/v1/messages` (e.g., `/apps/anthropic/v1/messages`);
+- openai request: `/v1/chat/completions` -> `{ProtocolPaths[openai]}/chat/completions` (e.g., `/compatible-mode/v1/chat/completions`).
+
+The rewrite is computed by the pure function `rewriteUpstreamPath` in `bfe_server/ai_path_rewrite.go`, executed in `doSingleAIForward` after the outbound request copy is created and before `clusterInvoke`, and applies only to the standard entry (the exact value `/v1` or the `/v1/` prefix). When `ProtocolPaths` is not configured or has no entry for the detected protocol, the path is forwarded unchanged; non-standard entries such as `/v10/xxx` or Gemini-style `/v1beta/...` are never rewritten. The rewrite only affects the outbound copy and never the inbound request, so every fallback attempt recomputes the path from the original client path — after switching to a backup cluster with a different prefix configuration, the upstream path automatically follows the new cluster's configuration.
+
+`ProtocolPaths` is passed through unchanged by the Control Plane from the provider referenced by the cluster (the configuration entry is the Provider's `protocol_paths` field; see [Chapter 10: Provider and Cluster Design](./chapter10-provider-and-cluster.md)). BFE also validates the key whitelist (`openai`/`anthropic`) and the value format at configuration load and hot reload, rejecting invalid configurations as a safety net when Control Plane validation is bypassed by manual edits.
+
 ## Chapter Summary
 
 This chapter introduced the design of BFE, the Data Plane component of the Rainway AI Gateway.
@@ -571,6 +583,7 @@ This chapter introduced the design of BFE, the Data Plane component of the Rainw
 - BFE's `bfe_module` framework organizes modules through callback points and return values; the registration order in `bfe_modules/bfe_modules.go` directly affects behavioral correctness.
 - Configuration loading adopts a two-layer INI + JSON structure, supports hot reload through the web interface, and new configurations atomically replace the old ones after validation completes.
 - `mod_ai_route` supports three-level routing of `apikey → entity → global`, weighted selection of `targets`, and sequential degradation of `fallbacks`, and is the core of AI Gateway forwarding.
+- Upstream path rewriting by protocol: `AIConf.ProtocolPaths` rewrites the standard entry `/v1/...` to the provider prefix, with pure pass-through when unconfigured; the rewrite only affects the outbound copy, every fallback attempt recomputes it independently, and non-standard entries are never rewritten.
 
 ## References
 
@@ -581,3 +594,4 @@ This chapter introduced the design of BFE, the Data Plane component of the Rainw
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route_bfe_changes.md`
 - `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
+- `bfe/docs/zh_cn/sys_design/ai_protocol_paths.md`

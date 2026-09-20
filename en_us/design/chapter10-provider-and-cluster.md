@@ -8,6 +8,7 @@ In the Control Plane of Rainway AI Gateway, the model Provider and the forwardin
 - Understand the design motivation, implementation, and benefits of decoupling the two.
 - Understand how the Control Plane generates the `AIConf` required by the BFE Data Plane from Provider + Cluster.
 - Learn about key mechanisms such as model discovery, Key references and weights, Key Policy, and Key Affinity.
+- Understand the semantics, validation rules, and Data Plane execution of `protocol_paths` protocol path rewriting.
 - Write practical configurations that conform to the specification.
 
 ## Provider Design Goals and Data Model
@@ -65,6 +66,7 @@ Key field descriptions:
 - `keys`: A list of API-Keys, each containing a `name` and the plaintext `key`. The `name` is used for cluster references.
 - `instance_pool`: The backend instance pool, containing at least one instance, and at least one instance must have `weight > 0`.
 - `model_protocols`: The supported model access protocols; the initial enum values are `openai` and `anthropic`.
+- `protocol_paths`: Optional. A declarative mapping of protocol -> upstream base path, used to rewrite the standard entry `/v1/...` to the provider's native prefix; see "Protocol Path Rewriting" below.
 - `time_zone` / `tiers`: Used for peak/off-peak price matching; only the `peak` tier is supported initially.
 
 ## Cluster Design Goals and Data Model
@@ -223,6 +225,7 @@ flowchart LR
         P2[keys plaintext]
         P3[model_protocols]
         P4[models]
+        P5[protocol_paths]
     end
     subgraph Cluster
         C1[models]
@@ -240,11 +243,13 @@ flowchart LR
         A5[Provider / MatchPrefix / StripPrefix]
         A6[ModelProtocols]
         A7[ModelTable]
+        A8[ProtocolPaths]
     end
     P1 -->|Generate instance pool/sub-cluster/cluster| CT[cluster_table]
     P2 -->|Join by name| A3
     C3 -->|Join by name| A3
     P3 --> C6 --> A6
+    P5 -->|Passed through by provider reference| A8
     C1 --> A1
     C2 --> A2
     C4 --> A4
@@ -264,6 +269,7 @@ The generation sources of each field are as follows:
 | `AIConf.Provider` | `cluster.llm_config.provider` |
 | `AIConf.MatchPrefix` / `StripPrefix` | `cluster.llm_config.match_prefix` / `strip_prefix` |
 | `AIConf.ModelProtocols` | `provider.model_protocols` passed through by the cluster's provider reference |
+| `AIConf.ProtocolPaths` | `provider.protocol_paths` passed through by the cluster's provider reference |
 | `AIConf.ModelTable` | Auto-populated by querying `model-prices` from the provider |
 
 ### Automatic Population of ModelTable
@@ -284,6 +290,31 @@ When `strip_prefix=true`, `match_prefix` is required, must be non-empty, and mus
 `ModelProtocols` comes from the Provider's `model_protocols`; the Control Plane passes it through to `AIConf` according to the cluster's `provider` reference. BFE uses it to determine the request protocol style (such as the OpenAI-compatible format or the Anthropic Messages API).
 
 The data plane validates every cluster's `AIConf.ModelProtocols` at both startup load and hot reload: `validateClusterModelProtocols` in `bfe_server/bfe_confdata_load.go` calls `bfe_model_protocol.ValidateProtocols`, requiring every protocol in the list to be registered in the `bfe_model_protocol` adapter registry (built-in: `openai`, `anthropic`). If any unknown protocol name appears, the load or hot reload fails, reporting which cluster's configuration is invalid. An empty list is valid and treated as the default `["openai"]`. The design of the protocol adapter layer is covered in [Chapter 7: Data Plane Forwarding Design: BFE](./chapter07-data-plane-design.md).
+
+### Protocol Path Rewriting (protocol_paths)
+
+Different providers (and different protocols of the same provider) use different upstream path prefixes: Bailian exposes OpenAI compatibility under `/compatible-mode/v1` and Anthropic compatibility under `/apps/anthropic`; Kimi Code membership uses `/coding/v1` and `/coding`; Volcano Ark pay-as-you-go uses `/api/v3` and `/api/compatible`. By default the BFE Data Plane forwards upstream paths unchanged, so without this feature clients must send requests using each provider's native path, and a single client SDK configuration (uniformly hitting the standard entry `/v1/...`) cannot be reused across providers.
+
+For this reason, the Provider gains an optional field `protocol_paths`: a declarative mapping of protocol -> upstream base path. The semantic convention: `protocol_paths[protocol]` is the path part of that protocol's official SDK `base_url` — `openai` includes the `/v1` tail (`/compatible-mode/v1`, `/api/v3`, `/coding/v1`); `anthropic` does not (`/apps/anthropic`, `/coding`, `/anthropic`, since the Anthropic SDK appends `/v1/messages` itself). The configured value can be copied directly from the base_url column of the provider's official documentation.
+
+At forwarding time, BFE rewrites standard-entry paths according to the detected request protocol: an anthropic request `/v1/messages` -> `{anthropic value}/v1/messages`; an openai request `/v1/chat/completions` -> `{openai value}/chat/completions`. When `protocol_paths` is unconfigured or has no entry for the protocol, the path is forwarded unchanged; non-standard-entry paths (native provider paths, `/v10/xxx`, Gemini-style `/v1beta/...`) are never rewritten. The rewrite only changes the URL path of the outbound request: it does not touch the request/response body or the host/scheme, and the gemini protocol does not enter `protocol_paths` (its native path is already the standard path and pass-through works).
+
+Control Plane validation: the key must be `openai` or `anthropic` already declared in `model_protocols`; the value must start with `/`, must not end with `/`, must not contain `..`/`?`/`#`, and must be at most 128 characters. For export, `provider.protocol_paths` is passed through unchanged to `AIConf.ProtocolPaths` by the cluster's provider reference (same pattern as `ModelProtocols`; clusters do not hold path configuration separately, keeping a single source of truth). BFE additionally validates the key whitelist and value format at load time as a safety net, rejecting invalid configurations.
+
+Reference values for common providers:
+
+| Provider | protocol_paths |
+|----------|----------------|
+| Bailian DashScope | `{"openai": "/compatible-mode/v1", "anthropic": "/apps/anthropic"}` |
+| Kimi Open Platform (api.moonshot.cn) | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| Kimi Code Membership (api.kimi.com) | `{"openai": "/coding/v1", "anthropic": "/coding"}` |
+| DeepSeek | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| Volcano Ark · Pay-as-you-go | `{"openai": "/api/v3", "anthropic": "/api/compatible"}` |
+| Volcano Ark · Coding Plan | `{"openai": "/api/coding/v3", "anthropic": "/api/coding"}` |
+
+Two caveats: on some providers the path carries billing semantics (Volcano `/api/v3` pay-as-you-go vs `/api/coding` subscription), so a subscription Key mistakenly configured with a pay-as-you-go prefix will be billed incorrectly — verify the Key type against the path when configuring; and the model discovery endpoint (`model_endpoint`) is not derived from `protocol_paths` — for example, Anthropic-protocol model discovery on Bailian requires manually configuring `/apps/anthropic/v1/models`.
+
+The execution details and fallback recomputation semantics are covered in [Chapter 7: Data Plane Forwarding Design: BFE](./chapter07-data-plane-design.md).
 
 ## Model Discovery
 
