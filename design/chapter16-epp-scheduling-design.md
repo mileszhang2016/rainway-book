@@ -116,7 +116,7 @@ Cluster 资源携带两个与 EPP 相关的字段：
 
 ### /epp-pool：EPP 实例池
 
-EPP 实例池是单例资源，管理面模式对齐 `/alb-pool`：`GET` 详情 + `PATCH` 全量替换。实例池由实例组（group）与实例列表构成：
+EPP 实例池是单例资源：`GET` 详情 + `PATCH` 全量替换。实例池由实例组（group）与实例列表构成：
 
 ```json
 {

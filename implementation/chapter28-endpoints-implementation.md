@@ -34,7 +34,6 @@ ai-gateway-api/endpoints/
 │   ├── endpoints.go          # 统一合并各子包 Endpoint
 │   ├── api_key/              # /api-keys
 │   ├── auth/                 # /auth、/meta
-│   ├── bfe_pool/             # /alb-pool
 │   ├── certificate/          # /certificates
 │   ├── domain/               # 当前未注册
 │   ├── entity/               # /entities
@@ -366,7 +365,6 @@ func endpoints() []*xreq.Endpoint {
         certificate.Endpoints,
         product_pool.Endpoints,
         subcluster.Endpoints,
-        bfe_pool.Endpoints,
         auth.Endpoints,
         traffic.Endpoints,
         bfe_cluster.Endpoints,

@@ -116,7 +116,7 @@ In storage, the `clusters` table contains a `balance_mode` column (default `'WRR
 
 ### /epp-pool: The EPP Instance Pool
 
-The EPP instance pool is a singleton resource, with management-plane semantics aligned to `/alb-pool`: `GET` for detail + `PATCH` for full replacement. The pool consists of instance groups (groups) and instance lists:
+The EPP instance pool is a singleton resource: `GET` for detail + `PATCH` for full replacement. The pool consists of instance groups (groups) and instance lists:
 
 ```json
 {
