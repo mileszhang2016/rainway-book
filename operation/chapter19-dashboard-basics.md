@@ -36,7 +36,7 @@ http://api-server:8183/login
 
 ## 控制台界面导览
 
-登录成功后，控制台呈现「左侧导航 + 右侧内容区」的布局。导航由 `/meta` 接口动态返回，对应 `conf/nav_tree.toml` 中定义的导航树。当前管理员视角下的主导航包括资源管理、消费者管理、路由管理、用户管理四大类：
+登录成功后，控制台呈现「左侧导航 + 右侧内容区」的布局。导航由 `/meta` 接口动态返回，对应 `conf/nav_tree.toml` 中定义的导航树。当前管理员视角下的主导航包括资源管理、消费者管理、路由管理、数据报表与用户管理等模块：
 
 ```
 AI 网关
@@ -49,6 +49,7 @@ AI 网关
 │   └─ API Key 管理      调用凭证签发与治理
 ├─ 路由管理
 │   └─ 路由表            Global / Entity / API-Key 路由规则
+├─ 数据报表              用量、延迟、成本与日志明细（配置 [Report] 后展示）
 └─ 用户管理              控制台账号与 Token（管理员）
 ```
 
@@ -62,6 +63,7 @@ AI 网关
 | Entity 管理 | `/entity-types`、`/entities` | 维护组织类型、组织架构、模型黑白名单、配额与限流策略 |
 | API Key 管理 | `/api-keys` | 创建、启用/禁用、配额绑定与密钥查看 |
 | 路由表 | `/global-route-rules`、`/route-tables` 等 | 维护 global / entity / api-key 三级路由规则 |
+| 数据报表 | `/report/overview`、`/report/timeseries`、`/report/rankings`、`/report/distribution`、`/report/logs` | 用量、延迟、成本与日志明细查询（配置 `[Report]` 后可用，未配置时无数据） |
 | 用户管理 | `/auth/users`、`/auth/tokens` | 维护控制台用户与机器 Token |
 
 ### 通用交互约定
@@ -128,6 +130,7 @@ Dashboard 的用户与权限由 `/auth` 接口族管理，相关定义详见 `ai
 | 消费者管理 → Entity 管理 | 查看 Entity 类型与组织树 | 创建类型 / 组织、配置配额 / 限流 / 模型访问控制 |
 | 消费者管理 → API Key 管理 | 查看 API Key 列表及挂载组织 | 创建 Key、重置配额、查看密钥 |
 | 路由管理 → 路由表 | 查看 Global / Entity / API-Key 三级路由表 | 启用 / 禁用路由表、编辑路由规则 |
+| 数据报表 | 查看用量总览与时序、排行、分布、日志明细（概览页 + 明细页） | 按时间窗与维度过滤报表（配置 `[Report]` 后展示，未配置时菜单不出现） |
 | 用户管理 | 查看控制台用户与 Token | 创建用户、创建 Token、修改密码 |
 
 路由规则示例（JSON 视图）如下：
@@ -257,7 +260,7 @@ curl -H "Authorization: <API Key>" \
 
 ## 报表与用量分析
 
-控制台内置报表页（AI Gateway API v0.0.10 起），面向管理员提供用量、延迟、成本与日志明细的统一视图，无需额外部署 Grafana。报表页数据来自 `/open-api/v1/report/*` 接口，前提是已按「第十八章 安装部署」完成报表形态配置：轻量形态（`[Report].Backend = "mysql"` + log-reader `mod_log_mysql` 插件）或标准形态（`Backend = "doris"` 接存量 Doris）。未配置 `[Report]` 时模块不装配，控制台不展示报表入口，接口返回 404。
+控制台内置数据报表模块，面向管理员提供用量、延迟、成本与日志明细的统一视图，无需额外部署 Grafana。报表数据来自 `/open-api/v1/report/*` 接口，前提是已按「第十八章 安装部署」完成报表形态配置：轻量形态（`[Report].Backend = "mysql"` + log-reader `mod_log_mysql` 插件）或标准形态（`Backend = "doris"` + Doris/Grafana 链路）。配置 `[Report]` 后控制台展示数据报表菜单（概览页 + 明细页）；未配置时报表模块不装配，菜单不出现，接口返回 404。
 
 报表页按以下视图组织：
 
@@ -297,13 +300,13 @@ curl -H "Authorization: <API Key>" \
 本章介绍了壬远 AI 网关 Dashboard 的基础操作。主要内容包括：
 
 - Dashboard 默认通过 `http://api-server:8183/login` 访问，初始账号为 `admin/admin`；
-- 控制台导航为「左侧导航 + 右侧内容区」，覆盖资源管理、消费者管理、路由管理、用户管理四大模块；
+- 控制台导航为「左侧导航 + 右侧内容区」，覆盖资源管理、消费者管理、路由管理、数据报表与用户管理等模块；配置 `[Report]` 后展示数据报表菜单（概览页 + 明细页）；
 - 模型服务商、AI 业务集群、模型定价、Entity 组织、API Key、路由表是控制台中的核心概念，理解它们的职责与引用关系是正确配置的前提；
 - 控制台采用抽屉表单、列表页、编辑模式等通用交互，路由规则需先本地保存再提交生效；
 - 用户、Session Key、Token 构成 Dashboard 与 API 的鉴权体系，Token 分为 `System` 与 `Support` 两种 Scope；
 - 配置版本基于 MD5 签名与 `YYYYMMDDHHMMSS` 版本号实现增量同步，主要暴露给 InnerAPI 与 Conf Agent；
 - 首次配置应按照“模型服务商 → AI 业务集群 → Entity（可选） → API Key → 路由规则 → curl 验证”的顺序进行；
-- 报表页提供总览、时序、排行、分布、日志明细五类视图，覆盖用量、延迟、成本与排障场景，需先完成报表形态部署方可使用；
+- 数据报表模块提供总览、时序、排行、分布、日志明细五类视图，覆盖用量、延迟、成本与排障场景，配置 `[Report]` 并部署报表形态后方可使用；
 - 日常运维需注意默认账号安全、级联引用检查、路由规则编辑模式、配置生效延迟与 Token 最小权限原则。
 
 掌握本章内容后，读者即可在 Dashboard 中完成壬远 AI 网关的初始化和基础管理操作，为后续章节中 Provider、Cluster、API-Key、限流等专项配置打下基础。

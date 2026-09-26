@@ -125,7 +125,7 @@ curl -X PATCH http://localhost:8183/open-api/v1/api-keys/apikey-001 \
 
 修改 `quota_plan.quota`（单位不变）时，系统会保留历史 `used`，按 `remaining = max(0, 新 quota - used)` 调整余额，并通过 `IncrBy(delta)` 原子调整 Redis。这种设计避免了普通调额时清空历史用量。修改 `unit` 或 `unlimited` 时，由于新旧单位无法换算，会重置 `used = 0`、`remaining = 新 quota`，并将 Redis 同步为新值。
 
-若将 API-Key 挂载到新的 Entity，且 `unlimited_quota=false` 且 `quota_plan.unlimited=false`，则要求新 Entity 或其祖先链上至少存在一个有效的 Quota Plan，否则更新会被拒绝。
+若将 API-Key 挂载到新的 Entity，控制面只校验目标 Entity 存在，对 Entity 及其祖先链上是否存在有效 Quota Plan 没有要求。
 
 ### 删除 API-Key
 
@@ -371,6 +371,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   -H "Content-Type: application/json" \
   -d '{
     "name": "bfe-project",
+    "description": "BFE 研发团队",
     "type": "team",
     "parent_id": "ent-ops-001",
     "allow_models": ["gpt-4", "claude-3"],
@@ -395,6 +396,8 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
     }
   }'
 ```
+
+`description` 为可选的组织描述字段：0-255 字符，不允许包含控制字符，控制台列表支持按该字段搜索与排序。更新语义为：`PUT` 全量更新省略 `description` 时将其清空，`PATCH` 部分更新省略时保持原值，显式传 `""` 则清空。
 
 ### 创建 API-Key 并挂载到 Entity
 
@@ -477,6 +480,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   -H "Content-Type: application/json" \
   -d '{
     "name": "ai-lab",
+    "description": "AI 实验室（部门级预算）",
     "type": "dep",
     "parent_id": null,
     "allow_models": ["*"],
@@ -499,6 +503,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   -H "Content-Type: application/json" \
   -d '{
     "name": "chatbot-proj",
+    "description": "智能客服项目",
     "type": "team",
     "parent_id": "ent-ai-lab-001",
     "allow_models": ["gpt-4", "gpt-3.5-turbo", "claude-3"],

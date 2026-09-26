@@ -21,6 +21,9 @@
 - **Conf Agent**：配置代理（Config Agent），与控制面通信并触发 BFE 配置热加载。对应仓库为 `bfenetworks/conf-agent`。
 - **Dashboard**：可视化管理控制台，通常以静态资源形式挂载到 AI Gateway API 中运行。
 - **Service Controller**：Kubernetes 服务发现组件，可选部署。
+- **Log Reader**：访问日志采集组件，随 BFE 部署在数据面，将 BFE 访问日志输出到 Kafka 或 MySQL，供报表与可观测链路消费。对应仓库为 `rainway-ai-gateway/log-reader`。
+
+此外，报表标准形态（Doris + Grafana）依赖一组可选的外部组件：Kafka 承接 log-reader 输出的日志消息，Doris 存储明细与聚合数据，Grafana 展示监控大盘。这组可观测组件不属于 AI 网关本体，其存储层与展示层的一键部署脚本由 `rainway-ai-gateway/ai-gateway-observability` 仓库提供，部署步骤见下文「报表标准形态部署（Doris + Grafana）」。
 
 ```mermaid
 flowchart LR
@@ -207,7 +210,7 @@ SQLite 适用于功能验证与开发调试，不建议用于生产高并发场�
 
 ## 报表轻量形态部署（可选）
 
-若需要在控制台查看用量报表而不引入 Kafka/Doris/Grafana，可启用报表轻量形态：访问日志由 log-reader `mod_log_mysql` 插件直写 MySQL，AI Gateway API 提供 `/report/*` 查询与内置聚合 JOB，控制台直接展示。标准形态（已有 Doris 链路）无需本步骤，仅需在 `[Report]` 中配置 `Backend = "doris"`。
+若需要在控制台查看用量报表而不引入 Kafka/Doris/Grafana，可启用报表轻量形态：访问日志由 log-reader `mod_log_mysql` 插件直写 MySQL，AI Gateway API 提供 `/report/*` 查询与内置聚合 JOB，控制台直接展示。标准形态（Doris + Grafana）无需本步骤，其部署方式见下文「报表标准形态部署（Doris + Grafana）」，完成后仅需在 `[Report]` 中配置 `Backend = "doris"`。
 
 部署遵循 schema-first 顺序：
 
@@ -248,6 +251,109 @@ SQLite 适用于功能验证与开发调试，不建议用于生产高并发场�
 - **分区先于数据**：MySQL 无动态分区，分区管理 JOB 先于数据到达建好分区（缺分区写入直接报错）；JOB 每 6h 巡检并在启动时立即补建一次。
 - **容量建议**：MySQL 形态面向日均百万级以下日志量，超量请使用 Doris 标准形态。
 - MySQL 后端不提供 P50/P90/P99 分位数延迟，控制台对应卡片自动降级隐藏。
+
+## 报表标准形态部署（Doris + Grafana）
+
+报表标准形态面向生产环境：BFE 访问日志经 log-reader `mod_kafka` 插件写入 Kafka，由 Doris Routine Load 实时落入明细表，再由 Doris INSERT JOB 每分钟聚合到分钟表；控制台报表页与 Grafana Dashboard 查询同一份 Doris 数据。存储层（Doris 建库/建表/Routine Load/INSERT JOB）与展示层（Grafana 数据源 + Dashboard）的一键部署脚本由 `rainway-ai-gateway/ai-gateway-observability` 仓库提供，数据链路如下：
+
+```text
+BFE（数据面）──访问日志──▶ log-reader (mod_kafka) ──JSON──▶ Kafka ──Routine Load──▶ Doris
+                                                                                  ├─ bfe_ai_request_log  （明细表，单请求粒度）
+                                                                                  └─ bfe_ai_metrics_1m   （聚合表，INSERT JOB 每分钟聚合）
+                                                                                            │
+                                                                                            ▼
+                                                                              Grafana（MySQL 协议直连 Doris FE:9030）
+```
+
+端到端延迟在 1 分钟以内（Routine Load 批量提交 1~5 秒，INSERT JOB 每分钟执行），满足分钟级报表与看板需求。
+
+### 前提条件
+
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| Doris | 4.0+ | FE 已启动且 query_port（默认 9030）可访问 |
+| Kafka | 2.8+ | Broker 可访问，`bfe_ai_log` Topic 已创建（按实际规模调整分区数与保留策略） |
+| Grafana | — | 已安装，且已知其安装根目录（含 `bin/` 与 `conf/provisioning/`） |
+| mysql 客户端 | 任意 | 用于连接 Doris FE 执行部署 SQL |
+| log-reader | v1.4.0 | 随 BFE 部署，启用 `mod_kafka` 插件 |
+
+### 步骤 1：部署 Doris 侧对象
+
+```bash
+cd ai-gateway-observability/doris
+
+# 生产环境（数据库 bfe_observability）：先编辑 setup.conf 填入 Doris FE 与 Kafka 连接信息
+vim setup.conf
+bash setup.sh
+
+# 测试环境（数据库 bfe_observability_test，Kafka Topic 使用 bfe_ai_log_test 的 _test 后缀）
+bash setup.sh ./setup_test.conf
+```
+
+`doris/setup.sh` 依次自动创建：数据库（默认 `bfe_observability`）、明细表 `bfe_ai_request_log`、聚合表 `bfe_ai_metrics_1m`、Routine Load `bfe_ai_log_load`（消费 Kafka 实时写明细表）、INSERT JOB `bfe_ai_metrics_1m_job`（每分钟把上一分钟明细聚合到分钟表）。数据库名、Kafka 地址、Topic、初始分区日期等均在 `setup.conf` / `setup_test.conf` 中参数化，无需改动 SQL。
+
+部署失败需要清空重试时，使用 `doris/cleanup.sh` 删除指定库下的两张表、Routine Load 与 INSERT JOB 后重新执行 `setup.sh`：
+
+```bash
+bash cleanup.sh              # 清空生产库（默认 setup.conf）
+bash cleanup.sh ./setup_test.conf   # 清空测试库
+```
+
+注意：Doris 的 INSERT JOB 名称全局唯一（不按库隔离），`bfe_ai_metrics_1m_job` 在生产与测试之间共享，清理测试库也会删除同名 Job；如需生产/测试完全隔离，请在各自配置中设置不同的 `JOB_NAME`。详细步骤与端到端验证清单见 `ai-gateway-observability/doris/docs/user/HOWTO.md`，表结构语义见同目录 `docs/design/TABLE_DESIGN.md`。
+
+### 步骤 2：部署 Grafana 侧
+
+```bash
+cd ai-gateway-observability/grafana
+
+# 生产环境：编辑 setup.conf，填写 GRAFANA_DIR、Doris FE 连接信息与数据源名称/UID
+vim setup.conf
+bash setup.sh
+
+# 测试环境（例如连接 bfe_observability_test）
+bash setup.sh ./setup_test.conf
+```
+
+`grafana/setup.sh` 基于 Grafana 的 provisioning（文件式配置）机制依次完成：写入 Doris 数据源（MySQL 协议直连 Doris FE 9030，指向目标库）、生成 Dashboard 供给配置并导入 `grafana/dashboards/bfe-ai-gateway-observability.json`（「BFE AI Gateway 可观测仪表盘」）、重启 Grafana 使配置生效。脚本会把 Dashboard 中的 `${DS_DORIS}` 占位符替换为数据源 UID，且每次执行都会覆盖目标配置文件，重复执行是安全的（重新配置并重启）。若 Grafana 由 systemd 管理，可将脚本内的重启步骤替换为 `systemctl restart grafana-server`。详细步骤见 `ai-gateway-observability/grafana/docs/user/HOWTO.md`，面板与 SQL 设计见同目录 `docs/design/DASHBOARD_DESIGN.md`。
+
+### 步骤 3：配置 log-reader 与 AI Gateway API
+
+1. **启用 log-reader 插件**：在 log-reader `conf/config.conf` 中配置 `Modules = mod_kafka`（与 `mod_log_mysql` 二选一，同一集群不要同时启用两种形态），并按 `conf/mod_kafka/mod_kafka.conf` 样例填写 Kafka Broker 地址与 Topic（生产 `bfe_ai_log`，测试 `bfe_ai_log_test`）。
+2. **配置 AI Gateway API**：在 `ai_gateway_api.toml` 中新增指向 Doris FE 的报表数据源与 `[Report]` 段：
+
+   ```toml
+   [Databases.report_db]
+   Driver = "mysql"         # 经 MySQL 协议连接 Doris FE
+   DBName = "bfe_observability"
+   Addr = "127.0.0.1:9030"
+   User = "report_read"
+   Passwd = "******"
+
+   [Report]
+   Backend = "doris"        # 缺省则报表模块不装配，/report/* 返回 404
+   Datasource = "report_db"
+   Database = ""            # 表名所属 schema 覆盖（可选）
+   ```
+
+   Doris 形态的分钟聚合由 Doris INSERT JOB `bfe_ai_metrics_1m_job` 完成，`EnableAggregateJob` / `EnablePartitionMgmt` 等 MySQL 形态专用的聚合与分区管理项仅对 `Backend = "mysql"` 生效。
+
+### 步骤 4：验证
+
+```bash
+# Routine Load 状态应为 RUNNING
+mysql -h127.0.0.1 -P9030 -uroot -e "SHOW ROUTINE LOAD FOR bfe_ai_log_load\G"
+
+# INSERT JOB 与两张表
+mysql -h127.0.0.1 -P9030 -uroot -e "SHOW JOBS FROM bfe_observability;"
+mysql -h127.0.0.1 -P9030 -uroot -e "USE bfe_observability; SHOW TABLES;"
+```
+
+随后登录控制台打开数据报表页确认总览指标有数据，并检查 Grafana「BFE AI Gateway 可观测仪表盘」各面板正常出图。
+
+注意事项：
+
+- **单集群单形态**：同一集群不要同时启用 `mod_kafka`（→ Doris）与 `mod_log_mysql`（→ MySQL），两条链路各自的数据缺口窗口会导致两套报表口径不一致。
+- **聚合表设计参考**：仓库示例中的聚合表 `bfe_ai_metrics_1m` 仅用于演示链路打通；生产环境可按查询场景拆分多张聚合表、调整为 5/15 分钟粒度，详见 `doris/docs/user/HOWTO.md` 的提示。
 
 ## 配置文件说明与最小可运行配置
 
@@ -749,6 +855,7 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 - 可通过 `make docker` 构建容器镜像，并采用 Kubernetes Deployment、Service 与 DaemonSet 进行集群化部署。
 - 多组件启动顺序为：数据库初始化 → AI Gateway API → BFE → Conf Agent，确保数据面能够及时获得控制面下发的最新配置。
 - BFE 镜像内置 tzdata；使用自定义镜像时需自行保证容器内时区数据完整。
+- 报表有两种部署形态：轻量形态由 log-reader `mod_log_mysql` 插件直写 MySQL；标准形态（Doris + Grafana）由 ai-gateway-observability 仓库的脚本一键部署 Doris 存储层与 Grafana 展示层，控制台经 `[Report].Backend = "doris"` 查询同一份数据。
 - 常见部署问题主要集中于数据库连接、静态资源挂载、Conf Agent 通信、TLS 配置关联检查、端口冲突与 Redis 连接失败。
 - 上线前应完成生产部署检查清单，重点检查密码安全、权限配置和回滚方案。
 
@@ -762,5 +869,8 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 - `ai-gateway-api/Makefile`：构建、打包、Docker 镜像构建与推送目标。
 - `conf-agent/AGENTS.md`：Conf Agent 架构、构建方式与本地启动命令。
 - `conf-agent/docs/zh_cn/config/config.md`：Conf Agent 配置文件详细说明。
+- `ai-gateway-observability/README.md`：可观测性（Doris + Grafana）仓库概览与数据链路。
+- `ai-gateway-observability/doris/docs/user/HOWTO.md`：Doris 建库/建表/Routine Load/INSERT JOB 部署与验证步骤。
+- `ai-gateway-observability/grafana/docs/user/HOWTO.md`：Grafana 数据源与 Dashboard 一键配置步骤。
 - [BFE 安装部署官方文档](https://www.bfe-networks.net/en_us/installation/install/)：BFE 数据面独立部署指南。
 - [ai-gateway-demo 部署示例仓库](https://github.com/rainway-ai-gateway/ai-gateway-demo)：Kubernetes 与 Docker Compose 完整示例。

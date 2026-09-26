@@ -32,6 +32,9 @@ The entry point is `cmd/epp/main.go`; parameter parsing is in `parseConfig` of `
 | `-default-pool` | empty | Fallback Cluster when a request lacks the inference-pool metadata (empty = reject) |
 | `-engine-drain-timeout` | `60s` | In-flight request drain cap for the old engine during an engine hot swap |
 | `-refresh-metrics-interval` | `50ms` | Scrape interval for backend `/metrics` metrics |
+| `-local-config-dir` | Environment variable `AI_GATEWAY_EPP_LOCAL_CONFIG_DIR`, empty by default | Local configuration directory: when non-empty, cluster-level configuration is loaded from local JSON via `LocalFileSource` and InnerAPI is not contacted (empty = use InnerAPI) |
+
+For building, `make release` of the repository Makefile cross-compiles release tarballs for linux/amd64 and linux/arm64, and `make clean` cleans up build artifacts.
 
 ### Dual-Poller + Cell Engine Architecture
 
@@ -60,9 +63,11 @@ The division of labor between the two pollers:
 - **epp_data poller** (`EppDataWatcher` in `pkg/poller/epp_data.go`): a single pull obtains both configuration sections. It self-matches its role against the assignment full view by `-instance-id` (`resolveRole` is a pure function: primary match → `RolePrimary`, standby match → `RoleStandby`, neither match → `RoleNone` skip), then diffs against the local Cell set to drive `Ensure` / `Promote` / `Demote` / `Drop` of `pkg/cell/manager.go`. The `epp_config` section and the assignment section are processed within the same version snapshot, so the two are naturally consistent. When this instance has no role at all, the `ai_epp_assignment_no_match` metric is set, making it easy to spot a misconfigured id during deployment.
 - **cluster_table discovery poller** (`pkg/poller/discovery.go`): diffs the backend instance list exported by cluster_table into the endpoint set of each Cluster; instances with `Weight==0` are treated as drained and skipped directly, and instances that have disappeared from the export are removed accordingly.
 
+The data source of both pollers can be switched to local files: when `-local-config-dir` (environment variable `AI_GATEWAY_EPP_LOCAL_CONFIG_DIR`) is non-empty, `cmd/epp/main.go` replaces the InnerAPI client with `LocalFileSource` from `pkg/poller/local_source.go`, reading `cluster_table.json` and `epp_data_config.json` from a local directory (the content is the `Data.Config` layer of the InnerAPI response, without the envelope and version fields) and never contacting InnerAPI. The fetch-consume flow, Cell lifecycle, and engine compile-swap path are fully reused; local files have no version semantics, so every polling cycle (5s by default) re-reads them in full, edits take effect in the next cycle, and a missing file or invalid JSON is handled as a polling failure (exponential backoff retry, keeping the last successful configuration). An `epp_pool.json` (instance pool definition) may also be placed in the directory for debugging reference only — EPP does not consume it. This mode targets local debugging and integration testing; production still relies on InnerAPI hot loading.
+
 Cell engine hot swap happens in `pkg/cell/manager.go`: when epp_config changes, the engine is recompiled per Cluster (`pkg/cell/compile.go`; the llm-d loader loads the complete `EndpointPickerConfig`), the pointer is swapped atomically after hash comparison, and the old engine drains (default 60 seconds) before being destroyed; a compile failure of a single Cluster only affects that Cluster (the old engine keeps running) and does not spread to other Clusters.
 
-demux (`pkg/demux/server.go`) is the ext_proc gRPC server: it extracts `llm-d.ai → inference-pool` (i.e. the Cluster name) from the `MetadataContext` of the first message and routes to the corresponding Cell; non-primary Cells return `ErrCellDraining` (BFE classifies `cell is not serving` as a draining error accordingly and retries on the next address); the decision result is returned in `dynamic_metadata` of the response at `envoy.lb → x-gateway-destination-endpoint`.
+demux (`pkg/demux/server.go`) is the ext_proc gRPC server: it extracts `llm-d.ai → inference-pool` (i.e. the Cluster name) from the `MetadataContext` of the first message and routes to the corresponding Cell; non-primary Cells return `ErrCellDraining` (BFE classifies `cell is not serving` as a draining error accordingly and retries on the next address); the decision result is returned in `dynamic_metadata` of the response at `envoy.lb → x-gateway-destination-endpoint`. demux also handles request correlation: it reads `x-request-id` from the request headers of the first ext_proc message and, when missing, generates a UUID and writes it back into the headers — the llm-d engine logs and EPP's own logs share the same request ID, every per-request logger carries it, and the BFE → EPP → inference engine logs of all three parties can be stitched by request ID.
 
 ---
 
@@ -76,7 +81,7 @@ The model-layer code is concentrated in `ai-gateway-api/model/epp_pool/`; the st
 |------|----------------|
 | `epp_pool.go` | Instance pool read/write: GET/PATCH semantics of `/epp-pool` (full replacement of `epp_instances`) and field validation (unique group names, unique ids, unique `(host,port)`, group size) |
 | `epp_config.go` | Structure definition and field validation of the simplified `epp_config` form (enums, ranges, seconds values, session-affinity pairing rule) |
-| `compiler.go` | Compiler: deterministically expands the simplified `epp_config` into a complete `EndpointPickerConfig` — fixed injection of `cluster-table-discovery` / `utilization-filter` / scorers / `max-score-picker` / `openai-parser`, mapping (kv, queue) weights by profile and `cache_affinity`, injecting affinity scorers by switch conditions, expanding the `flowControl` section and `featureGates`; rules are fixed in a code template and covered by unit tests |
+| `compiler.go` | Compiler: deterministically expands the simplified `epp_config` into a complete `EndpointPickerConfig` — fixed injection of `cluster-table-discovery` / `utilization-filter` / scorers / `max-score-picker` / `openai-parser`, mapping (kv, queue) weights by profile and `cache_affinity`, injecting affinity scorers by switch conditions, expanding the `flowControl` section and `featureGates`; rules are fixed in a code template and covered by unit tests; `flowControl` always carries an explicit priority 0 band (all EPP requests run in band 0, preventing the llm-d hidden band defaults of 5000 concurrency / 1GB memory from silently truncating the global `max_requests`; when `max_requests` is unset / `-1`, band 0 is explicitly set to 10000 concurrency and 5Gi memory) |
 | `assignment.go` | Assigner: greedy + deterministic tie-break group/primary selection algorithm, upsert into `epp_assignments` (storing only primary_instance_id) |
 | `reconciler.go` | Periodic reconciliation (30 seconds, configurable): scans all `balance_mode=EPP` Clusters and automatically repairs those without a valid assignment or with a dangling assignment (intra-group reselection → cross-group reassignment → assignment clearing), idempotent with zero writes in most rounds |
 | `epp_data.go` | epp_data generator: merges both sections at export time — the epp_config section (compiled per Cluster) + the assignment section (full view joined at read time from `epp_assignments` and `epp_instances`, `standby=null` for single-instance groups) — going through the `VersionControlManager.ExportConfig` framework (topic `ConfigTopicEppData`, MD5 signature + version increment) |
@@ -106,14 +111,17 @@ The BFE-side implementation is concentrated in three places: configuration parsi
 
 `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`:
 
-- `BalanceModeEPP = "EPP"` enum (`:66`); `GslbBasicConf` carries `EPPAddr *[]string` (ordered primary/standby) and four optional structs `EPPCheck` / `EPPTimeout` / `EPPTLS` / `EPPBreaker` (`:423-432`), all with defaults;
-- EPP-mode validation (from `:785`): when `BalanceMode=EPP`, `EPPAddr` is non-empty (`:786`); `checkEPPAddrs` validates that elements are `host:port` and deduplicates within the list (`:822`); `EPPCheckConfCheck` / `EPPTimeoutConfCheck` / `EPPTLSConfCheck` fill defaults and validate (`CAFile` must be readable when `Insecure=false`);
+- `BalanceModeEPP = "EPP"` enum (`:66`); `GslbBasicConf` carries `EPPAddr *[]string` (ordered primary/standby) and four optional structs `EPPCheck` / `EPPTimeout` / `EPPTLS` / `EPPBreaker` (`:481-485`), all with defaults;
+- EPP-mode validation (`GslbBasicConfCheck`, from `:808`): when `BalanceMode=EPP`, `EPPAddr` is non-empty (`:838`); `checkEPPAddrs` validates that elements are `host:port` and deduplicates within the list (`:880`); `EPPCheckConfCheck` / `EPPTimeoutConfCheck` / `EPPBreakerConfCheck` / `EPPTLSConfCheck` fill defaults and validate. An unconfigured `EPPTLS` is auto-filled with `{Insecure: true}` (TLS with certificate verification skipped) plus a warning log advising explicit configuration (`:862-866`); `EPPTLSConfCheck` (`:1023`) enforces a mutually exclusive three-way choice: `Plaintext` (plaintext dial) is mutually exclusive with `Insecure` / `CAFile`, and when not Plaintext and `Insecure=false`, `CAFile` must be readable;
+- On the dialing side, `epp.NewGrpcConn` (`bfe/bfe_util/epp/epp_client.go`) uses `insecure.NewCredentials()` plaintext credentials when `plaintext` is set, and otherwise builds TLS config from `insecureSkip` / `caFile`;
 - Validation failures fail fast: the reload reports an error and is rejected, keeping the old configuration effective — no silent degradation.
+
+Operational constraint: during a rolling upgrade, upgrade the BFE binaries in full before distributing a cluster_conf configuration containing `Plaintext`. Older BFE versions do not recognize the `Plaintext` field; such a configuration is parsed as "TLS without CAFile" and rejected on load (fail-fast), breaking the hot reload.
 
 ### ext_proc Calls and Scheduling Integration
 
 - `bfe/bfe_util/epp/epp_client.go`: the ext_proc gRPC client. A long-lived connection is maintained per EPP address (streams are established per request); the first `ProcessingRequest` has its request headers built by `BuildEnvoyGRPCHeaders`, injecting `MetadataContext.FilterMetadata["llm-d.ai"] = {"inference-pool": <cluster name>}`; the response path relays the body back in streaming via `EppResponseBodyFilter`, using a bounded buffer — on overflow the whole stream is abandoned with counting and instrumentation, guaranteeing that EndOfStream is always delivered.
-- `bfe/bfe_balance/bal_gslb/bal_gslb.go`: `BalanceGslb` holds the `eppAddrs` ordered address table and the active index. `initEPP` / `closeEPP` (`:124-168`) manage connections and a background health-check goroutine per address (gRPC health, parameters from `EPPCheck`); `chooseBackendFromEPP` (`:173-277`) builds and sends the first ext_proc message and waits for the decision; `BalanceEpp` (`:492-528`) maps the EPP-decided address to a local backend and constructs a temporary backend; `SetGslbBasic` (`:88-111`) dispatches by `BalanceMode` — EPP builds/refreshes the address state machine, non-EPP closes the EPP connections.
+- `bfe/bfe_balance/bal_gslb/bal_gslb.go`: `BalanceGslb` holds the `eppAddrs` ordered address table and the active index. `SetGslbBasic` (`:92`) dispatches by `BalanceMode` and records the `EPPTLS.Plaintext` plaintext dialing mode (`:166`); `initEPP` / `closeEPP` (`:203` / `:252`) manage connections and a background health-check goroutine per address (gRPC health, parameters from `EPPCheck`); `chooseBackendFromEPP` (`:287`) builds and sends the first ext_proc message and waits for the decision; `BalanceEpp` (`:699`) maps the EPP-decided address to a local backend and constructs a temporary backend.
 - `bfe/bfe_server/reverseproxy.go` (`:345-355`): request-side integration. EPP mode calls `BalanceEpp`; on failure it falls back to the local `Balance()` (WRR); retries reuse the same connection to establish a new stream.
 - Hysteresis state machine: the active address fails over to the next address after failing consecutively `FailThreshold` times, then enters a `Cooldown` period with no switch-back; after the cooldown, a higher-priority address must pass the health check consecutively `SuccessThreshold` times before failback. For `Unavailable / cell is not serving` and `unknown inference pool` errors, the request is retried directly on the next address of the same Cluster without waiting for the health check cycle.
 
@@ -130,6 +138,7 @@ sequenceDiagram
     BFE->>EPP: ProcessingRequest (RequestBody)
     EPP->>EPP: Filter (utilization-filter) + weighted scoring + max-score-picker
     EPP-->>BFE: Decided endpoint address (envoy.lb → x-gateway-destination-endpoint)
+    Note over EPP: read or generate x-request-id and write it back; logs of all parties correlate by ID
     BFE->>RS: Forward via a temporary backend built from the decided address
     RS-->>BFE: Response
     BFE->>EPP: ResponseHeaders + streaming body relay
@@ -156,9 +165,9 @@ sequenceDiagram
 | `pkg/innerapi/client.go` | InnerAPI HTTP client: `{ErrNum, ErrMsg, Data, WorkMode}` envelope, `?version=` increment, `Data==null` semantics; `EppDataConfigPath = "/configs/epp_data/config"` |
 | `pkg/cell/manager.go` | Cell lifecycle and atomic engine hot swap (hash comparison → compile → pointer swap → old engine drain and destroy); `ai_epp_engine_reloads_total` / `ai_epp_cell_state` |
 | `pkg/cell/compile.go` | Loads the compiled `EndpointPickerConfig` with the llm-d loader; a single Cluster compile failure keeps the old engine (defensive fallback) |
-| `pkg/demux/server.go` | ext_proc gRPC server: `extractPool` extracts the inference-pool from metadata to route to a Cell; non-primary returns `ErrCellDraining`; the decided address is written to `envoy.lb → x-gateway-destination-endpoint` |
+| `pkg/demux/server.go` | ext_proc gRPC server: `extractPool` extracts the inference-pool from metadata to route to a Cell; non-primary returns `ErrCellDraining`; the decided address is written to `envoy.lb → x-gateway-destination-endpoint`; reads or generates `x-request-id` from the first message's request headers and writes it back, using it as the correlation key across the engine and EPP logs |
 | `cmd/epp/plugins.go` | Plugin registration: `prefix-cache-scorer`, `session-affinity-scorer`, the `flowcontrol` plugin family, the `approx-prefix-cache` producer, `cluster-table-discovery`; the `flowControl` feature gate is off by default and enabled by the `featureGates` configuration |
-| `cmd/epp/main.go` | Assembly: parse configuration → build the InnerAPI client → start the epp_data and cluster_table pollers → start the demux/health/metrics services |
+| `cmd/epp/main.go` | Assembly: parse configuration → build the data source by `-local-config-dir` (local file source / InnerAPI client) → start the epp_data and cluster_table pollers → start the demux/health/metrics services |
 
 Semantic points of the scheduling plugins: utilization-filter runs before scoring (fail-closed); when backend metrics are missing, scores are neutralized (kv score treated as 1.0, the filter not applied); the index of prefix-cache-scorer is a local per-endpoint LRU; session-affinity-scorer parses the session id from `session_affinity_header`, with binding state in local memory; affinity scorers are all ordinary items in the weighted sum (output clamp [0,1] × fixed weight 1.0) and are soft affinity.
 
@@ -181,7 +190,8 @@ Semantic points of the scheduling plugins: utilization-filter runs before scorin
 - `ai-gateway-api/model/epp_pool/` (`compiler.go`, `assignment.go`, `reconciler.go`, `epp_data.go`)
 - `ai-gateway-api/endpoints/openapi_v1/epp_pool/`、`endpoints/openapi_v1/epp_assignments/`、`endpoints/innerapi_v1/epp_data/`
 - `ai-gateway-epp/docs/zh_cn/modifications/2026-09-08-epp-scheduling-integration/design-changes.md`
-- `ai-gateway-epp/pkg/poller/epp_data.go`、`pkg/poller/discovery.go`、`pkg/cell/manager.go`、`pkg/demux/server.go`
+- `ai-gateway-epp/docs/zh_cn/modifications/2026-09-14-local-config-file/design.md`
+- `ai-gateway-epp/pkg/poller/epp_data.go`, `pkg/poller/discovery.go`, `pkg/poller/local_source.go`, `pkg/cell/manager.go`, `pkg/demux/server.go`
 - `bfe/docs/zh_cn/modifications/2026-09-06-epp-ai-gateway-integration/design-changes.md`
 - `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`
 - `bfe/bfe_balance/bal_gslb/bal_gslb.go`、`bfe/bfe_balance/bal_gslb/epp_metrics.go`

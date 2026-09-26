@@ -38,7 +38,7 @@ The differences between the two concentrate on orchestration environment and lif
 
 | Dimension | Upstream EPP (llm-d) | ai-gateway-epp |
 |-----------|----------------------|----------------|
-| Runtime environment | Kubernetes: backend instances come from the InferencePool CRD, scheduling policies come from the inference extension configuration | No Kubernetes dependency: backend instances come from the cluster_table export of the AI Gateway API InnerAPI, scheduling configuration and primary/standby roles come from the `epp_data/config` interface (epp_config compiled artifact + assignment full view) — there is no CRD reconciler |
+| Runtime environment | Kubernetes: backend instances come from the InferencePool CRD, scheduling policies come from the inference extension configuration | No Kubernetes dependency: backend instances come from the cluster_table export of the AI Gateway API InnerAPI, scheduling configuration and primary/standby roles come from the `epp_data/config` interface (epp_config compiled artifact + assignment full view) — there is no CRD reconciler; for local debugging/testing, `-local-config-dir` can replace the InnerAPI configuration source with local JSON files so the process runs standalone without the Control Plane |
 | Process model | One EPP process serves one inference pool (InferencePool) | One process serves multiple Clusters: each assigned Cluster maps to one Cell (resident in the data plane: datastore + metrics collection; the engine switches atomically on configuration version), ext_proc requests are routed to the corresponding Cell by the inference-pool metadata injected by BFE |
 | Configuration activation | CRD updates take effect gradually through Kubernetes reconcile | `epp_config` changes are compiled into a new engine and switched atomically; the old engine drains (flow-control queue eviction + in-flight request wait cap); a compile failure of a single Cluster does not affect other Clusters |
 | Instance roles | Determined by components on the Kubernetes side | Determined by the assignment full view: instances self-match by `-instance-id` in the view to determine which Clusters' primary/standby roles they hold |
@@ -75,7 +75,7 @@ Responsibilities of each component:
 
 - **AI Gateway API**: maintains the EPP instance pool (`/epp-pool`), each Cluster's `balance_mode` and `epp_config`, and the Cluster→instance-group assignments (`epp_assignments`); distributes the compiled scheduling configuration and the assignment view to EPP via InnerAPI, and distributes `GslbBasic` with `BalanceMode=EPP` and the ordered `EPPAddr` to BFE via server_data_conf.
 - **BFE**: requests hitting an EPP-mode Cluster are sent via gRPC ext_proc to the currently active EPP address (primary); if the EPP call fails or there is no candidate, it silently falls back to local WRR without interrupting business.
-- **ai-gateway-epp (EPP component)**: runs with the instance group (2 instances per group, primary/standby for each other) as the deployment unit; polls InnerAPI for the scheduling configuration and the assignment view, and decides which Clusters' scheduling rights this instance holds according to the assignment; discovers inference backends via the `cluster-table-discovery` plugin from the cluster_table export, and periodically scrapes backend `/metrics` metrics to drive scheduling.
+- **ai-gateway-epp (EPP component)**: runs with the instance group (1-2 instances per group: 2 instances in production as primary/standby for each other, single-instance groups allowed in test) as the deployment unit; polls InnerAPI for the scheduling configuration and the assignment view, and decides which Clusters' scheduling rights this instance holds according to the assignment; discovers inference backends via the `cluster-table-discovery` plugin from the cluster_table export, and periodically scrapes backend `/metrics` metrics to drive scheduling. For debugging/testing, `-local-config-dir` can replace the InnerAPI configuration source with local JSON files so the process runs standalone without the Control Plane.
 - **Conf Agent**: delivers server_data_conf (including `GslbBasic`) to BFE and triggers hot reload; the mechanism is consistent with [Chapter 14 Config Export and Version Control Design](./chapter14-config-export-and-version-control.md).
 
 ---
@@ -103,7 +103,7 @@ The Cluster resource carries two EPP-related fields:
 | `session_affinity_enabled` | `false` | Session affinity switch |
 | `session_affinity_header` | - | Request header carrying the session id; required when `enabled=true`, the two appear in pairs |
 | `kv_cache_utilization_max` | `0.9` | Endpoint filter threshold `(0,1]`: endpoints whose KV cache utilization exceeds this value are filtered out |
-| `flow_control` | - | Flow control parameters: `max_requests` (unlimited by default, `-1` for explicitly unlimited), `queue_ttl` (seconds), `no_endpoint_queue_ttl` (seconds), `enable_eviction` |
+| `flow_control` | - | Flow control parameters: `max_requests` (unlimited by default, `-1` for explicitly unlimited), `queue_ttl` (seconds), `no_endpoint_queue_ttl` (seconds), `enable_eviction`; the compiled artifact always carries an explicit priority 0 band, so the global `max_requests` is not silently truncated by the hidden band defaults (5000 concurrency / 1GB memory) |
 
 Value rules of the two fields:
 
@@ -137,7 +137,7 @@ Design points:
 
 - **Instance id convention**: EPP is deployed as a StatefulSet; the instance id is the Pod hostname (the `-instance-id` startup parameter defaults to the hostname); when registering in `/epp-pool`, the instance id is the Pod name. For non-K8s deployments, pass `-instance-id` explicitly.
 - **Static configuration mode (no registration/heartbeat)**: the instance list is a deployment fact, maintained by the deployment pipeline calling `PATCH` after instance changes (scaling, machine replacement); it is naturally idempotent. The system provides no registration/heartbeat interfaces, and the AI Gateway API performs no liveness marking — instance liveness is driven by BFE-side `EPPAddr` connection hysteresis.
-- **Group size**: exactly 2 instances per group in production (primary/standby for each other); single-instance groups are allowed in test environments (primary only, no standby).
+- **Group size**: 1-2 instances per group — production uses 2 instances per group (primary/standby for each other), while test environments allow single-instance groups (primary only, no standby); a request with more than 2 instances per group is rejected with 422.
 - **Validation**: group names are non-empty and unique within the pool; instance ids are globally unique within the pool; `(host, port)` combinations are globally unique within the pool; host is a Hostname or IP (IPv6 literals without brackets).
 - Instance pool changes do not directly bump the `ConfigTopicEppData` topic (instance additions/removals do not change the cluster→role mapping).
 
@@ -203,6 +203,8 @@ The compilation rules from the simplified configuration to `EndpointPickerConfig
 | `session_affinity_enabled=true` | A `session-affinity-scorer` is appended to the scorer chain (strategy=session_id, session id taken from `session_affinity_header`, weight fixed at 1.0) |
 | `flow_control` present | Generates the `flowControl` section (seconds converted to Go duration), appends `flowControl` to `featureGates`; when `max_requests` is unset or `-1`, the `maxRequests` field is not generated |
 
+A key note on flow-control compilation: all EPP requests run in the priority 0 band, so the compiled artifact always carries an explicit band 0. llm-d falls back to hidden defaults for unconfigured bands (5000 concurrency / 1GB memory), while the global limit and band limits are enforced independently (hasCapacity checks both), so omitting the band would silently truncate a global `max_requests` above 5000. When `max_requests` is set explicitly, band 0 mirrors it; when it is unset or `-1`, the global `maxRequests` field is not generated, but band 0 is still emitted explicitly (10000 concurrency, 5Gi memory), keeping the capacity deterministic and auditable.
+
 Affinity scorers are feature switches (on/off + fixed weight 1.0), orthogonal to the profile weights: the profile only tunes the weights of the two base scorers (kv, queue).
 
 ### cluster_table Export: The Source for EPP to Discover Inference Backends
@@ -248,7 +250,7 @@ Each Cluster's `GslbBasic` section in BFE's `cluster_conf.data` carries EPP-rela
 | `EPPAddr` | Ordered primary/standby address list, `[0]`=primary, `[1]`=standby; non-empty when `BalanceMode=EPP` (load validation: elements must be `host:port`, deduplicated within the list) |
 | `EPPCheck` | Health check and hysteresis parameters: `CheckInterval` (default 2s), `FailThreshold` (default 3), `Cooldown` (default 45s), `SuccessThreshold` (default 2) |
 | `EPPTimeout` | Call timeouts: `Connect` (default 500ms), `Call` (default 3s) |
-| `EPPTLS` | Transport security: `Insecure` (test environments) / `CAFile` (verifies the EPP server certificate in production) |
+| `EPPTLS` | Transport security, three mutually exclusive choices (fail-fast mutual-exclusion validation at load time): `Insecure` (TLS with certificate verification skipped, test environments only) / `CAFile` (TLS with verification of the EPP server certificate, recommended for production) / `Plaintext` (plaintext dial, mutually exclusive with Insecure/CAFile). When unconfigured, it is auto-filled with `{Insecure: true}` (TLS with certificate verification skipped) plus a warning log advising explicit configuration |
 | `EPPBreaker` | Circuit breaker parameters (sliding-window error rate), complementary to address-level failover |
 
 ### Request Processing Flow

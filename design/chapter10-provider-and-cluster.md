@@ -295,9 +295,9 @@ flowchart LR
 
 不同 provider（以及同一 provider 的不同协议）的上游路径前缀各不相同：百炼 OpenAI 兼容挂在 `/compatible-mode/v1`、Anthropic 兼容挂在 `/apps/anthropic`，Kimi Code 会员是 `/coding/v1` 与 `/coding`，火山方舟按量是 `/api/v3` 与 `/api/compatible`。BFE 数据面对上游路径默认纯透传，若不加处理，客户端必须按 provider 原生路径发起请求，同一套客户端 SDK 配置（统一打标准入口 `/v1/...`）无法复用到多家 provider。
 
-为此，Provider 新增可选字段 `protocol_paths`：协议 → 上游 base path 的声明式映射。语义约定：`protocol_paths[protocol]` = 该协议官方 SDK `base_url` 的 path 部分——`openai` 含 `/v1` 尾（`/compatible-mode/v1`、`/api/v3`、`/coding/v1`）；`anthropic` 不含 `/v1`（`/apps/anthropic`、`/coding`、`/anthropic`，Anthropic SDK 会自拼 `/v1/messages`）。配置值可直接照抄 provider 官方文档的 base_url 一栏。
+为此，Provider 提供可选字段 `protocol_paths`：协议 → 上游 base path 的声明式映射。语义约定：`protocol_paths[protocol]` = 该协议官方 SDK `base_url` 的 path 部分——`openai` 含 `/v1` 尾（`/compatible-mode/v1`、`/api/v3`、`/coding/v1`）；`anthropic` 不含 `/v1`（`/apps/anthropic`、`/coding`、`/anthropic`，Anthropic SDK 会自拼 `/v1/messages`）。配置值可直接照抄 provider 官方文档的 base_url 一栏。
 
-BFE 在转发时按检测到的请求协议改写标准入口路径：anthropic 请求 `/v1/messages` → `{anthropic 值}/v1/messages`；openai 请求 `/v1/chat/completions` → `{openai 值}/chat/completions`。未配置 `protocol_paths` 或对应协议无条目时原样透传；非标准入口路径（provider 原生路径、`/v10/xxx`、gemini 风格的 `/v1beta/...`）永不改写。改写只改出站请求的 URL path：不改请求/响应体、不改 host/scheme；gemini 协议也不进入 `protocol_paths`（其原生路径本身就是标准路径，透传已可用）。
+BFE 在转发时按检测到的请求协议改写上游路径，两个协议分支的判定规则不同。anthropic 分支仍只认标准入口：`/v1/messages` → `{anthropic 值}/v1/messages`。openai 分支先剥离可选的 `/v1` 版本前缀（`/v1/chat/completions` 与 `/chat/completions` 等价），再查 `bfe_basic` 的共享 OpenAI 端点表（`bfe_basic/openai_endpoint.go` 的 `openAIEndpointModes`）：命中端点表的路径改写为 `{openai 值} + 剥离后路径`，如 `/v1/chat/completions` 与 `/chat/completions` 都改写为 `/compatible-mode/v1/chat/completions`；未命中端点表的自定义路径原样透传。未配置 `protocol_paths` 或对应协议无条目时原样透传；`/v10/xxx` 这类伪标准入口在任何分支下都不改写。改写只改出站请求的 URL path：不改请求/响应体、不改 host/scheme；gemini 协议也不进入 `protocol_paths`（其原生路径本身就是标准路径，透传已可用）。
 
 控制面校验规则：key 必须是 `model_protocols` 已声明的 `openai` 或 `anthropic`；value 必须 `/` 开头、不以 `/` 结尾、不含 `..`/`?`/`#`、长度不超过 128。导出方面，`provider.protocol_paths` 按 cluster 的 provider 引用恒透传至 `AIConf.ProtocolPaths`（与 `ModelProtocols` 同模式，cluster 不单独持有路径配置，保持单一事实来源）；BFE 加载期另做 key 白名单与 value 格式校验兜底，非法配置拒绝加载。
 

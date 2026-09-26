@@ -31,7 +31,7 @@ BFE 是一个开源的七层负载均衡器，起源于百度，现为 CNCF Sand
 
 BFE 在启动后监听 HTTP/HTTPS/HTTP2/WebSocket 等连接。每个请求进入 BFE 后，会依次经过连接接入、协议解析、租户识别、模块回调、后端转发、响应发送等阶段。在 AI 网关模式下，BFE 会进入独立的 `ServeHTTPForAI()` 转发路径。
 
-连接接入阶段由 `bfe_server/` 中的监听器完成，负责 TLS 握手、会话管理和协议协商。HTTP 请求解析由 `bfe_http/`、`bfe_http2/` 等协议实现负责，生成 `bfe_basic.Request` 对象。随后 BFE 进入模块回调阶段，按固定顺序调用已注册模块的回调函数。AI 相关模块主要在 `HandleFoundProduct` 阶段介入，而响应阶段则由 `HandleReadResponse` 与 `HandleRequestFinish` 处理。
+连接接入阶段由 `bfe_server/` 中的监听器完成，负责 TLS 握手、会话管理和协议协商。HTTP 请求解析由 `bfe_http/`、`bfe_http2/` 等协议实现负责，生成 `bfe_basic.Request` 对象。随后 BFE 进入模块回调阶段，按固定顺序调用已注册模块的回调函数。AI 相关模块主要在 `HandleFoundProduct` 与 `HandleAfterAITargetModel` 阶段介入，而响应阶段则由 `HandleReadResponse` 与 `HandleRequestFinish` 处理。
 
 ### 传统路径与 AI 网关路径的分发
 
@@ -46,7 +46,7 @@ if c.server.Config.Server.EnableAiGateway {
 }
 ```
 
-当 `ai_gateway_enabled = false` 时，请求沿用 BFE 原有的 `ServeHTTP()` 路径；当 `ai_gateway_enabled = true` 时，请求进入新增的 `ServeHTTPForAI()` 路径。两条路径共享连接管理、超时、响应发送等基础设施，但 AI 路径不再使用原有租户内集群路由，而是使用 `mod_ai_route` 计算出的 `AiRouteResult` 进行转发。
+当 `ai_gateway_enabled = false` 时，请求沿用 BFE 原有的 `ServeHTTP()` 路径；当 `ai_gateway_enabled = true` 时，请求进入独立的 `ServeHTTPForAI()` 路径。两条路径共享连接管理、超时、响应发送等基础设施，但 AI 路径不再使用原有租户内集群路由，而是使用 `mod_ai_route` 计算出的 `AiRouteResult` 进行转发。
 
 ### AI 网关路径处理流程
 
@@ -78,7 +78,6 @@ if c.server.Config.Server.EnableAiGateway {
 │  HandleFoundProduct                 │
 │  mod_ai_token_auth                  │
 │  mod_ai_route                       │
-│  mod_ai_rate_limit                  │
 └──────────────┬──────────────────────┘
                │
                ▼
@@ -102,6 +101,10 @@ if c.server.Config.Server.EnableAiGateway {
                ▼
 ┌─────────────────────────────────────┐
 │  aiClusterInvoke() 循环转发          │
+│  每次 attempt：                      │
+│  HandleAfterAITargetModel           │
+│  mod_ai_token_auth（目标模型校验）    │
+│  mod_ai_rate_limit                  │
 │  失败时按 fallbacks 顺序降级         │
 └──────────────┬──────────────────────┘
                │
@@ -111,7 +114,7 @@ if c.server.Config.Server.EnableAiGateway {
 └─────────────────────────────────────┘
 ```
 
-从图中可以看出，AI 网关路径在 `HandleFoundProduct` 阶段聚合了所有 AI 相关模块的处理结果，并在 `ServeHTTPForAI()` 中完成 target 选择、模型覆盖与 fallback 降级。
+从图中可以看出，AI 网关路径在 `HandleFoundProduct` 阶段完成鉴权与路由查找，在 `ServeHTTPForAI()` 的转发循环内通过 `HandleAfterAITargetModel` 回调按集群 attempt 完成目标模型校验与限流，并完成 target 选择、模型覆盖与 fallback 降级。
 
 ## AI 相关模块的执行顺序与协作
 
@@ -138,13 +141,13 @@ var moduleList = []bfe_module.BfeModule{
 }
 ```
 
-该顺序决定了模块在 `HandleFoundProduct` 回调中的执行顺序：`mod_ai_token_auth` → `mod_ai_route` → `mod_ai_rate_limit`。三个模块通过 `AiBasicInfo` 与 `Request.Context` 共享状态，例如 `ClientApiKey`、`ClientModel`、`TargetModel`、`AiRouteResult` 等。
+该顺序决定了模块在 `HandleFoundProduct` 回调中的执行顺序：`mod_ai_token_auth` → `mod_ai_route`。模型白名单校验与限流不在 `HandleFoundProduct` 执行，而是注册在转发阶段的 `HandleAfterAITargetModel` 回调点（目标模型解析后、转发前，按集群 attempt 触发），该点上 `mod_ai_token_auth` 先于 `mod_ai_rate_limit` 执行，保证白名单校验始终先于限流。这些模块通过 `AiBasicInfo` 与 `Request.Context` 共享状态，例如 `ClientApiKey`、`ClientModel`、`TargetModel`、`AiRouteResult` 等。
 
 执行顺序的约束由数据依赖决定：
 
 - `mod_ai_token_auth` 最早执行，识别调用方身份并设置 `ClientApiKey`；
 - `mod_ai_route` 紧随其后，依赖 `ClientApiKey` 完成路由查找，生成 `AiRouteResult`；
-- `mod_ai_rate_limit` 最后执行，依赖 `ClientApiKey`、目标模型等信息执行 TPM/RPM/并发限流。
+- `mod_ai_token_auth` 的目标模型校验与 `mod_ai_rate_limit` 在 `HandleAfterAITargetModel` 阶段执行，此时路由已完成、`AiBasicInfo.TargetModel` 已按路由目标模型覆盖、前缀裁剪与集群 `ModelMapping` 映射解析完毕，二者按该目标模型执行白名单校验与 TPM/RPM/并发限流。
 
 `mod_body_process` 主要在 `HandleReadResponse` 阶段执行，负责解析流式响应中的 Token 用量，其计算结果会供 `mod_ai_token_auth` 在 `HandleRequestFinish` 阶段进行最终配额扣减。任何顺序调整都会破坏这一依赖链，导致路由、限流或配额扣减行为异常。因此 `bfe_modules/bfe_modules.go` 中的注册位置与注释需要同步维护。
 
@@ -271,12 +274,11 @@ Authorization: Bearer <api-key>
 
 1. 从请求中提取 API-Key；
 2. 验证 API-Key 的有效性与状态；
-3. 检查请求访问的模型是否在允许列表中；
-4. 校验来源 IP 是否命中允许子网；
-5. 检查关联配额计划是否有足够配额；
-6. 请求完成后，从响应体中提取 token 使用量并扣除配额。
+3. 校验来源 IP 是否命中允许子网；
+4. 检查关联配额计划是否有足够配额；
+5. 请求完成后，从响应体中提取 token 使用量并扣除配额。
 
-其中前 5 步在 `HandleFoundProduct` 阶段完成；第 6 步在 `HandleRequestFinish` 阶段完成。模块会将 `ClientApiKey` 与配额计划写入 `AiBasicInfo`，供后续模块使用。
+其中前 4 步在 `HandleFoundProduct` 阶段完成；第 5 步在 `HandleRequestFinish` 阶段完成。模型白名单/黑名单不在鉴权期校验：`ServeHTTPForAI()` 的每次集群 attempt 在调用后端之前触发 `HandleAfterAITargetModel` 回调，`mod_ai_token_auth` 的 `targetModelCheckFilter` 调用 `ValidateTargetModel`，对路由目标模型覆盖、前缀裁剪与集群 `ModelMapping` 映射之后的最终目标模型（`AiBasicInfo.TargetModel`）做白名单/黑名单匹配，不匹配返回 400 `CodeModelNotAllowed` 并结束该次 attempt。模块会将 `ClientApiKey` 与配额计划写入 `AiBasicInfo`，供后续模块使用。
 
 ### mod_ai_rate_limit：限流模块
 
@@ -286,7 +288,7 @@ Authorization: Bearer <api-key>
 - RPM（Requests Per Minute）：每分钟请求数上限；
 - 最大并发数限制。
 
-该模块在 `HandleFoundProduct` 阶段执行，依赖 `mod_ai_token_auth` 设置的 `ClientApiKey` 等信息识别限流维度。若请求触发限流，模块会提前返回响应，阻止请求进入后续转发流程。
+该模块注册在 `HandleAfterAITargetModel` 回调点（目标模型解析后、转发前，按集群 attempt 触发），依赖 `mod_ai_token_auth` 设置的 `ClientApiKey` 与路由阶段解析出的目标模型识别限流维度，TPM/RPM/最大并发均按转发后目标模型匹配策略。若请求触发限流，模块返回 429 响应并结束该次 attempt；本地限流通过 `bfe_basic.ErrAiRateLimit` 错误标记区分于上游 429，阻断 API-Key 轮换与集群 fallback。
 
 ### mod_body_process：请求/响应体处理模块
 
@@ -305,8 +307,9 @@ BFE 的模块框架定义在 `bfe_module/` 目录下，核心抽象是 `BfeModul
 | 回调点 | 触发时机 | AI 相关模块 |
 |--------|----------|-------------|
 | `HandleBeforeLocation` | 租户识别之前 | mod_trust_clientip、mod_logid 等 |
-| `HandleFoundProduct` | 租户识别之后 | mod_ai_token_auth、mod_ai_rate_limit、mod_ai_route |
+| `HandleFoundProduct` | 租户识别之后 | mod_ai_token_auth、mod_ai_route |
 | `HandleAfterLocation` | 位置/路由确定之后 | mod_body_process 等 |
+| `HandleAfterAITargetModel` | 目标模型解析后、转发前，按集群 attempt 触发 | mod_ai_token_auth（目标模型校验）、mod_ai_rate_limit |
 | `HandleReadResponse` | 读取后端响应时 | mod_body_process |
 | `HandleRequestFinish` | 请求处理完成时 | mod_ai_token_auth（配额扣除） |
 
@@ -320,7 +323,7 @@ BFE 的模块框架定义在 `bfe_module/` 目录下，核心抽象是 `BfeModul
 - `BfeHandlerClose`：直接关闭连接；
 - `BfeHandlerRedirect`：返回重定向响应。
 
-AI 相关模块在 `HandleFoundProduct` 阶段通常返回 `BfeHandlerGoOn`，将状态写入上下文；若鉴权失败或触发限流，则返回 `BfeHandlerFinish` 或 `BfeHandlerResponse`。
+AI 相关模块在 `HandleFoundProduct` 阶段通常返回 `BfeHandlerGoOn`，将状态写入上下文；若鉴权失败或触发限流，则返回 `BfeHandlerFinish` 或 `BfeHandlerResponse`。`HandleAfterAITargetModel` 阶段的消费者同样遵循这一约定：目标模型校验失败返回 400，限流命中返回 429。
 
 ### 模块注册
 
@@ -516,7 +519,8 @@ func shouldTriggerFallback(res *bfe_http.Response, err error) bool {
 以下情况不触发 fallback：
 
 - 后端返回的 `4xx` 状态码不在 `aiFallbackStatusCodes` 白名单中；
-- 请求在 `HandleFoundProduct` 阶段已被限流或鉴权失败。
+- 请求在 `HandleFoundProduct` 阶段鉴权失败（未进入转发循环）；
+- 某次 attempt 被本地限流拒绝：`mod_ai_rate_limit` 触发时置 `bfe_basic.ErrAiRateLimit` 错误标记，转发循环识别该标记后直接终止尝试列表，既不再轮换 API-Key，也不降级到备用集群（上游返回的 429 仍按原有 key 轮换逻辑处理）。
 
 每次 fallback 前，`resetRequestForRetry()` 会重置 `OutRequest`、backend 连接、retry 计数与错误信息，并通过 `rewindRequestBody()` 将请求体重置到起始位置，确保下一次转发使用干净的请求状态。
 
@@ -562,7 +566,13 @@ prepareRequestBodyForRetry()
 - anthropic 请求：`/v1/messages` → `{ProtocolPaths[anthropic]}/v1/messages`（如 `/apps/anthropic/v1/messages`）；
 - openai 请求：`/v1/chat/completions` → `{ProtocolPaths[openai]}/chat/completions`（如 `/compatible-mode/v1/chat/completions`）。
 
-改写由 `bfe_server/ai_path_rewrite.go` 中的纯函数 `rewriteUpstreamPath` 计算，在 `doSingleAIForward` 创建出站请求拷贝之后、`clusterInvoke` 之前执行，仅对标准入口（`/v1` 精确值或 `/v1/` 前缀）生效。未配置 `ProtocolPaths` 或对应协议无条目时原样透传；`/v10/xxx`、gemini 风格的 `/v1beta/...` 等非标准入口永不改写。改写只落在出站拷贝上、不改入站请求，因此 fallback 的每次 attempt 都基于原始客户端路径重算——切换到不同前缀配置的备用 cluster 后，上游路径自动跟随新 cluster 的配置。
+改写由 `bfe_server/ai_path_rewrite.go` 中的纯函数 `rewriteUpstreamPath` 计算，在 `doSingleAIForward` 创建出站请求拷贝之后、`clusterInvoke` 之前执行。两个协议分支的判定规则不同：
+
+- **openai 分支**：先剥离可选的 `/v1` 版本前缀（`bfe_basic.StripV1Prefix`，`/v1/chat/completions` 与 `/chat/completions` 等价），再查 `bfe_basic` 的共享 OpenAI 端点表（`bfe_basic/openai_endpoint.go` 的 `openAIEndpointModes`，含 `/chat/completions`、`/embeddings`、`/images/generations`、`/responses`、`/video/generations` 等主要端点）：命中端点表的路径改写为 `base + 剥离后路径`（如 `/chat/completions` 与 `/v1/chat/completions` 都改写为 `/compatible-mode/v1/chat/completions`）；未命中端点表的自定义路径原样透传。路径恰好为 `/v1` 或 `/v1/` 时改写结果为 base 本身。
+- **anthropic 分支**：仍只认标准入口（`/v1` 精确值或 `/v1/` 前缀），命中后拼为 `base + 原始路径`（如 `/v1/messages` → `/apps/anthropic/v1/messages`）；`/v10/xxx` 等非标准入口透传。
+- **gemini 分支**：`ProtocolPaths` 只有 `openai`/`anthropic` 两个合法 key，gemini 永不改写，原生路径（如 `/v1beta/models/gemini-2.5-flash:generateContent`）始终透传。
+
+未配置 `ProtocolPaths` 或对应协议无条目时同样原样透传。改写只落在出站拷贝上、不改入站请求，因此 fallback 的每次 attempt 都基于原始客户端路径重算——切换到不同前缀配置的备用 cluster 后，上游路径自动跟随新 cluster 的配置。
 
 `ProtocolPaths` 由控制面按 cluster 引用的 provider 恒透传（配置入口为 Provider 的 `protocol_paths` 字段，见[第十章 Provider 与 Cluster 设计](./chapter10-provider-and-cluster.md)）。BFE 在配置加载与热加载时校验 key 白名单（`openai`/`anthropic`）与 value 格式，非法配置拒绝加载，作为控制面校验被手工配置等路径绕过时的兜底。
 
@@ -572,13 +582,13 @@ prepareRequestBodyForRetry()
 
 - BFE 负责实际转发 AI 请求，与控制面 AI Gateway API 通过配置分发协同工作。
 - AI 网关模式下，请求进入独立的 `ServeHTTPForAI()` 路径，复用原有回调与转发基础设施。
-- `mod_ai_token_auth`、`mod_ai_rate_limit`、`mod_ai_route` 三个模块在 `HandleFoundProduct` 阶段按固定顺序执行，通过 `AiBasicInfo` 与 `Request.Context` 共享状态。
+- `mod_ai_token_auth` 与 `mod_ai_route` 在 `HandleFoundProduct` 阶段按固定顺序执行；目标模型白名单校验与 `mod_ai_rate_limit` 注册在 `HandleAfterAITargetModel` 回调点（按集群 attempt 触发），通过 `AiBasicInfo` 与 `Request.Context` 共享状态。
 - `mod_body_process` 在 `HandleReadResponse` 阶段解析 SSE 响应中的 token 使用量，供 `mod_ai_token_auth` 最终扣减配额。
 - `bfe_model_protocol` 协议适配层把散落在 `bfe_basic`、`mod_ai_token_auth`、`mod_body_process`、`bfe_server` 四处的协议知识收敛为按协议组织的适配器；`AIConf.ModelProtocols` 在启动与热加载时接受注册表校验，未知协议名会使加载失败。
 - BFE 的 `bfe_module` 框架通过回调点与返回值机制组织模块，`bfe_modules/bfe_modules.go` 中的注册顺序直接影响行为正确性。
 - 配置加载采用 INI + JSON 双层结构，支持通过 Web 接口热加载，新配置在校验完成后原子替换旧配置。
 - `mod_ai_route` 支持 `apikey → entity → global` 三级路由、`targets` 加权选择与 `fallbacks` 顺序降级，是 AI 网关转发的核心。
-- 上游路径按协议改写：`AIConf.ProtocolPaths` 将标准入口 `/v1/...` 改写为 provider 前缀，未配置则纯透传；改写只作用于出站拷贝，fallback 每次 attempt 独立重算，非标准入口永不改写。
+- 上游路径按协议改写：`AIConf.ProtocolPaths` 中 openai 分支剥离可选 `/v1` 前缀后按 `bfe_basic` 共享端点表判定改写（`/chat/completions` 与 `/v1/chat/completions` 都会拼上 provider 前缀），anthropic 分支只认标准 `/v1` 入口，gemini 永不改写；改写只作用于出站拷贝，fallback 每次 attempt 独立重算。
 
 ## 参考文档
 

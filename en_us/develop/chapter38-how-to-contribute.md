@@ -70,17 +70,21 @@ If compilation succeeds, an `ai-gateway-api` executable will be generated in the
 
 ## Checking Out the Code and Repository Structure
 
-Rainway AI Gateway consists of multiple repositories. Contributors typically need to focus on the following three core repositories:
+Rainway AI Gateway consists of multiple repositories. Contributors typically need to focus on the following core repositories:
 
 | Repository | Role | Main Change Scenarios |
 |---|---|---|
 | `rainway-ai-gateway/ai-gateway-api` | Control Plane | APIs, business models, config export, version control |
 | `bfenetworks/bfe` | Data Plane | Traffic forwarding, AI routing, Token authentication, rate limit modules |
 | `bfenetworks/conf-agent` | Config pull agent | Hot reload of configuration, delivering configuration to BFE |
+| `rainway-ai-gateway/log-reader` | Access log collection | Consumes BFE access logs and writes them to Kafka / MySQL via `mod_kafka` / `mod_log_mysql` |
+| `rainway-ai-gateway/ai-gateway-observability` | Reporting/observability deployment config | Deployment scripts and configuration for Doris tables, Routine Load / INSERT JOB, and Grafana data sources and dashboards |
+
+Cross-repository changes to access log fields follow a fixed workflow: after the `bfe-access-pb` protocol fields or log-reader parsing fields change, run `skills/gen-req-log-api` in the `ai-gateway-observability` repository to regenerate `api/depends_api/req_log.md` (the authoritative PB-field → log-reader-JSON-field mapping), and then drive the Doris table schema and Grafana dashboard schema updates from it.
 
 ### Fork and Clone
 
-All three repositories use the [Git Flow branching model](http://nvie.com/posts/a-successful-git-branching-model/), and day-to-day development happens on the `develop` branch. Contributors should first fork the official repository, then clone their own fork:
+All the repositories above use the [Git Flow branching model](http://nvie.com/posts/a-successful-git-branching-model/), and day-to-day development happens on the `develop` branch. Contributors should first fork the official repository, then clone their own fork:
 
 ```bash
 git clone https://github.com/your-github-account/ai-gateway-api
@@ -513,7 +517,7 @@ Suggestions for cross-repository contributions:
 1. **Complete the design documents in `ai-gateway-api` first**: `design-docs/modifications/`, `api-define/`, `sys-design/`.
 2. **Update the BFE configuration format in sync**: if the JSON/TOML structure exported to the Data Plane changes, the corresponding module's configuration parsing in `bfe/` must be updated accordingly.
 3. **Update Conf Agent in sync**: if the configuration delivery path or version numbering rules change, synchronize in `conf-agent/`.
-4. **Submit separate PRs**: one PR per repository, cross-referencing each other in the PR descriptions (e.g. `Depends on rainway-ai-gateway/ai-gateway-api#123`).
+4. **Submit separate PRs**: one PR per repository, cross-referencing each other in the PR descriptions (e.g. `Depends on rainway-ai-gateway/ai-gateway-api#<number>`).
 5. **Use a consistent reviewer**: for cross-repository changes, find the same reviewer or reviewer group to ensure design consistency.
 
 The most common problems with cross-repository changes include: field names exported by the Control Plane not matching Data Plane parsing, Conf Agent failing to recognize version number or configuration path changes, and error codes or default values having different semantics in the two repositories. During the design phase, the configuration format consumed by the Data Plane and the version strategy should be made explicit in `design-changes.md`, and an end-to-end verification plan should be provided in the PR.

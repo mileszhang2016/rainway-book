@@ -55,7 +55,7 @@
 | `tpm_configs` | array | TPM（Tokens Per Minute）规则列表 |
 | `rpm_configs` | array | RPM（Requests Per Minute）规则列表 |
 
-在业务层，控制面使用 `RateLimitPolicyParam` 承载创建与更新参数，其中 `TpmConfigs` 与 `RpmConfigs` 分别为 `TPMConfig` 和 `RPMConfig` 切片。导出到 BFE 时，这些结构会被转换为 `BfeRateLimitPolicy`，并附带控制面生成的稳定 `redis_key`。
+在业务层，控制面使用 `RateLimitPolicyParam` 承载创建与更新参数，其中 `TpmConfigs` 与 `RpmConfigs` 分别为 `TPMConfig` 和 `RPMConfig` 切片。导出到 BFE 时，这些结构会被转换为 `BfeRateLimitPolicy`，并附带控制面按规则名生成的 `redis_key`。
 
 ## TPM、RPM、并发限制的配置方法
 
@@ -67,7 +67,7 @@ TPM 限制单位时间窗口内消耗的 Token 总量，适用于按 Token 计�
 
 | 字段 | 说明 |
 |------|------|
-| `name` | 规则名，同一策略内唯一，创建后不可修改 |
+| `name` | 规则名，同一策略内唯一；重命名等价于删除旧规则并新增规则，计数器重新开始 |
 | `model` | 适用模型，`"*"` 表示默认限制 |
 | `window_minutes` | 时间窗口长度（分钟） |
 | `max_tokens` | 窗口内允许的最大 Token 数 |
@@ -85,7 +85,7 @@ TPM 限制单位时间窗口内消耗的 Token 总量，适用于按 Token 计�
 }
 ```
 
-TPM 规则支持按模型细粒度控制。当请求模型同时命中具体模型规则与 `"*"` 默认规则时，BFE 优先匹配具体模型名；未命中具体模型时，再回落到默认规则。
+TPM 规则支持按模型细粒度控制。规则按转发后目标模型匹配：当目标模型同时命中具体模型规则与 `"*"` 默认规则时，BFE 优先匹配具体模型名；未命中具体模型时，再回落到默认规则。
 
 ### RPM 配置
 
@@ -120,7 +120,7 @@ RPM 与 TPM 的窗口可以独立设置。例如，可配置 1 分钟 RPM 限制
 在 AI Gateway API 中，限流策略通常通过 OpenAPI 的 `/api-keys` 或 `/entities` 接口随 API-Key / Entity 一并创建，也可通过独立的限流策略管理接口维护。创建时需要满足以下校验规则，详见 `ai-gateway-api/design-docs/sys-design/details/限流策略与导出.md`：
 
 - `name` 必填、非空、长度 1-128 字符，字符集限定为 `[a-zA-Z0-9_-]`；
-- `name` 在同一 `RateLimitPolicy` 内唯一，创建后不可修改；
+- `name` 在同一 `RateLimitPolicy` 内唯一；重命名一条规则等价于删除旧规则并新增同名新规则，旧规则的计数器 Key 被清理、新规则计数器从零开始；
 - `model` 不能为空；
 - `max_tokens`、`max_requests` 等 limit 字段必须 ≥ 0；
 - `max_concurrency` 必须 ≥ 0（`0` 的语义需与 BFE 实现对齐）。
@@ -185,7 +185,7 @@ root (ent-root, policy: rlp-0002)
 
 对于 `ak-test`，最终导出的绑定顺序为 `["rlp-0001", "rlp-0003", "rlp-0002"]`，从自身向上排列。BFE 在请求到达时会依次检查这些策略中的规则，任一规则触发都会导致限流。
 
-导出后的策略名称统一为 `rlp-<policy_id>`，避免命名冲突并便于 BFE 索引。控制面同时为每条 TPM/RPM 规则生成稳定的 Redis Key，例如 `RL_TPM_rlp-1_tpm_1min`。Key 基于 `(policy_id, rule_name)` 生成，因此修改 `model` 不会重置计数器，而删除规则会清理对应 Key，新增规则会生成新的 Key。
+导出后的策略名称统一为 `rlp-<policy_id>`，避免命名冲突并便于 BFE 索引。控制面同时为每条 TPM/RPM 规则生成 Redis Key，例如 `default_bfe_rlp-1_RL_TPM_rlp-1_tpm_1min`。Key 基于 `(policy_id, rule_name)` 生成，因此修改 `model` 不会重置计数器，而重命名规则、删除规则会清理对应旧 Key，新增规则会生成新的 Key。
 
 如果同一策略在层级中多次出现，导出时会生成多条绑定记录；BFE 会按命中顺序处理或去重。建议在 Entity 设计时避免重复绑定同一策略，以减少配置量和排查复杂度。
 
@@ -202,7 +202,7 @@ root (ent-root, policy: rlp-0002)
 可通过 Redis 查看对应计数器是否被写入，例如：
 
 ```bash
-redis-cli GET RL_RPM_rlp-1_rpm_1min
+redis-cli GET default_bfe_rlp-1_RL_RPM_rlp-1_rpm_1min
 ```
 
 如果计数器持续增加并在阈值附近触发 429 响应，说明限流已生效。建议在验证时使用单一 API-Key 和固定模型，避免多 Key、多模型并发导致结果难以分析。
@@ -278,7 +278,7 @@ redis-cli GET RL_RPM_rlp-1_rpm_1min
 - `RateLimitPolicy` 通过 `tpm_configs`、`rpm_configs` 与 `max_concurrency` 三个维度控制访问速率；
 - 策略可随 API-Key 或 Entity 创建，也可通过更新接口重新绑定；
 - Entity 层级会向上合并所有启用的策略，最终生成多绑定关系；
-- 控制面导出 `rate_limit_policies.json` 与 `api_key_rl_policy_bindings.json` 供 BFE 消费，并为每条规则生成稳定 Redis Key；
+- 控制面导出 `rate_limit_policies.json` 与 `api_key_rl_policy_bindings.json` 供 BFE 消费，并为每条规则生成基于规则名的 Redis Key；
 - 限流触发后 BFE 返回 429，客户端应配合退避逻辑重试。
 
 理解并正确配置限流策略，是保障后端 AI 模型服务稳定性、控制成本支出的关键操作之一。

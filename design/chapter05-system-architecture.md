@@ -5,7 +5,7 @@
 通过本章，读者将理解：
 - 壬远AI网关如何解决企业接入大模型服务时的核心问题；
 - 壬远AI网关的整体架构，以及控制面与数据面的职责划分；
-- 各核心组件（AI Gateway API、Dashboard、BFE、Conf Agent、Service Controller）如何协同工作；
+- 各核心组件（AI Gateway API、Dashboard、BFE、Conf Agent、Service Controller、Log Reader）如何协同工作；
 - 一条配置从创建到生效的完整生命周期；
 - 典型的部署拓扑形态。
 
@@ -82,7 +82,7 @@ OpenAI、DeepSeek、Anthropic、Google Gemini 等模型服务商的 API 协议�
 
 | 概念 | 英文 | 一句话说明 |
 |---|---|---|
-| AI 网关实例池 | Server Data | 登记数据面 BFE 引擎地址，控制面据此知道配置要下发给谁 |
+| BFE 集群 | BFECluster | 登记数据面 BFE 引擎地址，控制面据此知道配置要下发给谁（Server Data，由部署初始化数据维护，无 OpenAPI 管理接口） |
 | 模型服务商 | Provider | 描述一个模型服务提供方，包括协议类型、后端实例池、模型列表与认证密钥 |
 | AI 业务集群 | Cluster | 流量实际转发的后端集群，通过引用 Provider 声明其上游能力 |
 | 组织 | Entity | 表达部门、团队或项目等组织架构，是配额、限流、模型访问控制与路由规则的挂载点 |
@@ -91,9 +91,9 @@ OpenAI、DeepSeek、Anthropic、Google Gemini 等模型服务商的 API 协议�
 | 配额计划 | Quota Plan | 按 RMB 或 Token 为 Entity / API-Key 设置预算上限 |
 | 限流策略 | Rate Limit Policy | 按 RPM / TPM / 并发等维度限制请求速率 |
 
-### AI 网关实例池
+### BFE 集群（BFECluster）
 
-「AI 网关实例池」对应数据面 BFE 的引擎地址清单，用于登记哪些 BFE 节点可以从控制面拉取配置。它回答的是“配置要下发给谁”的问题，与 Provider 中的后端实例池（`instance_pool`）含义不同：前者是数据面入口，后者是上游模型服务端点。
+「BFE 集群」对应 BFE 的 Server Data 配置，登记数据面 BFE 的引擎地址清单，用于标识哪些 BFE 节点可以从控制面拉取配置。其记录由部署初始化数据（`db_ddl.sql` 种子数据，默认集群引用内置实例池 `BFE.aipool`）维护，未暴露 OpenAPI 管理接口。它回答的是“配置要下发给谁”的问题，与 Provider 中的后端实例池（`instance_pool`）含义不同：前者是数据面入口，后者是上游模型服务端点。
 
 ### 模型服务商（Provider）
 
@@ -193,6 +193,10 @@ Conf Agent 的存在使得控制面无需直接连接数据面，配置下发是
 ### Service Controller（服务发现）
 
 Service Controller 用于在 Kubernetes 环境中发现后端服务，并将服务地址同步到 AI Gateway API。这样，Cluster 中的后端实例可以自动跟随 K8s 服务变化，减少手工维护成本。
+
+### Log Reader（数据面日志采集）
+
+Log Reader 是数据面日志采集组件（仓库 `rainway-ai-gateway/log-reader`），部署在 BFE 侧，负责读取 BFE 产生的访问日志，解析为结构化的 Token 用量、延迟、状态码等记录，并写入 Kafka 或 MySQL，供报表统计与可观测分析消费。详细设计见 [第十五章 可观测性设计](./chapter15-observability.md)。
 
 ---
 
@@ -330,7 +334,7 @@ BFE /reload（热加载）
 
 - 壬远AI网关作为统一接入层，解决了多模型提供商接入、API-Key管理、成本与配额控制、高可用、安全审计等问题。
 - 系统采用控制面与数据面分离架构，控制面负责策略管理，数据面负责请求转发与策略执行。
-- 核心组件包括 AI Gateway API、Dashboard、BFE、Conf Agent 和 Service Controller。
+- 核心组件包括 AI Gateway API、Dashboard、BFE、Conf Agent、Service Controller 和 Log Reader。
 - 配置生命周期涵盖创建、存储、导出、拉取、热加载和生效六个阶段。
 - 支持从最小化部署到多可用区生产部署的多种拓扑。
 

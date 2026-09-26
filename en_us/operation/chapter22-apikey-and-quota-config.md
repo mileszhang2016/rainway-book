@@ -125,7 +125,7 @@ curl -X PATCH http://localhost:8183/open-api/v1/api-keys/apikey-001 \
 
 When modifying `quota_plan.quota` (unit unchanged), the system preserves the historical `used`, adjusts the balance as `remaining = max(0, new quota - used)`, and atomically adjusts Redis via `IncrBy(delta)`. This design avoids clearing historical usage during ordinary quota adjustments. When modifying `unit` or `unlimited`, since the old and new units cannot be converted, `used = 0` and `remaining = new quota` are reset, and Redis is updated to the new values.
 
-If an API-Key is attached to a new Entity, and `unlimited_quota=false` and `quota_plan.unlimited=false`, then the new Entity or at least one of its ancestors must have a valid Quota Plan; otherwise the update is rejected.
+If an API-Key is attached to a new Entity, the Control Plane only validates that the target Entity exists; no valid Quota Plan is required on the Entity or any of its ancestors.
 
 ### Deleting an API-Key
 
@@ -371,6 +371,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   -H "Content-Type: application/json" \
   -d '{
     "name": "bfe-project",
+    "description": "BFE R&D team",
     "type": "team",
     "parent_id": "ent-ops-001",
     "allow_models": ["gpt-4", "claude-3"],
@@ -395,6 +396,8 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
     }
   }'
 ```
+
+`description` is an optional organizational description field: 0-255 characters, with control characters not allowed; the Dashboard entity list supports searching and sorting by this field. Update semantics: omitting `description` in a full `PUT` update clears it, omitting it in a `PATCH` partial update keeps the current value, and passing `""` explicitly clears it.
 
 ### Creating an API-Key and Attaching It to an Entity
 
@@ -477,6 +480,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   -H "Content-Type: application/json" \
   -d '{
     "name": "ai-lab",
+    "description": "AI Lab (department-level budget)",
     "type": "dep",
     "parent_id": null,
     "allow_models": ["*"],
@@ -499,6 +503,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   -H "Content-Type: application/json" \
   -d '{
     "name": "chatbot-proj",
+    "description": "Intelligent customer service project",
     "type": "team",
     "parent_id": "ent-ai-lab-001",
     "allow_models": ["gpt-4", "gpt-3.5-turbo", "claude-3"],

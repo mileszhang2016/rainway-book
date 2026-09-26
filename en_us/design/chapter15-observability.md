@@ -104,6 +104,16 @@ In addition to the core fields listed above, the 781-790 sub-range of the 761-80
 
 `ai_image_input_tokens` and `ai_video_count` depend on `bfe-access-pb` v0.3.5. Their collection logic is located in `reqAiInfoGen()` of `bfe_modules/mod_access_pb3/request_log.go`; the values come from `ImageInputTokens` and `VideoCount` of `bfe_basic.TokenUsage`, which are filled by `mod_ai_token_auth` when parsing the usage in the response phase.
 
+### Zero-Value Semantics of Duration Fields
+
+The five duration fields of the access log — `ClusterServeTime` / `BackendServeTime` / `WriteClientTime` / `SessionOffsetTime` / `ProxyDelayTime` — are all funneled through `durationMsUint32` in `bfe_modules/mod_access_pb3/request_log.go`: when either endpoint is a zero time or the difference is negative, the value is written as 0.
+
+`ProxyDelayTime` (`proxy_delay_time`) measures the proxy delay from "request fully read" to "first byte from the backend". Its end timestamp `Stat.BackendFirst` is only set when the request actually invoked a backend; for requests that end without any backend call — auth rejection (401), no route (404), redirect, or connection close — it stays zero. A naive uint32 millisecond conversion of the negative difference "real timestamp − zero timestamp" wraps into a garbage value on the order of 2.1 billion milliseconds (observed: 2217714954, about 25 days), which exceeds the MySQL INT column limit (2147483647) and makes log-reader's `mod_log_mysql` fail the entire batch INSERT of access logs. `durationMsUint32` guards all five fields with an IsZero + non-negativity double check: durations with no backend call or a negative difference are emitted as 0, so downstream MySQL / Doris writes and billing reconciliation are unaffected by dirty data.
+
+### Subset Semantics of Responses API Cache Metering
+
+For the Responses API, `input_tokens` already includes `cached_tokens` (`total_tokens = input_tokens + output_tokens`, consistent with the total-input semantics of Chat Completions / Gemini). The protocol adaptation layer (`ParseOpenAIUsageFields` in `bfe/bfe_model_protocol/utils/usage_parse.go`) takes `input_tokens` directly as `PromptTokens` for the Responses chain without stacking cache sub-items on top — in the access log, `ai_input_tokens` is the total input and `ai_cache_read_tokens` is its subset. The Anthropic protocol differs: its `input_tokens` counts only fresh (cache-missing) tokens and excludes `cache_read_input_tokens` / `cache_creation_input_tokens`, so the adaptation layer (`ParseAnthropicUsageFields`) keeps the additive normalization (`PromptTokens = input_tokens + cache_read + cache_creation`) to align with the total-input semantics of OpenAI's `prompt_tokens`. The two accounting conventions are unified at the parsing layer, so downstream billing splits and reports do not need to distinguish protocols.
+
 ### Control Plane Operation Logs (Audit Data Source)
 
 The access log captures the request lifecycle of the Data Plane, while every configuration change in the Control Plane (AI Gateway API) is recorded by the Operation Log module, forming an audit observability data source. The Control Plane records every configuration change via the `operation_logs` module and exposes the query interface `GET /open-api/v1/operation-logs` (see [Appendix 1: OpenAPI Quick Reference](../appendix/appendix01-openapi-quick-reference.md) for the interface definition).
@@ -221,6 +231,8 @@ Logs and metrics solve "data collection"; reporting solves "data consumption". I
 | Presentation | ai-gateway-web report pages (calling `/report/*`) | Grafana Dashboard (`/report/*` can also query Doris directly) |
 | External dependencies | MySQL only | Kafka + Doris (+ Grafana) |
 | Applicable scenarios | Small-scale / private deployments, recommended for up to ~1M log entries per day | Large-scale deployments where MySQL capacity is exceeded |
+
+The official components of the standard form (ai-gateway-observability repository) are named as follows: on the Doris side, the database `bfe_observability` is created, containing the detail table `bfe_ai_request_log` and the minute-aggregation table `bfe_ai_metrics_1m`; details are loaded from Kafka via the Routine Load `bfe_ai_log_load`, and minute pre-aggregation is done on the Doris side by the INSERT JOB `bfe_ai_metrics_1m_job`; Grafana uses a MySQL-protocol connection to the Doris FE query port (9030 by default) as its data source, with the dashboard configured as `grafana/dashboards/bfe-ai-gateway-observability.json`. The deployment entry points are `doris/setup.sh` and `grafana/setup.sh`: see `doris/docs/user/HOWTO.md` and `grafana/docs/user/HOWTO.md` for operations, `doris/docs/design/TABLE_DESIGN.md` for table design, `grafana/docs/design/DASHBOARD_DESIGN.md` for dashboard panels and SQL, and `api/depends_api/req_log.md` for the PB-field → log-reader-JSON-field mapping.
 
 Key design trade-offs of the two pipelines:
 
@@ -394,5 +406,9 @@ Observability is not a one-time effort; it evolves continuously as business scal
 - `ai-gateway-api/design-docs/modifications/2026-09-15-report-query-api/change-summary.md` — Report Query API Change Summary
 - `ai-gateway-api/db_ddl_report_mysql.sql` — Report Detail and Aggregation Table DDL (MySQL Form)
 - `log-reader/doc/modules/mod_log_mysql/mod_log_mysql.md` — mod_log_mysql Plugin Documentation
+- `ai-gateway-observability/doris/docs/user/HOWTO.md` — Doris deployment guide (standard form)
+- `ai-gateway-observability/doris/docs/design/TABLE_DESIGN.md` — Doris table design
+- `ai-gateway-observability/grafana/docs/design/DASHBOARD_DESIGN.md` — Grafana dashboard panel and SQL design
+- `ai-gateway-observability/api/depends_api/req_log.md` — PB-field → log-reader-JSON-field mapping
 - `bfe_basic/request_ai_basic.go` — AI Context and Error Code Definitions in Go
 - `bfe_modules/mod_access_pb3/` — Access Log Output Module

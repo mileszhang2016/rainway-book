@@ -38,7 +38,7 @@ ai-gateway-epp 复用 llm-d（llm-d-router 引擎包）的调度引擎与插件�
 
 | 维度 | 上游 EPP（llm-d） | ai-gateway-epp |
 |------|------------------|----------------|
-| 运行环境 | Kubernetes：后端实例来自 InferencePool CRD，调度策略来自推理扩展配置 | 无 Kubernetes 依赖：后端实例来自 AI Gateway API InnerAPI 的 cluster_table 导出，调度配置与主备角色来自 `epp_data/config` 接口（epp_config 编译产物 + assignment 全量视图）——CRD reconciler 不存在 |
+| 运行环境 | Kubernetes：后端实例来自 InferencePool CRD，调度策略来自推理扩展配置 | 无 Kubernetes 依赖：后端实例来自 AI Gateway API InnerAPI 的 cluster_table 导出，调度配置与主备角色来自 `epp_data/config` 接口（epp_config 编译产物 + assignment 全量视图）——CRD reconciler 不存在；本地调试/测试可经 `-local-config-dir` 以本地 JSON 配置代替 InnerAPI 配置源，脱离控制面独立运行 |
 | 进程模型 | 一个 EPP 进程服务一个推理池（InferencePool） | 一个进程服务多个 Cluster：每个被分配的 Cluster 对应一个 Cell（数据面常驻：datastore + 指标采集；引擎按配置版本原子热切换），ext_proc 请求按 BFE 注入的 inference-pool metadata 路由到对应 Cell |
 | 配置生效 | CRD 更新经 Kubernetes reconcile 逐步生效 | `epp_config` 变更编译为新引擎后原子切换，旧引擎 drain（流控队列逐出 + 在飞请求等待上限），单 Cluster 编译失败不影响其他 Cluster |
 | 实例角色 | 由 Kubernetes 侧组件决定 | 由 assignment 全量视图决定：实例以 `-instance-id` 在视图中自匹配，定位自己持有哪些 Cluster 的主/备角色 |
@@ -75,7 +75,7 @@ flowchart LR
 
 - **AI Gateway API**：维护 EPP 实例池（`/epp-pool`）、Cluster 的 `balance_mode` 与 `epp_config`、Cluster→实例组分配（`epp_assignments`）；经 InnerAPI 向 EPP 下发编译后的调度配置与分配视图，经 server_data_conf 向 BFE 下发 `GslbBasic` 的 `BalanceMode=EPP` 与有序 `EPPAddr`。
 - **BFE**：命中 EPP 模式 Cluster 的请求经 gRPC ext_proc 发往当前活跃 EPP 地址（主）；EPP 调用失败或无候选时静默回退本地 WRR，业务不中断。
-- **ai-gateway-epp（EPP 组件）**：以实例组（每组 2 实例，互为主备）为部署单元运行；轮询 InnerAPI 获取调度配置与分配视图，按 assignment 决定本实例持有哪些 Cluster 的调度权；经 `cluster-table-discovery` 插件从 cluster_table 导出发现推理后端，周期性抓取后端 `/metrics` 指标驱动调度。
+- **ai-gateway-epp（EPP 组件）**：以实例组（每组 1~2 实例：生产 2 实例互为主备，测试可单实例组）为部署单元运行；轮询 InnerAPI 获取调度配置与分配视图，按 assignment 决定本实例持有哪些 Cluster 的调度权；经 `cluster-table-discovery` 插件从 cluster_table 导出发现推理后端，周期性抓取后端 `/metrics` 指标驱动调度。调试/测试可经 `-local-config-dir` 以本地 JSON 配置代替 InnerAPI 配置源，脱离控制面独立运行。
 - **Conf Agent**：把 server_data_conf（含 `GslbBasic`）下发到 BFE 并触发热加载，机制与 [第十四章 配置导出与版本控制设计](./chapter14-config-export-and-version-control.md) 所述一致。
 
 ---
@@ -103,7 +103,7 @@ Cluster 资源携带两个与 EPP 相关的字段：
 | `session_affinity_enabled` | `false` | 会话亲和开关 |
 | `session_affinity_header` | - | session id 来源请求头；`enabled=true` 时必填，二者成对出现 |
 | `kv_cache_utilization_max` | `0.9` | 端点过滤阈值 `(0,1]`：KV cache 利用率超过该值的端点被过滤 |
-| `flow_control` | - | 流控参数：`max_requests`（缺省不限，`-1` 显式不限）、`queue_ttl`（秒）、`no_endpoint_queue_ttl`（秒）、`enable_eviction` |
+| `flow_control` | - | 流控参数：`max_requests`（缺省不限，`-1` 显式不限）、`queue_ttl`（秒）、`no_endpoint_queue_ttl`（秒）、`enable_eviction`；编译产物始终显式下发 priority 0 band，全局 `max_requests` 不被隐藏 band 默认值（5000 并发 / 1GB 内存）静默截断 |
 
 两个字段的取值规则：
 
@@ -137,7 +137,7 @@ EPP 实例池是单例资源：`GET` 详情 + `PATCH` 全量替换。实例池�
 
 - **实例 id 约定**：EPP 以 StatefulSet 部署，实例 id 即 Pod hostname（`-instance-id` 启动参数缺省取 hostname）；`/epp-pool` 登记时实例 id 取 Pod 名。非 K8s 部署显式传 `-instance-id`。
 - **静态配置模式（无注册/心跳）**：实例列表是部署事实，由部署流程在实例变更（扩缩容、换机）后调用 `PATCH` 维护，天然幂等。系统不提供注册/心跳接口，AI Gateway API 侧不做存活标记——实例存活感知由 BFE 侧 `EPPAddr` 连接滞回驱动。
-- **组规模**：生产环境每组恰 2 实例（互为主备）；测试环境允许单实例组（仅主、无备）。
+- **组规模**：每组 1~2 实例——生产环境每组 2 实例（互为主备），测试环境允许单实例组（仅主、无备）；超过 2 个实例/组的请求返回 422。
 - **校验**：组名非空唯一；实例 id 池内全局唯一；`(host, port)` 组合池内全局唯一；host 为 Hostname 或 IP（IPv6 字面量不带括号）。
 - 实例池变更不直接 bump `ConfigTopicEppData` topic（实例增减不改变 cluster→role 映射）。
 
@@ -203,6 +203,8 @@ Authorization: Token <token>
 | `session_affinity_enabled=true` | scorer 链追加 `session-affinity-scorer`（strategy=session_id，session id 取自 `session_affinity_header`，权重固定 1.0） |
 | `flow_control` 存在时 | 生成 `flowControl` 段（秒数转为 Go duration），`featureGates` 追加 `flowControl`；`max_requests` 缺省或 `-1` 时不生成 `maxRequests` 字段 |
 
+流控编译的一个关键注记：EPP 的全部请求都运行在 priority 0 band，编译产物因此始终显式携带 band 0。llm-d 对未配置 band 会回退到隐藏默认值（5000 并发 / 1GB 内存），而全局限额与 band 限额独立生效（hasCapacity 同时校验两者），不显式下发就会把全局 `max_requests`（大于 5000 时）静默截断。`max_requests` 显式配置时 band 0 与之镜像；缺省或 `-1` 时全局 `maxRequests` 字段不生成，band 0 仍显式下发（10000 并发、5Gi 内存），容量确定且可审计。
+
 亲和类 scorer 是特性开关（开/关 + 固定权重 1.0），与档位权重正交：档位只调节 (kv, queue) 两个基础 scorer 的权重。
 
 ### cluster_table 导出：EPP 发现推理后端的来源
@@ -248,7 +250,7 @@ BFE 的 `cluster_conf.data` 中每个 Cluster 的 `GslbBasic` 节携带 EPP 相�
 | `EPPAddr` | 有序主备地址列表，`[0]`=主、`[1]`=备；`BalanceMode=EPP` 时非空（加载校验：元素须为 `host:port`、列表内去重） |
 | `EPPCheck` | 健康检查与滞回参数：`CheckInterval`（默认 2s）、`FailThreshold`（默认 3）、`Cooldown`（默认 45s）、`SuccessThreshold`（默认 2） |
 | `EPPTimeout` | 调用超时：`Connect`（默认 500ms）、`Call`（默认 3s） |
-| `EPPTLS` | 传输安全：`Insecure`（测试环境）/ `CAFile`（生产环境校验 EPP 服务端证书） |
+| `EPPTLS` | 传输安全三选一（加载期 fail-fast 互斥校验）：`Insecure`（TLS 但跳过证书校验，仅测试环境）/ `CAFile`（TLS 并校验 EPP 服务端证书，生产环境推荐）/ `Plaintext`（明文拨号，与 Insecure/CAFile 互斥）。未配置时自动填充 `{Insecure: true}`（TLS 但跳过证书校验）并输出告警日志，提示显式配置 |
 | `EPPBreaker` | 熔断参数（滑动窗口错误率），与地址级 failover 互补 |
 
 ### 请求处理流程

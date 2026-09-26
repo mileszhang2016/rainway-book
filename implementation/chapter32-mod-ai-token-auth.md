@@ -18,10 +18,11 @@
 
 模块的核心职责包括：
 
-1. **API-Key 提取与校验**：从请求 `Authorization: Bearer <api-key>` 头中提取 Key，校验其存在性、启用状态、过期时间、模型白名单/黑名单、来源 IP 子网等。校验失败时立即构造结构化错误响应返回客户端，避免无效请求进入后端。
+1. **API-Key 提取与校验**：从请求 `Authorization: Bearer <api-key>` 头中提取 Key，校验其存在性、启用状态、过期时间、来源 IP 子网等。校验失败时立即构造结构化错误响应返回客户端，避免无效请求进入后端。
 2. **配额余额预检**：在请求进入后端前，查询 Redis 中各 `QuotaPlan` 的剩余配额，余额不足或计划过期时拒绝请求。这一步只在请求成功认证后执行，未命中鉴权规则的请求不会触发配额检查。
-3. **请求结束扣减**：在响应完成后，根据响应体中的 `usage` 字段或按内容长度估算的 Token 数，对 `total_token` 配额执行扣减；对 `RMB` 配额则先按模型单价折算成本，再执行扣减。客户端中断且未拿到最终 usage 的请求不计费，`/count_tokens` 类端点跳过计费，扣费通过 `deducted` 标记保证幂等。扣减失败会被捕获并记录 Warn 日志，不会影响响应返回。
-4. **错误信息结构化**：在 `AiBasicInfo.AiAuthInfo` 中记录拒绝原因与命中的配额计划，便于访问日志与监控分析。这些字段也会被 `mod_access` 等访问日志模块输出，为后续排障提供完整上下文。
+3. **目标模型校验**：若 Token 配置了 `Models` 或 `BlockModels`，在转发阶段对最终目标模型执行白名单/黑名单校验（见下文"目标模型校验（转发期）"），不匹配返回 400 `CodeModelNotAllowed`。
+4. **请求结束扣减**：在响应完成后，根据响应体中的 `usage` 字段或按内容长度估算的 Token 数，对 `total_token` 配额执行扣减；对 `RMB` 配额则先按模型单价折算成本，再执行扣减。客户端中断且未拿到最终 usage 的请求不计费，`/count_tokens` 类端点跳过计费，扣费通过 `deducted` 标记保证幂等。扣减失败会被捕获并记录 Warn 日志，不会影响响应返回。
+5. **错误信息结构化**：在 `AiBasicInfo.AiAuthInfo` 中记录拒绝原因与命中的配额计划，便于访问日志与监控分析。这些字段也会被 `mod_access` 等访问日志模块输出，为后续排障提供完整上下文。
 
 ## 模块在 BFE 模块链中的位置
 
@@ -53,23 +54,28 @@ var moduleList = []bfe_module.BfeModule{
 
 `HandleRequestFinish` 是 BFE 请求生命周期的最后一个回调点，所有响应数据（包括流式累计的 Token 用量、RMB 成本）此时都已就绪，因此配额扣减放在这里可以确保只扣除一次且金额准确。如果提前到 `HandleReadResponse` 扣减，流式响应尚未结束，会导致少扣或重复扣减。
 
-`mod_ai_token_auth` 在初始化时注册了三个回调：
+`mod_ai_token_auth` 在初始化时注册了四个回调：
 
 - `HandleFoundProduct`：`tokenFoundProductHandler`，完成 API-Key 校验与配额预检；
+- `HandleAfterAITargetModel`：`targetModelCheckFilter`，在目标模型解析后、转发前按集群 attempt 对最终目标模型执行白名单/黑名单校验；
 - `HandleReadResponse`：`tokenReadResponseHandler`，非流式场景下解析响应体中的 Token 用量；
 - `HandleRequestFinish`：`tokenRequestFinishHandler`，在所有响应处理完成后执行最终配额扣减。
+
+其中 `HandleAfterAITargetModel` 上 `mod_ai_token_auth` 先于 `mod_ai_rate_limit` 注册，保证模型白名单校验始终先于限流执行。
 
 ```mermaid
 flowchart LR
     A[请求进入] --> B[mod_unified_waf]
     B --> C[mod_ai_token_auth<br/>HandleFoundProduct]
     C --> D[mod_ai_route]
-    D --> E[后端模型服务]
-    E --> F[mod_body_process<br/>HandleReadResponse]
-    F --> G[mod_ai_token_auth<br/>HandleReadResponse]
-    G --> H[mod_ai_rate_limit]
-    H --> I[mod_ai_token_auth<br/>HandleRequestFinish]
-    I --> J[返回客户端]
+    D --> E[目标模型解析<br/>doSingleAIForward]
+    E --> F[mod_ai_token_auth<br/>HandleAfterAITargetModel<br/>目标模型校验]
+    F --> G[mod_ai_rate_limit<br/>HandleAfterAITargetModel]
+    G --> H[后端模型服务]
+    H --> I[mod_body_process<br/>HandleReadResponse]
+    I --> J[mod_ai_token_auth<br/>HandleReadResponse]
+    J --> K[mod_ai_token_auth<br/>HandleRequestFinish]
+    K --> L[返回客户端]
 ```
 
 ## API-Key 校验流程
@@ -120,8 +126,9 @@ func (m *ModuleAITokenAuth) tokenFoundProductHandler(req *bfe_basic.Request) (in
 2. **查找 Token**：在规则表 `TokenRuleTable` 中按 `product + key` 查找；不存在返回 `CodeInvalidApiKey`。在校验失败前，模块会尽早把 `KeyId` 写入 `AiBasicInfo`，这样即使请求后续被拒绝，访问日志也能关联到具体 Key。
 3. **状态校验**：检查 `Enabled` 与 `ExpiredTime`；禁用或过期分别返回 `CodeKeyDisabled`、`CodeKeyExpired`。
 4. **配额预检**：遍历 `token.QuotaPlans`，跳过 `Unlimited` 与 `PassNoQuota` 计划；对有限计划调用 `plan.HasBalance` 查询 Redis，余额不足返回 `CodeQuotaExhausted`，计划过期返回 `CodeQuotaExpired`。多个配额计划会依次检查，只有全部通过才放行。
-5. **模型权限校验**：若 Token 配置了 `Models` 或 `BlockModels`，读取请求体 `model` 字段进行白名单/黑名单匹配；不匹配返回 `CodeModelNotAllowed`。当配置为 `*` 时表示允许所有模型。
-6. **IP 子网校验**：若配置了 `Subnet`，检查 `ClientAddr` 或 `RemoteAddr` 是否在允许子网内；不在则返回 `CodeSubnetNotAllowed`。子网支持 CIDR 表示，可配置多个。
+5. **IP 子网校验**：若配置了 `Subnet`，检查 `ClientAddr` 或 `RemoteAddr` 是否在允许子网内；不在则返回 `CodeSubnetNotAllowed`。子网支持 CIDR 表示，可配置多个。
+
+模型白名单/黑名单不在上述鉴权期列表中，而是在转发期对最终目标模型校验，详见下一节。
 
 ```mermaid
 flowchart TD
@@ -136,9 +143,9 @@ flowchart TD
     H -->|是| J[遍历 QuotaPlans 查 Redis]
     J --> K{余额足够?}
     K -->|否| L[返回 429 CodeQuotaExhausted]
-    K -->|是| M[模型/子网校验]
+    K -->|是| M[子网校验]
     M --> N{通过?}
-    N -->|否| O[返回 403/400]
+    N -->|否| O[返回 403 CodeSubnetNotAllowed]
     N -->|是| P[设置 TokenAuthContext]
 ```
 
@@ -152,6 +159,36 @@ if aiBasicInfo.Mode == bfe_basic.ModeVideoGeneration {
     tusage.VideoCount = GetVideoCountFromReq(req)
 }
 ```
+
+## 目标模型校验（转发期）
+
+Token 的 `Models`（白名单）与 `BlockModels`（黑名单）在转发期校验，而不是鉴权期读请求体 `model` 字段。校验入口是 `mod_ai_token_auth` 注册在 `HandleAfterAITargetModel` 回调点的 `targetModelCheckFilter`（`bfe/bfe_modules/mod_ai_token_auth/model_check.go`）：`ServeHTTPForAI()` 的每次集群 attempt 在 `doSingleAIForward` 内、调用 `clusterInvoke` 之前触发该回调，此时 `AiBasicInfo.TargetModel` 已由 `computeTargetModel` 完成解析——依次应用路由 target/fallback 的目标模型覆盖、集群 `StripPrefix`/`MatchPrefix` 前缀裁剪、集群 `ModelMapping` 模型映射——校验对象就是发往上游的最终模型名。`ValidateTargetModel` 的逻辑为：
+
+```go
+func (m *ModuleAITokenAuth) ValidateTargetModel(req *bfe_basic.Request, targetModel string) *bfe_basic.AiError {
+    ctx := GetTokenAuthContext(req)
+    if ctx == nil || ctx.Token == nil {
+        return nil // 未命中鉴权规则或未认证，不校验
+    }
+    tok := ctx.Token
+    if len(tok.Models) == 0 && len(tok.BlockModels) == 0 {
+        return nil // 未配置白名单/黑名单，放行
+    }
+    model := strings.TrimSpace(targetModel)
+    if model == "" {
+        // 配置了白名单/黑名单但目标模型不可判定，按"请求体中找不到模型"拒绝
+        return ... // CodeInvalidRequest，HTTP 400
+    }
+    // 先查黑名单，再查白名单（白名单非空时必须命中）
+    // 不匹配返回 CodeModelNotAllowed，HTTP 400
+}
+```
+
+校验不通过时 `targetModelCheckFilter` 返回 `BfeHandlerFinish` 并构造本地 400 错误响应，该 attempt 不再发往上游，也不会触发 API-Key 轮换与集群 fallback；校验结果通过 `SetAiAuthInfo` 记入 `AiBasicInfo.AiAuthInfo.RejectReason`，便于访问日志关联拒绝原因。
+
+按 attempt 触发意味着集群级 fallback 会对每个 attempt 各自解析出的目标模型复校验：主目标被白名单拒绝时请求携带 `RejectReason` 进入备用集群尝试，若备用 attempt 成功，`ServeHTTPForAI()` 会在跳出转发循环时清除残留的 `RejectReason`（及 `RejectQuotaPlans`），保证成功请求的访问日志不携带旧的拒绝原因。因此路由目标模型覆盖与 API-Key 模型白名单按"先重定向、后校验"组合生效：白名单约束的是转发后的目标模型，而不是客户端请求体里的原始模型。
+
+原生 Gemini 路径（`:publishers/.../models/<model>:generateContent` 之外的 `/v1beta/models/<model>:<action>` 形式）的模型名取自 URL path（`bfe_model_protocol/gemini` 的 `ExtractModelFromPath`），同样进入 `TargetModel` 的解析链路，白名单校验对其生效。
 
 ## 配额计划绑定与余额查询（Redis）
 
@@ -310,8 +347,8 @@ func isClientAbortErr(err error) bool {
 
 按内容长度估算 Token（`EstimateToken`，请求体 `Content-Length/4` 估算输入、响应体长度估算输出）只是兜底手段，只有响应正常完成时才允许参与计费。为此 `bfe_basic.AiBasicInfo` 维护两组状态标记：
 
-- `MarkResponseCompleted` / `IsResponseCompleted`：响应正常完成时置位。流式场景由 `mod_body_process` 在见到终止事件（Anthropic `message_stop`、OpenAI `[DONE]`）时置位；非流式场景由 `tokenReadResponseHandler` 在完整读出响应体后置位。
-- `MarkFinalUsageSeen` / `IsFinalUsageSeen`：从响应中解析到最终 usage 时置位。流式场景由 `QuotaUsageProcessor` 在收到最终 usage 事件（如 Anthropic `message_delta`，或带 `image_count` / `video_count` 的事件）时置位；非流式场景在解析出非零 `UsedQuota` 后置位。Anthropic `message_start` 中 `output_tokens = 0` 的初始 usage 不算最终 usage。
+- `MarkResponseCompleted` / `IsResponseCompleted`：响应正常完成时置位。流式场景由 `mod_body_process` 在见到终止事件（Anthropic `message_stop`、OpenAI `[DONE]`、Responses API `response.completed`）时置位；非流式场景由 `tokenReadResponseHandler` 在完整读出响应体后置位。
+- `MarkFinalUsageSeen` / `IsFinalUsageSeen`：从响应中解析到最终 usage 时置位。流式场景由 `QuotaUsageProcessor` 在收到最终 usage 事件（如 Anthropic `message_delta`、Responses API `response.completed`，或带 `image_count` / `video_count` 的事件）时置位；非流式场景在解析出非零 `UsedQuota` 后置位。Anthropic `message_start` 中 `output_tokens = 0` 的初始 usage 不算最终 usage。
 
 结算规则为：
 
@@ -458,7 +495,7 @@ default:
 }
 ```
 
-模式由 `bfe_basic.DetectModeFromPath` 根据请求路径判定，包括 `/v1/responses` → `ModeResponses` 与 `/v1/video/generations` → `ModeVideoGeneration`。
+模式由 `bfe_basic.DetectModeFromPath` 根据请求路径判定（端点表为 `bfe_basic/openai_endpoint.go` 的 `openAIEndpointModes`）：先剥离可选的 `/v1` 版本前缀，再查共享端点表——`/responses` → `ModeResponses`、`/video/generations` → `ModeVideoGeneration`，`/chat/completions`、`/embeddings`、`/images/generations` 等端点各归对应模式，无专属模式的端点与未知路径归默认 `ModeChat`；`/compatible-mode/v1/responses` 这类以 `/v1` 段结尾的 provider 原生入口归约后同样识别为 `ModeResponses`。
 
 `calcChatCost` 支持多种细粒度计费维度：
 
@@ -512,7 +549,7 @@ func (m *ModuleAITokenAuth) tokenReadResponseHandler(req *bfe_basic.Request, res
 }
 ```
 
-`UpdateCtxByUsage` 不再内置大段的 gjson 提取链，而是委托给协议适配层：根据请求阶段识别出的 `AiBasicInfo.AuthStyle` 取对应适配器（`modelprotocol.Get(authStyle).ExtractUsageFields`），由 `bfe_model_protocol` 按协议提取 `PromptTokens`、`CompletionTokens`、缓存读写、图片输入、图片/视频数量等字段后回填到 `TokenUsage`。这样既兼容 OpenAI、DeepSeek、Anthropic 等协议的 usage 差异（如 DeepSeek 的 `prompt_cache_hit_tokens`、Anthropic 的 `message.usage` 嵌套形态），也让新增协议的用量提取可以在适配层独立扩展。
+`UpdateCtxByUsage` 将字段提取委托给协议适配层：根据请求阶段识别出的 `AiBasicInfo.AuthStyle` 取对应适配器（`modelprotocol.Get(authStyle).ExtractUsageFields`），由 `bfe_model_protocol` 按协议提取 `PromptTokens`、`CompletionTokens`、缓存读写、图片输入、图片/视频数量等字段后回填到 `TokenUsage`。这样既兼容 OpenAI、DeepSeek、Anthropic 等协议的 usage 差异（如 DeepSeek 的 `prompt_cache_hit_tokens`、Anthropic 的 `message.usage` 嵌套形态），也让新增协议的用量提取可以在适配层独立扩展。
 
 当响应体中确实没有 `usage` 字段（例如某些私有部署模型未返回用量），且配置允许估算时，模块会按 `Content-Length / 4` 粗略估算输出 Token 数，并结合请求体估算的输入 Token 数得到一个近似用量。估算逻辑仅作为兜底，不建议用于精确计费场景。
 
@@ -520,7 +557,7 @@ func (m *ModuleAITokenAuth) tokenReadResponseHandler(req *bfe_basic.Request, res
 
 流式响应由 `mod_body_process` 在 `HandleReadResponse` 中逐段解析 SSE 事件，并通过 `QuotaUsageProcessor.Process` 累计 Token 用量到 `AiBasicInfo.TokenUsage`。由于流式响应在 `HandleReadResponse` 阶段尚未结束，`mod_ai_token_auth` 的 `tokenReadResponseHandler` 通常拿不到完整用量；最终扣减由 `tokenRequestFinishHandler` 在 `HandleRequestFinish` 阶段读取已填充的 `TokenUsage` 完成。
 
-`QuotaUsageProcessor` 在解析每个 SSE 事件时同步维护计费可靠性状态：见到终止事件（Anthropic `message_stop`、OpenAI `[DONE]`）时调用 `MarkResponseCompleted`；收到最终 usage 事件时调用 `MarkFinalUsageSeen`。Anthropic 流式的 `message_start` 只带初始 usage（`output_tokens = 0`），`message_delta` 才携带最终 output tokens 但不带 prompt 字段——Processor 对最终 usage 事件始终处理，并在 `message_delta` 场景下保留 `message_start` 阶段已解析的 `PromptTokens`、`CacheReadTokens`、`CacheWriteTokens` 等字段，只更新 completion 部分，避免缓存 Token 丢失或重复计价。这两个状态标记正是 `tokenRequestFinishHandler` 判断"客户端中断不计费、估算仅正常完成时可用"的依据。
+`QuotaUsageProcessor` 在解析每个 SSE 事件时同步维护计费可靠性状态：见到终止事件（Anthropic `message_stop`、OpenAI `[DONE]`、Responses API `response.completed`）时调用 `MarkResponseCompleted`；收到最终 usage 事件（Anthropic `message_delta`、Responses API `response.completed`——该事件同时是终止事件与最终 usage 事件，usage 嵌套在 `response.usage` 下）时调用 `MarkFinalUsageSeen`。Anthropic 流式的 `message_start` 只带初始 usage（`output_tokens = 0`），`message_delta` 才携带最终 output tokens 但不带 prompt 字段——Processor 对最终 usage 事件始终处理，并在 `message_delta` 场景下保留 `message_start` 阶段已解析的 `PromptTokens`、`CacheReadTokens`、`CacheWriteTokens` 等字段，只更新 completion 部分，避免缓存 Token 丢失或重复计价。这两个状态标记正是 `tokenRequestFinishHandler` 判断"客户端中断不计费、估算仅正常完成时可用"的依据。
 
 ```mermaid
 sequenceDiagram
@@ -576,8 +613,12 @@ func (m *ModuleAITokenAuth) Init(cbs *bfe_module.BfeCallbacks, whs *web_monitor.
     m.redisClient = client
     m.loadProductRuleConf(nil)
 
-    // 注册三个回调
+    // 注册四个回调
     cbs.AddFilter(bfe_module.HandleFoundProduct, m.tokenFoundProductHandler)
+    // 模型白名单/黑名单校验注册在 AI 转发阶段回调点（目标模型已解析），
+    // 按集群 attempt 复校验；先于 mod_ai_rate_limit 注册，
+    // 保证白名单校验始终先于限流执行。
+    cbs.AddFilter(bfe_module.HandleAfterAITargetModel, m.targetModelCheckFilter)
     cbs.AddFilter(bfe_module.HandleReadResponse, m.tokenReadResponseHandler)
     cbs.AddFilter(bfe_module.HandleRequestFinish, m.tokenRequestFinishHandler)
 
@@ -716,8 +757,8 @@ type TokenAuthContext struct {
 `mod_ai_token_auth` 是壬远 AI 网关数据面中连接认证与计费的关键模块。本章要点如下：
 
 - 模块在 BFE 模块链中位于 `mod_ai_route` 之前，负责在请求路由前完成 API-Key 校验与配额预检。
-- 通过 `HandleFoundProduct`、`HandleReadResponse`、`HandleRequestFinish` 三个回调，分别完成认证、用量解析、配额扣减。
-- API-Key 从 `Authorization: Bearer <api-key>` 中提取，校验项包括存在性、启用状态、过期时间、模型白名单/黑名单、来源子网以及各 `QuotaPlan` 的 Redis 余额。
+- 通过 `HandleFoundProduct`、`HandleAfterAITargetModel`、`HandleReadResponse`、`HandleRequestFinish` 四个回调，分别完成认证、目标模型校验、用量解析、配额扣减。
+- API-Key 从 `Authorization: Bearer <api-key>` 中提取，鉴权期校验项包括存在性、启用状态、过期时间、来源子网以及各 `QuotaPlan` 的 Redis 余额；模型白名单/黑名单在转发期按最终目标模型校验（`ValidateTargetModel`），不匹配返回 400 并结束该次 attempt。
 - `QuotaPlan.RedisKey` 由控制面生成并下发，BFE 直接使用，避免改名导致计数器重置；`total_token` 与 `RMB` 两种单位分别使用不同的 Lua 脚本扣减。
 - RMB 配额按 `AIConf.ModelTable` 中的模型价格（float64）与当前时段 tier 逐项 `quota.CalcCostUnits` 换算为 1e-8 元定点整数后累加扣减；chat 计费从总输入中拆分缓存读写、图片/音频输入维度，均未配置时回退 legacy 公式，`responses` 复用 chat 计费，`video_generation` 按 `output_cost_per_video` × 视频数计费。
 - 计费可靠性由 `AiBasicInfo` 的 `MarkResponseCompleted` / `MarkFinalUsageSeen` 两组标记支撑：客户端中断且未见到最终 usage 不扣费，估算值仅在响应正常完成时可用；`TokenAuthContext.deducted` 保证扣费幂等；`/count_tokens` 端点跳过计费。

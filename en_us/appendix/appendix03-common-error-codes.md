@@ -2,9 +2,9 @@
 
 This book involves two categories of error codes: the OpenAI-compatible error codes returned by the BFE Data Plane in AI gateway scenarios, and the `ErrNum` business error codes returned by the AI Gateway API Control Plane OpenAPI. Both are maintained by the official BFE documentation and the Control Plane interface definition documents respectively; this book does not repeat them, but highlights the key semantics of both categories in AI gateway scenarios.
 
-## BFE Data Plane Error Codes (v1.8.7)
+## BFE Data Plane Error Codes (v1.8.8)
 
-- [BFE AI Gateway Error Codes](https://github.com/bfenetworks/bfe/blob/refs/tags/v1.8.7/docs/zh_cn/sys_design/ai_error_codes.md)
+- [BFE AI Gateway Error Codes](https://github.com/bfenetworks/bfe/blob/refs/tags/v1.8.8/docs/zh_cn/sys_design/ai_error_codes.md)
 
 That document covers the following:
 

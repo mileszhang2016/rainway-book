@@ -15,7 +15,7 @@ Provider 与 Cluster 分离后，二者职责更加清晰：
 
 这种分离带来了多方面好处：同一 Provider 被多个 Cluster 引用时，实例池和密钥只需维护一份，避免重复配置；Cluster 不再存储 API Key 明文，只通过 name 引用 Provider 中的 Key，提升了安全性；Provider 可独立创建、更新、删除，Cluster 通过引用获取后端能力，生命周期更独立；新增协议时只需扩展 Provider 的 model_protocols，不会导致 Cluster 模型持续膨胀。
 
-Provider 的核心字段包括：全局唯一的 `name`、可选的 `description`、模型发现端点 `model_endpoint`、支持的模型列表 `models`、API Key 列表 `keys`、后端实例池 `instance_pool`、支持的协议 `model_protocols`、可选的协议路径映射 `protocol_paths`、时区 `time_zone` 与分时段模板 `tiers`。其中 `instance_pool` 必填且至少包含一个权重大于 0 的实例，`model_protocols` 必填且至少包含一个协议。
+Provider 的核心字段包括：全局唯一的 `name`、可选的 `description`、模型发现端点 `model_endpoint`、模型列表 `models`、API Key 列表 `keys`、后端实例池 `instance_pool`、支持的协议 `model_protocols`、可选的协议路径映射 `protocol_paths`、时区 `time_zone` 与分时段模板 `tiers`。其中 `models` 必填且至少包含 1 个元素，`instance_pool` 必填且至少包含一个权重大于 0 的实例，`model_protocols` 必填且至少包含一个协议。
 
 `time_zone` 默认值为 `Asia/Shanghai`，用于计算当前时间属于哪个 tier。`tiers` 初期只支持 `name=peak`，每个 tier 包含若干 `time_ranges`，采用左闭右开语义。通过 `PUT /v1/providers/{provider_name}/pricing-tiers` 可单独维护时区与 tier，无需在创建 Provider 时传入。
 
@@ -126,7 +126,7 @@ Provider 通过 `model_protocols` 字段声明支持的模型访问协议。首�
 
 ## 协议路径配置（protocol_paths）
 
-不同 provider 的上游路径前缀各不相同，且同一 provider 的不同协议常挂在不同前缀下：百炼 DashScope 的 OpenAI 兼容在 `/compatible-mode/v1`、Anthropic 兼容在 `/apps/anthropic`；火山方舟按量在 `/api/v3` 与 `/api/compatible`；Kimi Code 会员（api.kimi.com）在 `/coding/v1` 与 `/coding`。不配 `protocol_paths` 时 BFE 对上游路径纯透传，客户端必须按 provider 原生路径发起请求；配置后客户端可以统一用标准入口 `/v1/...` 访问所有 provider，由 BFE 在转发时改写路径。
+不同 provider 的上游路径前缀各不相同，且同一 provider 的不同协议常挂在不同前缀下：百炼 DashScope 的 OpenAI 兼容在 `/compatible-mode/v1`、Anthropic 兼容在 `/apps/anthropic`；火山方舟按量在 `/api/v3` 与 `/api/compatible`；Kimi Code 会员（api.kimi.com）在 `/coding/v1` 与 `/coding`。不配 `protocol_paths` 时 BFE 对上游路径纯透传，客户端必须按 provider 原生路径发起请求；配置后客户端可以统一用 OpenAI 端点路径访问所有 provider（openai 协议带不带 `/v1` 前缀均可，anthropic 协议走标准入口 `/v1/...`），由 BFE 在转发时改写路径。
 
 `protocol_paths` 是"协议 → 上游 base path"的映射，取值为该协议官方 SDK `base_url` 的 path 部分：`openai` 含 `/v1` 尾（如 `/compatible-mode/v1`），`anthropic` 不含 `/v1`（如 `/apps/anthropic`，Anthropic SDK 会自拼 `/v1/messages`）。配置时可直接照抄 provider 官方文档的 base_url 一栏。常见 provider 的参考值：
 
@@ -146,7 +146,10 @@ Provider 通过 `model_protocols` 字段声明支持的模型访问协议。首�
 - 缺省（不配置）表示关闭，请求路径原样转发；
 - PATCH 更新遵循部分更新约定：不显式携带则保持原值，显式传 `null` 清空（恢复透传）。
 
-转发行为：仅标准入口被改写（anthropic 请求 `/v1/messages` → `{anthropic 值}/v1/messages`；openai 请求 `/v1/chat/completions` → `{openai 值}/chat/completions`）；未配置对应协议、或请求本就按 provider 原生路径（非标准入口）发起时原样透传，兼容存量客户端。
+转发行为（`bfe/bfe_server/ai_path_rewrite.go` 中的 `rewriteUpstreamPath`）：
+
+- openai 协议：客户端入口带不带 `/v1` 前缀均可改写。先剥离可选的 `/v1` 前缀，命中 `bfe_basic` 共享端点表（`bfe/bfe_basic/openai_endpoint.go` 中的 `openAIEndpointModes`，13 个端点）才改写：`/v1/chat/completions` 与 `/chat/completions` 均改写为 `{openai 值}/chat/completions`，`/v1` 或 `/v1/` 改写为 `{openai 值}` 本身；未命中端点表的自定义路径原样透传，兼容存量客户端。
+- anthropic 协议：仅标准入口 `/v1/...` 被改写（`/v1/messages` → `{anthropic 值}/v1/messages`），非标准入口原样透传；未配置对应协议路径时不改写。
 
 注意事项：
 
@@ -226,12 +229,14 @@ BFE 数据面 cluster_conf 的 `ModelTable`（含全局 `Prices` 与 `TierPrices
 
 | mode | 计费方式 |
 |------|---------|
-| `responses` | 按 chat 计费，即沿用 `input_cost_per_token` / `output_cost_per_token` 等字段的 token 计费逻辑（`/v1/responses` 路径识别为该模式） |
+| `responses` | 按 chat 计费，即沿用 `input_cost_per_token` / `output_cost_per_token` 等字段的 token 计费逻辑（`/v1/responses` 及 provider 原生路径形式的 `/responses` 端点识别为该模式） |
 | `video_generation` | 成本 = `VideoCount × output_cost_per_video`（`/v1/video/generations` 路径识别为该模式） |
 
 对于 `video_generation` 模式，BFE 在认证阶段预读请求体 `n` 字段作为生成个数兜底：字段缺失或非法时按 1 个计费，避免少计费；响应 `usage` 中的 `video_count` 优先作为最终生成个数。相应地，`usage` 统计包含 `image_input_tokens` 与 `video_count` 字段，分别对应访问日志字段 `ai_image_input_tokens`(786) 与 `ai_video_count`(787)（bfe-access-pb v0.3.5）。
 
-实现参考：`bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go` 中的 `ModelPrice` 与价格字段常量、`bfe/bfe_basic/request_ai_basic.go` 中的 `DetectModeFromPath`、`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go` 中的 `calcVideoGenerationCost` / `calcResponsesCost`。完整计费语义见 `bfe/docs/zh_cn/sys_design/rmb_quota.md`。
+实现参考：`bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go` 中的 `ModelPrice` 与价格字段常量、`bfe/bfe_basic/request_ai_basic.go` 中的 `DetectModeFromPath`、`bfe/bfe_basic/openai_endpoint.go` 中的 `openAIEndpointModes`（OpenAI 共享端点表，13 个端点）、`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go` 中的 `calcVideoGenerationCost` / `calcResponsesCost`。完整计费语义见 `bfe/docs/zh_cn/sys_design/rmb_quota.md`。
+
+模式识别与上游路径改写共用同一张端点表，两者对"什么是 OpenAI 标准端点"的判断永远一致：`DetectModeFromPath` 先剥离可选的 `/v1` 前缀（标准入口带不带 `/v1` 识别结果相同），并把以 `/v1` 段结尾的 provider 原生前缀（OpenAI SDK base_url 形式，如百炼 `/compatible-mode/v1/responses`）归约到同一端点再查表。因此客户端按 provider 原生路径发起的请求也能正确识别模式与计费；未命中端点表的路径按默认 chat 模式处理。
 
 ## Provider 与 Cluster 的关联
 
@@ -292,7 +297,7 @@ BFE 最终接收到的配置由控制面自动合并生成：`AIConf.Keys` 通�
 
 ### 7. 配置了 protocol_paths 但请求未被改写（上游 404）
 
-确认请求走的是标准入口 `/v1/...`（非标准入口永不改写，原样透传）；确认请求协议已在 `model_protocols` 中声明且 `protocol_paths` 有对应条目；确认 BFE 版本已支持 `AIConf.ProtocolPaths`（加载期会做 key 白名单校验，非法配置拒绝加载并指明 cluster）；若发生了 fallback，切换到未配置 `protocol_paths` 的备用 cluster 后透传属预期行为。
+先确认请求路径命中 OpenAI 共享端点表：openai 协议下带不带 `/v1` 前缀均可改写，但剥离可选 `/v1` 前缀后未命中端点表（`bfe_basic/openai_endpoint.go`）的自定义路径会原样透传，属预期行为；anthropic 协议仅改写标准入口 `/v1/...`，非标准入口透传。再确认请求协议已在 `model_protocols` 中声明且 `protocol_paths` 有对应条目；确认 BFE 版本已支持 `AIConf.ProtocolPaths`（加载期会做 key 白名单校验，非法配置拒绝加载并指明 cluster）；若发生了 fallback，切换到未配置 `protocol_paths` 的备用 cluster 后透传属预期行为。
 
 ## 配置示例
 

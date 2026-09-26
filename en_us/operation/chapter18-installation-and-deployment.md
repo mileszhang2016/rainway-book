@@ -21,6 +21,9 @@ The Rainway AI Gateway adopts a layered **Control Plane + Data Plane** architect
 - **Conf Agent**: the configuration agent, which communicates with the Control Plane and triggers hot reload of BFE configurations. The corresponding repository is `bfenetworks/conf-agent`.
 - **Dashboard**: the visual management console, usually served as static assets mounted into AI Gateway API.
 - **Service Controller**: a Kubernetes service discovery component, deployed optionally.
+- **Log Reader**: the access-log collection component, deployed with BFE in the Data Plane. It forwards BFE access logs to Kafka or MySQL for the reporting and observability pipelines. The corresponding repository is `rainway-ai-gateway/log-reader`.
+
+In addition, the reporting standard form (Doris + Grafana) relies on a set of optional external components: Kafka receives log messages from log-reader, Doris stores detail and aggregated data, and Grafana renders the monitoring dashboards. These observability components are not part of the AI Gateway itself; the one-click deployment scripts for the storage and presentation layers are provided by the `rainway-ai-gateway/ai-gateway-observability` repository, as described in "Deploying the Reporting Standard Form (Doris + Grafana)" below.
 
 ```mermaid
 flowchart LR
@@ -207,7 +210,7 @@ SQLite is suitable for functional validation and development debugging; it is no
 
 ## Deploying the Reporting Lightweight Form (Optional)
 
-If you want usage reports in the console without introducing Kafka/Doris/Grafana, enable the reporting lightweight form: the log-reader `mod_log_mysql` plugin writes access logs directly to MySQL, AI Gateway API provides the `/report/*` queries and built-in aggregation JOBs, and the console renders the pages directly. The standard form (with an existing Doris pipeline) skips this section — it only requires `[Report].Backend = "doris"`.
+If you want usage reports in the console without introducing Kafka/Doris/Grafana, enable the reporting lightweight form: the log-reader `mod_log_mysql` plugin writes access logs directly to MySQL, AI Gateway API provides the `/report/*` queries and built-in aggregation JOBs, and the console renders the pages directly. The standard form (Doris + Grafana) does not require these steps; see "Deploying the Reporting Standard Form (Doris + Grafana)" below, after which you only need to set `Backend = "doris"` in `[Report]`.
 
 The deployment follows a schema-first order:
 
@@ -248,6 +251,109 @@ Notes:
 - **Partitions before data**: MySQL has no dynamic partitioning; the partition management JOB must create partitions before data arrives (writes to a missing partition fail outright). The JOB inspects every 6 hours and pre-creates partitions immediately at startup.
 - **Capacity guidance**: the MySQL form targets up to roughly one million log entries per day; beyond that, use the Doris standard form.
 - The MySQL backend does not provide P50/P90/P99 percentile latency; the corresponding cards are automatically hidden in the console.
+
+## Deploying the Reporting Standard Form (Doris + Grafana)
+
+The reporting standard form targets production environments: BFE access logs are written to Kafka by the log-reader `mod_kafka` plugin, streamed into the Doris detail table by a Doris Routine Load, and aggregated every minute into the minute table by a Doris INSERT JOB. Both the console report pages and the Grafana dashboards query the same Doris data. The one-click deployment scripts for the storage layer (Doris database/tables/Routine Load/INSERT JOB) and the presentation layer (Grafana datasource + dashboard) are provided by the `rainway-ai-gateway/ai-gateway-observability` repository. The data pipeline is:
+
+```text
+BFE (Data Plane)──access logs──▶ log-reader (mod_kafka) ──JSON──▶ Kafka ──Routine Load──▶ Doris
+                                                                                       ├─ bfe_ai_request_log  (detail table, one row per request)
+                                                                                       └─ bfe_ai_metrics_1m   (aggregation table, INSERT JOB aggregates per minute)
+                                                                                                 │
+                                                                                                 ▼
+                                                                                   Grafana (connects to Doris FE:9030 via MySQL protocol)
+```
+
+End-to-end latency is under one minute (Routine Load commits in 1–5 seconds; the INSERT JOB runs every minute), satisfying minute-level reporting and dashboard needs.
+
+### Prerequisites
+
+| Component | Version | Description |
+|---|---|---|
+| Doris | 4.0+ | FE started and query_port (default 9030) reachable |
+| Kafka | 2.8+ | Broker reachable; the `bfe_ai_log` topic created (adjust partition count and retention for your scale) |
+| Grafana | — | Installed, with its installation root directory known (containing `bin/` and `conf/provisioning/`) |
+| mysql client | any | Used to connect to the Doris FE and run deployment SQL |
+| log-reader | v1.4.0 | Deployed with BFE, with the `mod_kafka` plugin enabled |
+
+### Step 1: Deploy the Doris-Side Objects
+
+```bash
+cd ai-gateway-observability/doris
+
+# Production (database bfe_observability): edit setup.conf with the Doris FE and Kafka connection info first
+vim setup.conf
+bash setup.sh
+
+# Test environment (database bfe_observability_test; Kafka topic uses the bfe_ai_log_test "_test" suffix)
+bash setup.sh ./setup_test.conf
+```
+
+`doris/setup.sh` creates the following objects in order: the database (default `bfe_observability`), the detail table `bfe_ai_request_log`, the aggregation table `bfe_ai_metrics_1m`, the Routine Load `bfe_ai_log_load` (consumes Kafka and writes the detail table in real time), and the INSERT JOB `bfe_ai_metrics_1m_job` (aggregates the previous minute's detail rows into the minute table every minute). The database name, Kafka address, topic, and initial partition date are all parameterized in `setup.conf` / `setup_test.conf`; no SQL changes are needed.
+
+If a deployment fails and you need a clean retry, use `doris/cleanup.sh` to drop the two tables, the Routine Load, and the INSERT JOB in the target database, then rerun `setup.sh`:
+
+```bash
+bash cleanup.sh                    # clean the production database (default setup.conf)
+bash cleanup.sh ./setup_test.conf  # clean the test database
+```
+
+Note: Doris INSERT JOB names are globally unique (not scoped per database); `bfe_ai_metrics_1m_job` is shared between production and test, so cleaning the test database also removes the job of the same name. For full production/test isolation, set a distinct `JOB_NAME` in each configuration. For detailed steps and the end-to-end verification checklist, see `ai-gateway-observability/doris/docs/user/HOWTO.md`; table schema semantics are in `docs/design/TABLE_DESIGN.md` under the same directory.
+
+### Step 2: Deploy the Grafana Side
+
+```bash
+cd ai-gateway-observability/grafana
+
+# Production: edit setup.conf with GRAFANA_DIR, the Doris FE connection info, and the datasource name/UID
+vim setup.conf
+bash setup.sh
+
+# Test environment (e.g., connecting to bfe_observability_test)
+bash setup.sh ./setup_test.conf
+```
+
+Based on Grafana's provisioning (file-based configuration) mechanism, `grafana/setup.sh` performs the following in order: writes the Doris datasource (connecting to Doris FE 9030 via MySQL protocol, pointing at the target database), generates the dashboard provider configuration and imports `grafana/dashboards/bfe-ai-gateway-observability.json` (the "BFE AI Gateway Observability Dashboard"), and restarts Grafana to apply the changes. The script replaces the `${DS_DORIS}` placeholder in the dashboard with the datasource UID, and it overwrites the target configuration files on every run, so rerunning it is safe (reconfigures and restarts). If Grafana is managed by systemd, you can replace the restart step in the script with `systemctl restart grafana-server`. For detailed steps, see `ai-gateway-observability/grafana/docs/user/HOWTO.md`; panel and SQL design are in `docs/design/DASHBOARD_DESIGN.md` under the same directory.
+
+### Step 3: Configure log-reader and AI Gateway API
+
+1. **Enable the log-reader plugin**: set `Modules = mod_kafka` in the log-reader `conf/config.conf` (choose either this or `mod_log_mysql`; do not enable both forms on the same cluster), and fill in the Kafka broker address and topic (production `bfe_ai_log`, test `bfe_ai_log_test`) following the `conf/mod_kafka/mod_kafka.conf` sample.
+2. **Configure AI Gateway API**: add a report datasource pointing to the Doris FE and a `[Report]` section to `ai_gateway_api.toml`:
+
+   ```toml
+   [Databases.report_db]
+   Driver = "mysql"         # connects to the Doris FE via MySQL protocol
+   DBName = "bfe_observability"
+   Addr = "127.0.0.1:9030"
+   User = "report_read"
+   Passwd = "******"
+
+   [Report]
+   Backend = "doris"        # if absent, the report module stays unassembled and /report/* returns 404
+   Datasource = "report_db"
+   Database = ""            # schema override for table names (optional)
+   ```
+
+   For the Doris form, per-minute aggregation is performed by the Doris INSERT JOB `bfe_ai_metrics_1m_job`; options specific to the MySQL form such as `EnableAggregateJob` / `EnablePartitionMgmt` (aggregation and partition management) only take effect with `Backend = "mysql"`.
+
+### Step 4: Verify
+
+```bash
+# The Routine Load state should be RUNNING
+mysql -h127.0.0.1 -P9030 -uroot -e "SHOW ROUTINE LOAD FOR bfe_ai_log_load\G"
+
+# The INSERT JOB and the two tables
+mysql -h127.0.0.1 -P9030 -uroot -e "SHOW JOBS FROM bfe_observability;"
+mysql -h127.0.0.1 -P9030 -uroot -e "USE bfe_observability; SHOW TABLES;"
+```
+
+Then open the report pages in the console and confirm the overview cards have data, and check that all panels of the "BFE AI Gateway Observability Dashboard" render correctly in Grafana.
+
+Notes:
+
+- **One form per cluster**: do not enable `mod_kafka` (→ Doris) and `mod_log_mysql` (→ MySQL) on the same cluster — the data-gap windows of the two pipelines make the two reports inconsistent.
+- **Aggregation table design reference**: the example aggregation table `bfe_ai_metrics_1m` in the repository only demonstrates the pipeline; in production you can split it into multiple aggregation tables by query scenario and adjust the granularity to 5/15 minutes. See the notes in `doris/docs/user/HOWTO.md`.
 
 ## Configuration File Description and Minimal Runnable Configuration
 
@@ -749,6 +855,7 @@ This chapter systematically covered the installation and deployment of the Rainw
 - Container images can be built with `make docker`, and cluster deployment uses Kubernetes Deployments, Services, and DaemonSets.
 - The multi-component startup order is: database initialization → AI Gateway API → BFE → Conf Agent, ensuring the Data Plane promptly receives the latest configuration distributed by the Control Plane.
 - The BFE image ships with tzdata built in; when using a custom image, ensure the container has complete timezone data.
+- Reporting has two deployment forms: the lightweight form writes directly to MySQL via the log-reader `mod_log_mysql` plugin; the standard form (Doris + Grafana) deploys the Doris storage layer and Grafana presentation layer with one-click scripts from the ai-gateway-observability repository, and the console queries the same data via `[Report].Backend = "doris"`.
 - Common deployment issues mainly involve database connections, static asset mounting, Conf Agent communication, TLS configuration association checks, port conflicts, and Redis connection failures.
 - Before going live, complete the production deployment checklist, focusing on password security, permission configuration, and the rollback plan.
 
@@ -762,5 +869,8 @@ This chapter references the following project documentation and code:
 - `ai-gateway-api/Makefile`: build, packaging, Docker image build, and push targets.
 - `conf-agent/AGENTS.md`: Conf Agent architecture, build method, and local startup commands.
 - `conf-agent/docs/zh_cn/config/config.md`: detailed description of the Conf Agent configuration file.
+- `ai-gateway-observability/README.md`: overview and data pipeline of the observability (Doris + Grafana) repository.
+- `ai-gateway-observability/doris/docs/user/HOWTO.md`: Doris deployment and verification steps for the database, tables, Routine Load, and INSERT JOB.
+- `ai-gateway-observability/grafana/docs/user/HOWTO.md`: one-click Grafana datasource and dashboard configuration steps.
 - [BFE Installation Official Documentation](https://www.bfe-networks.net/en_us/installation/install/): guide for standalone deployment of the BFE Data Plane.
 - [ai-gateway-demo deployment example repository](https://github.com/rainway-ai-gateway/ai-gateway-demo): complete Kubernetes and Docker Compose examples.

@@ -17,32 +17,37 @@
 
 `mod_ai_rate_limit` 是 BFE 数据面负责 AI 请求限流的内置模块，位于 `bfe/bfe_modules/mod_ai_rate_limit/`。它对进入 AI 网关路径的请求执行分布式限流，支持按产品（product）、API-Key、模型等维度配置 TPM（Tokens Per Minute）、RPM（Requests Per Minute）与最大并发数三类限制。
 
-在 BFE 的模块管线中，`mod_ai_rate_limit` 注册在 `HandleFoundProduct` 回调点。实际注册顺序见 `bfe/bfe_modules/bfe_modules.go`：`mod_ai_token_auth` → `mod_ai_route` → `mod_body_process` → `mod_ai_rate_limit`。由于 `mod_body_process` 主要在 `HandleReadResponse` 阶段工作，在 `HandleFoundProduct` 阶段实际执行顺序为 `mod_ai_token_auth` → `mod_ai_route` → `mod_ai_rate_limit`。该顺序由数据依赖决定：`mod_ai_token_auth` 先完成 API-Key 鉴权并将 `ClientApiKey` 写入 `AiBasicInfo`；`mod_ai_route` 随后完成路由查找；`mod_ai_rate_limit` 依赖 `ClientApiKey` 与 `ClientModel` 查找绑定策略并执行限流。任何顺序调整都会破坏依赖链。
+在 BFE 的模块管线中，`mod_ai_rate_limit` 注册在 `HandleAfterAITargetModel` 回调点。该回调点在目标模型解析后、转发前触发，且按集群 attempt 触发（每次 `doSingleAIForward` 调用，包括 API-Key 轮换与集群 fallback）。`mod_ai_token_auth` 与 `mod_ai_rate_limit` 都在 `HandleAfterAITargetModel` 触发，注册序保证 `mod_ai_token_auth` 先于限流执行（见 `bfe/bfe_modules/bfe_modules.go` 的 `moduleList`：`mod_ai_token_auth` → `mod_ai_route` → `mod_body_process` → `mod_ai_rate_limit`），因此目标模型的白名单/黑名单校验始终先于限流。限流判定依赖的数据有两类：`mod_ai_token_auth` 在 `HandleFoundProduct` 阶段写入的 `ClientApiKey`，以及路由阶段解析出的转发后目标模型 `AiBasicInfo.TargetModel`。任何顺序调整都会破坏依赖链。
 
 模块的核心职责可概括为以下三点：
 
-1. **策略匹配**：根据请求的 `product`、`ClientApiKey`、`ClientModel` 匹配 `ai_rate_limit.data` 中的产品线规则与限流策略；
+1. **策略匹配**：根据请求的 `product`、`ClientApiKey`、转发后目标模型（`TargetModel`）匹配 `ai_rate_limit.data` 中的产品线规则与限流策略；
 2. **限流检查**：对命中的策略依次执行并发、RPM、TPM 检查，任一限制超限即拦截请求；
 3. **后置处理**：在 `HandleRequestFinish` 阶段释放并发计数，并根据实际 Token 消耗修正 TPM 预扣值。
+
+由于回调点按集群 attempt 触发，而限流检查每请求最多执行一次，`PolicyLimiterContext`（存入 `Request.Context` 的 `mod_ai_rate_limit.policy_limiter_ctx`）兼作幂等守卫：回调入口先检查该 Context 是否已存在，存在即直接放行，保证 key 轮换与 fallback 触发的重复回调不会重复计数。
 
 模块状态机如下：
 
 ```mermaid
 flowchart TD
-    A[HandleFoundProduct] --> B{AiBasicInfo 存在?}
+    A[HandleAfterAITargetModel] --> B{AiBasicInfo 存在?}
     B -->|否| C[返回 BfeHandlerGoOn]
-    B -->|是| D[runProductRules]
-    D --> E[条件匹配产品规则]
-    E --> F[获取 API-Key 绑定策略]
-    F --> G[并发检查]
-    G --> H[RPM 检查]
-    H --> I[TPM 检查]
-    I --> J{任一限制触发?}
-    J -->|是| K[执行 hit_action<br/>返回 429]
-    J -->|否| L[返回 BfeHandlerGoOn]
-    L --> M[转发至后端]
-    M --> N[HandleRequestFinish]
-    N --> O[释放并发 / TPM 修正]
+    B -->|是| D{PolicyLimiterContext 已存在?}
+    D -->|是| C
+    D -->|否| E[runProductRules]
+    E --> F[条件匹配产品规则]
+    F --> G[获取 API-Key 绑定策略]
+    G --> H[按 TargetModel 匹配策略模型]
+    H --> I[并发检查]
+    I --> J[RPM 检查]
+    J --> K[TPM 检查]
+    K --> L{任一限制触发?}
+    L -->|是| M[执行 hit_action<br/>置 ErrAiRateLimit 返回 429]
+    L -->|否| N[返回 BfeHandlerGoOn]
+    N --> O[转发至后端]
+    O --> P[HandleRequestFinish]
+    P --> Q[释放并发 / TPM 修正]
 ```
 
 ## TPM、RPM、并发限流算法
@@ -56,12 +61,12 @@ flowchart TD
 | 限制对象 | 同时处理的请求数 | 单位窗口请求次数 | 单位窗口 Token 消耗 |
 | Redis 数据结构 | `STRING`（INCR/DECR） | `ZSET`（时间戳有序集合） | `HASH`（分桶计数） |
 | 窗口类型 | 无窗口，依赖 TTL | 滑动窗口 | 滑动窗口 + 子桶峰值 |
-| 获取真实值时机 | `HandleFoundProduct` | `HandleFoundProduct` | `HandleFoundProduct` 预扣，`HandleRequestFinish` 修正 |
+| 获取真实值时机 | `HandleAfterAITargetModel` | `HandleAfterAITargetModel` | `HandleAfterAITargetModel` 预扣，`HandleRequestFinish` 修正 |
 | 失败释放 | `HandleRequestFinish` 调用 `ConnRelease` | 无需释放 | 无需释放 |
 
 ### 并发限流
 
-并发限流通过 Redis 的一个计数器实现。请求到达时调用 `ConcurrencyLimiter.ConnAcquire` 对计数器执行原子 `INCR`；请求结束时在 `HandleRequestFinish` 中调用 `ConnRelease` 执行 `DECRBY`。`ConcurrencyLimiter` 定义于 `bfe/bfe_util/limit_rate/redis_concurrency_limiter.go`：
+并发限流通过 Redis 的一个计数器实现。请求到达时（`HandleAfterAITargetModel` 阶段，按集群 attempt 触发，经 `PolicyLimiterContext` 幂等守卫保证每请求只 acquire 一次）调用 `ConcurrencyLimiter.ConnAcquire` 对计数器执行原子 `INCR`；请求结束时在 `HandleRequestFinish` 中调用 `ConnRelease` 执行 `DECRBY`。`ConcurrencyLimiter` 定义于 `bfe/bfe_util/limit_rate/redis_concurrency_limiter.go`：
 
 ```go
 func (l *ConcurrencyLimiter) ConnAcquire(agent *RedisLRAgent) (bool, int64, int64, error) {
@@ -95,7 +100,7 @@ Lua 脚本 `redis_qpm_limit_check.lua` 的关键步骤如下：
 
 ### TPM 限流
 
-TPM 限流是最复杂的场景，因为 Token 消耗在请求真正完成前无法确定。`mod_ai_rate_limit` 采用"预扣 + 修正"的两阶段方案：`HandleFoundProduct` 阶段根据请求提示 Token 数预测本次可能消耗的 Token 并预扣；`HandleRequestFinish` 阶段根据 `mod_body_process` 解析出的实际 Token 消耗与预扣值的差值，通过 `UpdateTokenUsage` 修正计数器。
+TPM 限流是最复杂的场景，因为 Token 消耗在请求真正完成前无法确定。`mod_ai_rate_limit` 采用"预扣 + 修正"的两阶段方案：`HandleAfterAITargetModel` 阶段根据请求提示 Token 数预测本次可能消耗的 Token 并预扣；`HandleRequestFinish` 阶段根据 `mod_body_process` 解析出的实际 Token 消耗与预扣值的差值，通过 `UpdateTokenUsage` 修正计数器。
 
 `TPMLimiter` 定义于 `bfe/bfe_util/limit_rate/redis_tpm_limiter.go`：
 
@@ -122,7 +127,7 @@ func (r *tpmLimiterItem) predictTokenUsage(promptToken int64) int64 {
 }
 ```
 
-其中 `ReservedX` 与 `ReservedOff` 当前固定为 0，因此预测值实际为 0。这意味着当前实现主要在请求完成后的修正阶段写入真实 Token 消耗，而 `HandleFoundProduct` 阶段的 TPM 检查不会成为主要拦截手段。预留这两个字段是为了后续支持基于提示 Token 的预测模型。
+其中 `ReservedX` 与 `ReservedOff` 当前固定为 0，因此预测值实际为 0。这意味着当前实现主要在请求完成后的修正阶段写入真实 Token 消耗，而 `HandleAfterAITargetModel` 阶段的 TPM 检查不会成为主要拦截手段。预留这两个字段是为了后续支持基于提示 Token 的预测模型。
 
 TPM 的 Redis 数据结构为 Hash，Key 为 Redis Key，Field 为每个子桶的起始时间戳，Value 为该桶内已消耗 Token 数。Lua 脚本 `redis_tpm_limit_check.lua` 同时维护整体窗口阈值与子桶峰值阈值：
 
@@ -140,7 +145,7 @@ sequenceDiagram
     participant RC as Redis
     participant BP as mod_body_process
 
-    R ->> M: HandleFoundProduct
+    R ->> M: HandleAfterAITargetModel（每请求一次，PolicyLimiterContext 守卫）
     M ->> M: predictTokenUsage = 0
     M ->> RC: CheckAndConsumeToken(0)
     RC -->> M: allowed
@@ -155,11 +160,19 @@ sequenceDiagram
 
 ## Redis 限流 Key 设计
 
-### 稳定 Key 的必要性
+### 控制面统一生成完整 Key
 
-早期 `mod_ai_rate_limit` 的 Redis Key 由策略 ID 与规则名拼接而成（`default_bfe_<policyId>_rpm_<ruleName>`）。当管理面仅修改规则名时，Redis Key 发生变化，导致历史计数器归零。为避免这一问题，当前架构由控制面生成稳定的 `redis_key` 并随配置下发。
+控制面在导出限流配置时为每条规则生成完整的 Redis Key 并随配置下发，生成逻辑见 `model/shared/rate_limit_redis_key.go`：
 
-控制面导出时基于不会随用户编辑变化的 `(policy_id, rule_index)` 生成 Key，格式为 `RL_TPM_rlp-<id>_<idx>` 与 `RL_RPM_rlp-<id>_<idx>`。BFE 侧优先使用配置中的 `redis_key` 字段；若旧配置未携带该字段，则回退到基于规则名的旧逻辑，保证向后兼容。该设计详见 `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`。
+```go
+func BuildBFERateLimitRedisKey(policyID int64, ruleType string, name string) string {
+    return fmt.Sprintf("default_bfe_rlp-%d_%s_rlp-%d_%s", policyID, ruleType, policyID, name)
+}
+```
+
+TPM / RPM 规则分别以 `RL_TPM` / `RL_RPM` 作为 `ruleType`、以规则名作为 `name`，生成的 Key 形如 `default_bfe_rlp-1_RL_TPM_rlp-1_tpm_1min`。规则名是 Key 的组成部分：重命名一条规则等价于删除旧规则并新增一条规则，新规则使用新 Key、计数器重新开始；修改 `model` 等其它字段不改变 Key，计数器不重置。
+
+BFE 侧优先使用配置中的 `redis_key` 字段；若配置未携带该字段，则回退到下述本地构建逻辑。该设计详见 `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`。
 
 ### BFE 侧的 Key 构建
 
@@ -194,11 +207,11 @@ limiter := limit_rate.NewTPMLimiter(redisKey, rule.Threshold, rule.TimeWindow, .
 
 | 场景 | 行为 |
 |------|------|
-| 新配置携带 `redis_key` | BFE 直接使用该字段构建 Redis Key |
-| 旧配置未携带 `redis_key` | 回退到基于 `name` 的旧 Key，计数器行为不变 |
-| 修改规则名（其余字段不变） | `redis_key` 不变，计数器不重置 |
+| 配置携带 `redis_key` | BFE 直接使用该字段构建 Redis Key |
+| 配置未携带 `redis_key` | 回退到基于 `name` 的旧 Key（规则未命名时基于阈值元组），计数器行为不变 |
+| 重命名规则（其余字段不变） | 规则名编码在 Key 中，等价于删除旧规则并新增规则：使用新 Key，计数器重新开始 |
 | 修改 model（其余字段不变） | `redis_key` 不变，计数器不重置 |
-| 删除/新增规则 | 后续规则下标变化，对应 Key 变化，计数器重置 |
+| 删除/新增规则 | 被删规则的 Key 由控制面清理，新增规则使用新 Key，计数器重新开始 |
 
 ## 限流触发与响应（429）
 
@@ -256,6 +269,15 @@ func (m *ModuleAiRateLimit) executePolicyAction(...) (int, *bfe_http.Response) {
 
 最终返回 HTTP 状态码 `429 Too Many Requests`，响应体中包含错误码、限流类型与 API-Key 等元信息，便于客户端识别限流原因。
 
+### 本地限流与上游 429 的区分
+
+本地限流拒绝与上游返回的 429 在转发循环中走完全不同的路径。`runProductRules` 判定限流命中时，除了构造 429 响应外还会置 `req.ErrCode = bfe_basic.ErrAiRateLimit`（`bfe_basic/error_code.go` 中定义的全局 sentinel 错误标记）。`ServeHTTPForAI()` 的转发循环在两处识别该标记：
+
+- **集群 fallback 守卫**：某次 attempt 因本地限流结束时，`ErrCode == bfe_basic.ErrAiRateLimit` 使循环直接终止尝试列表，不再降级到备用集群；
+- **Key 轮换守卫**：`aiClusterInvoke` 内的 key 级重试识别该标记后停止轮换，直接按原样返回（不标记 key 已用、不施加 session-affinity 惩罚）。
+
+上游模型服务返回的 429 则不携带该标记，仍按原有逻辑处理：将当前 key 标记为已用并轮换到同集群的其他 key，仍失败时才按 `shouldTriggerFallback()` 决定是否集群降级。这一区分保证限流拒绝来自网关自身的配额管控，而不是上游某个 key 的瞬时抖动。
+
 ### Redis 故障时的行为
 
 模块配置 `IsRejectOnRedisError` 控制 Redis 故障时是否拒绝请求。当 Redis 调用失败且该开关为 `true` 时，模块会记录 `IsRedisError` 并触发 `FINISH` 动作返回 429；为 `false` 时则放行请求，避免 Redis 故障导致服务完全不可用。
@@ -294,7 +316,7 @@ OpenDebug = false
 1. 调用 `ConfLoad` 读取 `mod_ai_rate_limit.conf`；
 2. 根据 Redis 配置创建 `redisClient` 与 `redisAgent`；
 3. 调用 `loadProductRuleTable` 加载 `ai_rate_limit.data`；
-4. 将 `limitFoundProductHandler` 注册到 `HandleFoundProduct`；
+4. 将 `targetModelCheckHandler` 注册到 `HandleAfterAITargetModel`（`mod_ai_token_auth` 的目标模型校验也在该点注册，且先于本模块，保证白名单校验先于限流）；
 5. 将 `limitRequestFinishHandler` 注册到 `HandleRequestFinish`；
 6. 注册监控与热加载 Web Handler。
 
@@ -310,7 +332,7 @@ func (m *ModuleAiRateLimit) Init(cbs *bfe_module.BfeCallbacks, whs *web_monitor.
         return err
     }
 
-    cbs.AddFilter(bfe_module.HandleFoundProduct, m.limitFoundProductHandler)
+    cbs.AddFilter(bfe_module.HandleAfterAITargetModel, m.targetModelCheckHandler)
     cbs.AddFilter(bfe_module.HandleRequestFinish, m.limitRequestFinishHandler)
     // ...
 }
@@ -392,22 +414,49 @@ Prometheus 指标定义于 `bfe/bfe_modules/mod_ai_rate_limit/prometheus_states.
 
 ## 关键代码片段
 
-### 产品线规则匹配
+### 回调入口与幂等守卫
 
-`runProductRules` 按产品获取规则列表并顺序匹配，命中后调用 `executeCheckLimitPolicy`：
+`targetModelCheckHandler` 是 `HandleAfterAITargetModel` 的入口。回调按集群 attempt 触发（key 轮换与 fallback 都会再次触发），因此先检查 `PolicyLimiterContext` 是否已存在：存在说明该请求已经过限流检查，直接放行；这就是每请求一次的幂等守卫：
 
 ```go
-func (m *ModuleAiRateLimit) runProductRules(req *bfe_basic.Request, meta *bfe_basic.AiBasicInfo) (int, *bfe_http.Response) {
+func (m *ModuleAiRateLimit) targetModelCheckHandler(req *bfe_basic.Request) (int, *bfe_http.Response) {
+    // Fired per cluster attempt (key rotation / fallback); the policy check
+    // must run at most once per request.
+    if getPolicyLimiterContext(req) != nil {
+        return bfe_module.BfeHandlerGoOn, nil
+    }
+
+    meta := req.GetAiBasicInfo()
+    if meta == nil {
+        return bfe_module.BfeHandlerGoOn, nil
+    }
+
+    // 策略按解析出的转发后目标模型（meta.TargetModel）匹配与计量
+    targetModel := meta.TargetModel
+
+    req.InitAiRateLimitHitInfo()
+    return m.runProductRules(req, meta, targetModel)
+}
+```
+
+### 产品线规则匹配
+
+`runProductRules` 按产品获取规则列表并顺序匹配，命中后调用 `executeCheckLimitPolicy`；限流命中时置 `bfe_basic.ErrAiRateLimit` 标记：
+
+```go
+func (m *ModuleAiRateLimit) runProductRules(req *bfe_basic.Request, meta *bfe_basic.AiBasicInfo, targetModel string) (int, *bfe_http.Response) {
     product := req.Route.Product
     rules := m.productTable.getProductRules(product)
     // ...
+    ctx := &PolicyLimiterContext{}
+    setPolicyLimiterContext(req, ctx)
     for _, rule := range rules {
         if !rule.cond.Match(req) {
             continue
         }
-        ret, res := m.executeCheckLimitPolicy(req, meta, rule, ctx)
+        ret, res := m.executeCheckLimitPolicy(req, meta, rule, ctx, targetModel)
         if ret != bfe_module.BfeHandlerGoOn {
-            req.ErrCode = ErrAiRateLimit
+            req.ErrCode = bfe_basic.ErrAiRateLimit
             return ret, res
         }
     }
@@ -417,16 +466,16 @@ func (m *ModuleAiRateLimit) runProductRules(req *bfe_basic.Request, meta *bfe_ba
 
 ### 策略检查顺序
 
-`executeCheckLimitPolicy` 按并发、RPM、TPM 的顺序依次检查，任一失败即执行 `hit_action`：
+`executeCheckLimitPolicy` 先按 `policy.Models` 匹配转发后目标模型（`matchModel(policy.Models, targetModel)`，不匹配的策略直接跳过），再按并发、RPM、TPM 的顺序依次检查，任一失败即执行 `hit_action`：
 
 ```go
-if !ls.checkConcurrency(req, meta, m.redisAgent, ctx, clientModel, m.isRejectOnRedisError) {
+if !ls.checkConcurrency(req, meta, m.redisAgent, ctx, targetModel, m.isRejectOnRedisError) {
     return m.executePolicyAction(req, meta, policyId, policy, rule)
 }
-if !ls.checkRPM(req, meta, m.redisAgent, ctx, clientModel, m.isRejectOnRedisError) {
+if !ls.checkRPM(req, meta, m.redisAgent, ctx, targetModel, m.isRejectOnRedisError) {
     return m.executePolicyAction(req, meta, policyId, policy, rule)
 }
-if !ls.checkTPM(req, meta, m.redisAgent, ctx, clientModel, m.isRejectOnRedisError) {
+if !ls.checkTPM(req, meta, m.redisAgent, ctx, targetModel, m.isRejectOnRedisError) {
     return m.executePolicyAction(req, meta, policyId, policy, rule)
 }
 ```
@@ -459,11 +508,12 @@ func (m *ModuleAiRateLimit) limitRequestFinishHandler(req *bfe_basic.Request, re
 
 ## 本章小结
 
-- `mod_ai_rate_limit` 是 BFE 数据面负责 AI 请求限流的模块，注册在 `HandleFoundProduct` 回调点，依赖 `mod_ai_token_auth` 设置的 `ClientApiKey` 识别限流维度。
+- `mod_ai_rate_limit` 是 BFE 数据面负责 AI 请求限流的模块，主逻辑注册在 `HandleAfterAITargetModel` 回调点（目标模型解析后、转发前，按集群 attempt 触发），TPM/RPM/最大并发按转发后目标模型（`AiBasicInfo.TargetModel`）匹配策略；`mod_ai_token_auth` 与 `mod_ai_rate_limit` 同点触发，注册序保证白名单校验先于限流。
+- 回调按集群 attempt 触发，但限流检查每请求最多一次：`PolicyLimiterContext` 兼作幂等守卫，key 轮换与 fallback 的重复回调直接放行。
 - 模块支持 TPM、RPM 与最大并发数三类限制，分别基于 Redis Hash、Redis ZSET 与 Redis String 实现，均通过 Lua 脚本保证原子性。
-- TPM 采用"预扣 + 修正"两阶段方案：`HandleFoundProduct` 阶段按预测 Token 预扣，`HandleRequestFinish` 阶段根据实际 Token 消耗修正。
+- TPM 采用"预扣 + 修正"两阶段方案：`HandleAfterAITargetModel` 阶段按预测 Token 预扣，`HandleRequestFinish` 阶段根据实际 Token 消耗修正。
 - 控制面为每条 TPM/RPM 规则生成稳定的 `redis_key`（`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`），BFE 优先使用该字段构建 Redis Key，未指定时回退到旧逻辑。
-- 限流触发后，模块根据 `hit_action` 执行 `FINISH` 或 `CLOSE`，默认返回 429 Too Many Requests，并在响应体中携带限流类型与错误码。
+- 限流触发后，模块根据 `hit_action` 执行 `FINISH` 或 `CLOSE`，默认返回 429 Too Many Requests，并在响应体中携带限流类型与错误码；本地限流置 `bfe_basic.ErrAiRateLimit` 标记，阻断 key 轮换与集群 fallback，上游 429 仍按原 key 轮换逻辑处理。
 - 配置采用 INI + JSON 双层结构，支持通过 `/reload/mod_ai_rate_limit` 热加载；热加载时会保留旧限流器的统计计数，避免监控跳变。
 - 模块暴露 `tpm_match`、`tpm_hit`、`rpm_match`、`rpm_hit`、`con_match`、`con_hit` 等 Prometheus 指标，支持按 `policy_id` 与 `inst_id` 拆分观测。
 

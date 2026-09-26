@@ -311,15 +311,19 @@ Failed operations are also recorded: `status=2`, and `error_msg` is truncated to
 `change_summary` (a `mediumtext` column storing JSON) records before/after snapshots of the key fields involved in a change, constructed by `BuildChangeSummary` in `model/ioperlog/change_summary.go`:
 
 - `before` / `after`: field maps before and after the change, both passed through `MaskSensitiveFields` first;
-- `diff_keys`: present only on update actions. It lists the keys that are **newly added in after or whose values changed relative to before** (keys that exist only in before are excluded, so partial update requests do not produce false-positive diffs), stored in sorted order.
+- `diff_keys`: present only on update actions. It lists the keys that are **newly added in after or whose values changed relative to before** (keys that exist only in before are excluded, so partial update requests do not produce false-positive diffs; unsubmitted fields, i.e. nil-valued keys, are dropped by `ParamToMap` during snapshot construction), stored in sorted order.
+
+The audit snapshot of the cluster resource is an exception: instead of the default `ParamToMap` mapping, it is hand-written in the API lower-case vocabulary consistent with `GET /clusters` (e.g. `hash_strategy` as a string enum, `epp_config` as a decoded JSON object, `balance_mode` normalized to `WRR` when empty), with internal fields not exposed by the API — `id` / `ready` / `product_id` / `scheduler` / `sub_clusters` — trimmed, keeping `change_summary` consistent with API semantics.
 
 Masking rules (`model/ioperlog/mask.go`) match lower-cased key names and recurse into nested maps:
 
 | Key name | Masked result |
 |------|----------|
-| `password` / `secret` / `session_key` / `private_key` (and their variants without underscores) | `******` |
+| `password` / `secret` / `session_key` / `private_key` / `token` / `access_token` / `refresh_token` / `session_token` / `id_token` / `secret_key` / `client_secret` / `access_key` (and their variants without underscores) | `******` |
 | `api_key` / `apikey` / `key` | First and last 4 characters kept, the middle replaced with `****`; fully masked when the length is 8 or less |
 | `certificate` / `cert` / `cert_body` / `private_key_body` | `[已更新]` |
+
+`error_msg` is masked at the source when the audit entry is constructed: sensitive plaintext values such as API-Keys are replaced throughout the message, with any Key plaintext rendered in the masked form that keeps the first and last 4 characters (`ioperlog.MaskErrorMessage`, invoked from `model/api_key/api_key_operation_log.go`), so error echoes never leak credentials.
 
 ### Coverage
 
@@ -337,7 +341,7 @@ The resources and actions that actually produce operation logs are as follows:
 | auth/users (including session reset) | create / update / delete / reset |
 | auth/tokens | create / delete |
 
-Domains and rate_limit_policy currently do not produce operation logs.
+quota_plan and rate_limit_policy have no standalone OpenAPI resources, but they do produce audit logs through the nested create / update / delete of Entity / API-Key: `resource_type` is `quota_plan` / `rate_limit_policy` respectively, and `resource_parent_id` records the owning Entity or API-Key. Domains currently do not produce operation logs.
 
 ### Query Interface
 

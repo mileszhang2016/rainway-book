@@ -15,7 +15,7 @@ After Provider and Cluster are separated, their responsibilities become clearer:
 
 This separation brings many benefits: when the same Provider is referenced by multiple Clusters, the instance pool and keys only need to be maintained in one place, avoiding duplicate configuration; the Cluster no longer stores API Key plaintext and only references Keys in the Provider by name, improving security; the Provider can be created, updated, and deleted independently, while Clusters obtain backend capability by reference, making their lifecycles more independent; when a new protocol is added, only the Provider's model_protocols needs to be extended, without causing the Cluster model list to continuously grow.
 
-The core fields of a Provider include: a globally unique `name`, an optional `description`, the model discovery endpoint `model_endpoint`, the supported model list `models`, the API Key list `keys`, the backend instance pool `instance_pool`, the supported protocols `model_protocols`, the optional protocol path mapping `protocol_paths`, the time zone `time_zone`, and the time-of-day templates `tiers`. Among them, `instance_pool` is required and must contain at least one instance with weight greater than 0, and `model_protocols` is required and must contain at least one protocol.
+The core fields of a Provider include: a globally unique `name`, an optional `description`, the model discovery endpoint `model_endpoint`, the supported model list `models`, the API Key list `keys`, the backend instance pool `instance_pool`, the supported protocols `model_protocols`, the optional protocol path mapping `protocol_paths`, the time zone `time_zone`, and the time-of-day templates `tiers`. Among them, `models` is required and must contain at least one element; `instance_pool` is required and must contain at least one instance with weight greater than 0; and `model_protocols` is required and must contain at least one protocol.
 
 The default value of `time_zone` is `Asia/Shanghai`, used to determine which tier the current time belongs to. In the initial phase, `tiers` only supports `name=peak`, and each tier contains several `time_ranges` with a left-closed, right-open semantics. The time zone and tiers can be maintained separately via `PUT /v1/providers/{provider_name}/pricing-tiers`, without being passed when the Provider is created.
 
@@ -126,7 +126,7 @@ A Provider can support multiple protocols at the same time; for example, an aggr
 
 ## Protocol Path Configuration (protocol_paths)
 
-Different providers use different upstream path prefixes, and different protocols of the same provider often live under different prefixes: Bailian DashScope exposes OpenAI compatibility at `/compatible-mode/v1` and Anthropic compatibility at `/apps/anthropic`; Volcano Ark pay-as-you-go uses `/api/v3` and `/api/compatible`; Kimi Code membership (api.kimi.com) uses `/coding/v1` and `/coding`. Without `protocol_paths`, BFE forwards the upstream path unchanged and clients must send requests using the provider's native paths; with it, clients can uniformly access all providers through the standard entry `/v1/...`, and BFE rewrites the path during forwarding.
+Different providers use different upstream path prefixes, and different protocols of the same provider often live under different prefixes: Bailian DashScope exposes OpenAI compatibility at `/compatible-mode/v1` and Anthropic compatibility at `/apps/anthropic`; Volcano Ark pay-as-you-go uses `/api/v3` and `/api/compatible`; Kimi Code membership (api.kimi.com) uses `/coding/v1` and `/coding`. Without `protocol_paths`, BFE forwards the upstream path unchanged and clients must send requests using the provider's native paths; with it, clients can uniformly access all providers through OpenAI endpoint paths (for the openai protocol, with or without the `/v1` prefix; for the anthropic protocol, through the standard entry `/v1/...`), and BFE rewrites the path during forwarding.
 
 `protocol_paths` is a mapping of "protocol -> upstream base path", whose value is the path part of the protocol's official SDK `base_url`: `openai` includes the `/v1` tail (e.g., `/compatible-mode/v1`), while `anthropic` does not (e.g., `/apps/anthropic`, since the Anthropic SDK appends `/v1/messages` itself). When configuring, you can copy the base_url column directly from the provider's official documentation. Reference values for common providers:
 
@@ -146,7 +146,10 @@ Configuration constraints:
 - Omitting the field means it is disabled and request paths are forwarded unchanged.
 - PATCH updates follow the partial-update convention: omitting the field keeps the current value; explicitly passing `null` clears it (restoring pass-through).
 
-Forwarding behavior: only the standard entry is rewritten (an anthropic request `/v1/messages` -> `{anthropic value}/v1/messages`; an openai request `/v1/chat/completions` -> `{openai value}/chat/completions`). When the protocol has no configured entry, or the request was sent using the provider's native path (a non-standard entry), the path is forwarded unchanged, remaining compatible with existing clients.
+Forwarding behavior (see `rewriteUpstreamPath` in `bfe/bfe_server/ai_path_rewrite.go`):
+
+- openai protocol: client entries with or without the `/v1` prefix can both be rewritten. An optional `/v1` prefix is stripped first, and the path is rewritten only when it hits the `bfe_basic` shared endpoint table (`openAIEndpointModes` in `bfe/bfe_basic/openai_endpoint.go`, 13 endpoints): both `/v1/chat/completions` and `/chat/completions` are rewritten to `{openai value}/chat/completions`, and `/v1` or `/v1/` is rewritten to the `{openai value}` itself. Custom paths that miss the endpoint table are forwarded unchanged, remaining compatible with existing clients.
+- anthropic protocol: only the standard entry `/v1/...` is rewritten (`/v1/messages` -> `{anthropic value}/v1/messages`); non-standard entries are forwarded unchanged. When no path is configured for the protocol, no rewrite occurs.
 
 Caveats:
 
@@ -226,12 +229,14 @@ Two more billing modes (modes) are supported:
 
 | mode | Billing Method |
 |------|---------------|
-| `responses` | Billed like chat, i.e., token billing with `input_cost_per_token` / `output_cost_per_token` and related fields (the `/v1/responses` path is recognized as this mode) |
+| `responses` | Billed like chat, i.e., token billing with `input_cost_per_token` / `output_cost_per_token` and related fields (the `/v1/responses` endpoint and provider-native path forms of `/responses` are recognized as this mode) |
 | `video_generation` | Cost = `VideoCount × output_cost_per_video` (the `/v1/video/generations` path is recognized as this mode) |
 
 For `video_generation` mode, BFE pre-reads the `n` field of the request body as a fallback for the generation count during the authentication phase: if the field is missing or invalid, it is billed as 1 to avoid under-billing; `video_count` in the response `usage` takes precedence as the final count. Correspondingly, usage statistics include the `image_input_tokens` and `video_count` fields, which map to the access log fields `ai_image_input_tokens` (786) and `ai_video_count` (787) respectively (bfe-access-pb v0.3.5).
 
-Implementation references: `ModelPrice` and the price field constants in `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`, `DetectModeFromPath` in `bfe/bfe_basic/request_ai_basic.go`, and `calcVideoGenerationCost` / `calcResponsesCost` in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`. See `bfe/docs/zh_cn/sys_design/rmb_quota.md` for the complete billing semantics.
+Implementation references: `ModelPrice` and the price field constants in `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`, `DetectModeFromPath` in `bfe/bfe_basic/request_ai_basic.go`, `openAIEndpointModes` in `bfe/bfe_basic/openai_endpoint.go` (the shared OpenAI endpoint table, 13 endpoints), and `calcVideoGenerationCost` / `calcResponsesCost` in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`. See `bfe/docs/zh_cn/sys_design/rmb_quota.md` for the complete billing semantics.
+
+Mode detection and the upstream path rewrite share the same endpoint table, so the two can never disagree on what an OpenAI endpoint is: `DetectModeFromPath` first strips the optional `/v1` prefix (the recognition result is the same whether or not the standard entry carries `/v1`), and reduces a provider-native prefix ending in a `/v1` segment (the OpenAI SDK base_url form, e.g. Bailian's `/compatible-mode/v1/responses`) to the same endpoint before the lookup. Requests sent via the provider's native path are therefore recognized with the correct mode and billed correctly; paths that miss the endpoint table fall back to the default chat mode.
 
 ## The Relationship Between Provider and Cluster
 
@@ -292,7 +297,7 @@ Check whether a `(provider, model, mode)` record exists in `/model-prices`; whet
 
 ### 7. protocol_paths is configured but requests are not rewritten (upstream 404)
 
-Confirm that the request uses the standard entry `/v1/...` (non-standard entries are never rewritten and are forwarded unchanged); that the request protocol is declared in `model_protocols` and has a corresponding `protocol_paths` entry; and that the BFE version supports `AIConf.ProtocolPaths` (a key whitelist is validated at load time, and invalid configurations are rejected with the offending cluster identified). If a fallback occurred, pass-through after switching to a backup cluster without `protocol_paths` is expected behavior.
+First confirm that the request path hits the shared OpenAI endpoint table: for the openai protocol, entries with or without the `/v1` prefix can both be rewritten, but a custom path that misses the endpoint table (`bfe_basic/openai_endpoint.go`) after the optional `/v1` prefix is stripped will be forwarded unchanged, which is expected. For the anthropic protocol, only the standard entry `/v1/...` is rewritten; non-standard entries pass through. Then confirm that the request protocol is declared in `model_protocols` and has a corresponding `protocol_paths` entry; that the BFE version supports `AIConf.ProtocolPaths` (a key whitelist is validated at load time, and invalid configurations are rejected with the offending cluster identified); and, if a fallback occurred, that pass-through after switching to a backup cluster without `protocol_paths` is expected behavior.
 
 ## Configuration Examples
 

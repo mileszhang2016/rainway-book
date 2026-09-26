@@ -235,6 +235,7 @@ CREATE TABLE entity_types (
 CREATE TABLE entities (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
+    description VARCHAR(255) NOT NULL DEFAULT '',
     type VARCHAR(64) NOT NULL,
     parent_id VARCHAR(64) DEFAULT NULL,
     allow_models TEXT COMMENT 'JSON 数组',
@@ -246,6 +247,8 @@ CREATE TABLE entities (
     update_time BIGINT NOT NULL
 );
 ```
+
+`description` 为可选描述字段：0-255 字符，不允许包含控制字符。存量部署可通过 `ALTER TABLE entities ADD COLUMN description VARCHAR(255) NOT NULL DEFAULT ''` 补列。该字段在控制台列表中支持搜索与排序，便于按业务含义筛选组织节点。
 
 ### `api_keys` 表
 

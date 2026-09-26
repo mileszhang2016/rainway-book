@@ -204,7 +204,7 @@ models:
 
 ### Provider 时段模板
 
-`/providers` 新增 `time_zone` 与 `tiers` 字段，用于描述共享的时段规则：
+`/providers` 提供 `time_zone` 与 `tiers` 字段，用于描述共享的时段规则：
 
 ```json
 {
@@ -384,14 +384,20 @@ PromptTokens = input_tokens + cache_read_input_tokens + cache_creation_input_tok
 
 使下游的"总输入减缓存"拆分逻辑对 OpenAI 与 Anthropic 完全一致。流式响应中，`message_start` 事件的 usage 嵌套在 `message.usage` 下，解析层同时兼容该形态；`message_delta` 事件只携带最终 output tokens，计费模块保留 `message_start` 阶段已解析的 prompt/cache 字段，避免缓存 Token 丢失或重复计价。缓存创建 Token 只按 `cache_creation_input_token_cost` 计价一次，避免高缓存命中场景下 fresh tokens 被截断为 0 而完全不计费。
 
+Responses API 的 usage 是子集（subset）语义，不做上述 additive 归一化：`input_tokens` 已包含 `input_tokens_details.cached_tokens`（`total_tokens = input_tokens + output_tokens`，与 Chat Completions 主链一致），因此 `ParseOpenAIUsageFields` 对 Responses 链直接取 `input_tokens` 作为 `PromptTokens`。流式 `response.completed` 事件的 usage 嵌套在 `response.usage` 下，非流式 create-response 对象的 usage 位于顶层、字段名为 `input_tokens`/`output_tokens`，两种形态都在 Responses 专用链中解析。
+
+#### 请求模式识别
+
+请求模式由 `bfe_basic.DetectModeFromPath` 根据请求路径判定（实现位于 `bfe_basic/request_ai_basic.go`，端点表由 `bfe_basic/openai_endpoint.go` 的 `openAIEndpointModes` 提供）：先剥离可选的 `/v1` 版本前缀，再查共享 OpenAI 端点表得到模式——`/chat/completions` 与 `/embeddings`、`/images/generations`、`/responses`、`/video/generations` 等主要端点各有专属模式；`/models`、`/moderations`、`/audio/translations` 等无专属模式的端点归入默认 `ModeChat`；未命中端点表的未知路径同样按 `ModeChat` 处理。前缀以 `/v1` 段结尾的 provider 原生入口（OpenAI SDK `base_url` 形式，如 `/compatible-mode/v1/responses`）也会归约到端点表，识别为 Responses 模式而不是误归为 Chat。该端点表与上游路径改写（`bfe_server/ai_path_rewrite.go`）共用同一份定义，改写资格与计费模式不会相互矛盾。
+
 #### 其他请求模式
 
 另外两个请求模式的计费逻辑如下：
 
-| 模式 | 路径前缀 | 计费公式 |
-|------|----------|----------|
-| `responses` | `/v1/responses` | 复用 chat 计费（`calcResponsesCost` 直接委托 `calcChatCost`） |
-| `video_generation` | `/v1/video/generations` | `VideoCount × output_cost_per_video` |
+| 模式 | 路径 | 计费公式 |
+|------|------|----------|
+| `responses` | `/responses`（含 `/v1/responses`、`/compatible-mode/v1/responses` 等入口） | 复用 chat 计费（`calcResponsesCost` 直接委托 `calcChatCost`） |
+| `video_generation` | `/video/generations`（含 `/v1/video/generations`） | `VideoCount × output_cost_per_video` |
 
 `VideoCount` 优先取响应 `usage.video_count`，回退响应 `data.#`（生成结果条数）；认证阶段还会预读请求体 `n` 字段作为兜底（`n ≤ 0` 时取 1），防止响应未返回用量时少收。图片生成模式（`image_generation`）的费用为 `ImageCount × output_cost_per_image + ImageInputTokens × input_cost_per_image_token`，其中 `ImageInputTokens` 来源为 `usage.input_token_details.image_tokens`，回退 `usage.image_input_tokens`。
 
@@ -404,9 +410,9 @@ PromptTokens = input_tokens + cache_read_input_tokens + cache_creation_input_tok
 - `/providers` 不填 `time_zone` / `tiers` 时，`ModelTable.TimeZone` / `ModelTable.Tiers` 为空，行为与固定价格完全一致；
 - `/model-prices` 不填 `tier_prices` 时，始终按默认 `Prices` 计费；
 - 命中 tier 但该 tier 未配置某个价格键时，自动 fallback 到默认 `Prices`；
-- chat 计费中未配置任何 cache / audio / image 细化价格键时，回退 legacy 公式，存量固定价格配置无需修改；
-- 未配置 `input_cost_per_image_token` / audio 价格时，图片/音频输入 Token 按普通输入 Token 计价，语义与旧版本一致；
-- `TokenUsage.UsedCost`、Lua 扣减逻辑、Redis 定点数存储都不需要修改。
+- chat 计费中未配置任何 cache / audio / image 细化价格键时，回退 legacy 公式 `PromptTokens × input_cost_per_token + CompletionTokens × output_cost_per_token`；
+- 未配置 `input_cost_per_image_token` / audio 价格时，图片/音频输入 Token 按普通输入 Token 计价；
+- `TokenUsage.UsedCost` 的语义、Lua 扣减逻辑与 Redis 定点数存储不受分时段配置影响。
 
 这种兼容方式使得现有部署可以平滑启用分时段能力，无需一次性全量调整配置。
 
@@ -549,7 +555,7 @@ models:
 - RMB 配额分时段定价通过 Provider 时段模板与 Model tier 价格配合实现，BFE 按请求发生时刻匹配 `peak` 等 tier，未命中时 fallback 到默认价格。
 - BFE 数据面加载后价格保持 `float64`（负值加载报错），运行时根据 Token 用量和活跃 tier 逐项 `quota.CalcCostUnits` 换算为 1e-8 元定点整数再累加，Redis 扣减与存量配置的金额语义保持不变。
 - chat 计费以总输入 Token 为起点拆分缓存读写、图片输入、音频输入等维度；所有细化价格键均未配置时回退 legacy 公式。
-- Anthropic 用量在协议适配层归一化为总输入语义（`input_tokens + cache_read + cache_creation`），与 OpenAI 的 `prompt_tokens` 对齐；支持 `responses`（复用 chat 计费）与 `video_generation`（按 `output_cost_per_video` × 视频数）两种计费模式。
+- Anthropic 用量在协议适配层归一化为总输入语义（`input_tokens + cache_read + cache_creation`），与 OpenAI 的 `prompt_tokens` 对齐；Responses API 的 `input_tokens` 是包含 `cached_tokens` 的子集语义，直接取作 `PromptTokens`（不做 additive 累加）；支持 `responses`（复用 chat 计费）与 `video_generation`（按 `output_cost_per_video` × 视频数）两种计费模式。
 - Provider 与 Cluster 概念分离后，`model-prices.provider` 仅作为价格归集标识，与 `/providers` 为弱引用关系，配置更灵活；`AIConf.ModelTable` 由控制面在导出时按 provider 拼接生成。
 
 ---

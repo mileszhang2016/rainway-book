@@ -204,7 +204,7 @@ When multiple clusters reference the same provider, each receives an identical c
 
 ### Provider Time Template
 
-`/providers` adds the `time_zone` and `tiers` fields to describe shared time rules:
+`/providers` carries the `time_zone` and `tiers` fields to describe shared time rules:
 
 ```json
 {
@@ -384,14 +384,20 @@ PromptTokens = input_tokens + cache_read_input_tokens + cache_creation_input_tok
 
 This makes the downstream "total input minus cache" splitting logic identical for OpenAI and Anthropic. In streaming responses, the usage of the `message_start` event is nested under `message.usage`, which the parsing layer also accepts; the `message_delta` event carries only the final output tokens, and the billing module retains the prompt/cache fields parsed at the `message_start` stage, avoiding cache Token loss or double counting. Cache-creation Tokens are billed exactly once at `cache_creation_input_token_cost`, preventing fresh tokens from being truncated to 0 and never billed in high cache-hit scenarios.
 
+Responses API usage follows subset semantics and skips the additive normalization above: `input_tokens` already includes `input_tokens_details.cached_tokens` (`total_tokens = input_tokens + output_tokens`, consistent with the Chat Completions main chain), so `ParseOpenAIUsageFields` takes `input_tokens` directly as `PromptTokens`. In streaming, the usage of the `response.completed` event is nested under `response.usage`; in non-streaming, the create-response object keeps usage at the top level with fields named `input_tokens`/`output_tokens`. Both shapes are parsed by the Responses-specific chain.
+
+#### Request Mode Detection
+
+The request mode is determined from the request path by `bfe_basic.DetectModeFromPath` (implemented in `bfe_basic/request_ai_basic.go`; the endpoint table is `openAIEndpointModes` in `bfe_basic/openai_endpoint.go`): an optional `/v1` version prefix is stripped first, and the stripped path is looked up in the shared OpenAI endpoint table to obtain the mode — the main endpoints such as `/chat/completions`, `/embeddings`, `/images/generations`, `/responses`, and `/video/generations` each have a dedicated mode; endpoints without a dedicated mode (`/models`, `/moderations`, `/audio/translations`) fall into the default `ModeChat`, as do unknown paths that miss the endpoint table. Provider-native entries whose prefix ends in a `/v1` segment (the OpenAI SDK `base_url` form, e.g. `/compatible-mode/v1/responses`) are also reduced to the endpoint table and recognized as the Responses mode rather than being misclassified as Chat. This endpoint table is shared with the upstream path rewrite (`bfe_server/ai_path_rewrite.go`), so rewrite eligibility and billing mode can never disagree on what an OpenAI endpoint is.
+
 #### Other Request Modes
 
 Billing is also defined for two more request modes:
 
-| Mode | Path prefix | Billing formula |
-|------|-------------|-----------------|
-| `responses` | `/v1/responses` | Reuses chat billing (`calcResponsesCost` delegates directly to `calcChatCost`) |
-| `video_generation` | `/v1/video/generations` | `VideoCount × output_cost_per_video` |
+| Mode | Path | Billing formula |
+|------|------|-----------------|
+| `responses` | `/responses` (including entries such as `/v1/responses` and `/compatible-mode/v1/responses`) | Reuses chat billing (`calcResponsesCost` delegates directly to `calcChatCost`) |
+| `video_generation` | `/video/generations` (including `/v1/video/generations`) | `VideoCount × output_cost_per_video` |
 
 `VideoCount` is taken from `usage.video_count` in the response, falling back to `data.#` (number of generated results); the authentication stage also pre-reads the `n` field of the request body as a fallback (taking 1 when `n <= 0`) to prevent under-billing when the response carries no usage. For image generation mode (`image_generation`), the cost is `ImageCount × output_cost_per_image + ImageInputTokens × input_cost_per_image_token`, where `ImageInputTokens` comes from `usage.input_token_details.image_tokens`, falling back to `usage.image_input_tokens`.
 
@@ -404,9 +410,9 @@ The tiered pricing design maintains backward compatibility with fixed pricing:
 - When `time_zone` / `tiers` are not set on `/providers`, `ModelTable.TimeZone` / `ModelTable.Tiers` are empty, and behavior is identical to fixed pricing;
 - When `tier_prices` is not set on `/model-prices`, billing always uses the default `Prices`;
 - When a tier is matched but a price key is not configured for that tier, it automatically falls back to the default `Prices`;
-- In chat billing, when none of the cache / audio / image refinement price keys is configured, it falls back to the legacy formula, so existing fixed-price configurations require no changes;
-- When `input_cost_per_image_token` / audio prices are not configured, image/audio input Tokens are billed as regular input Tokens, consistent with the old version;
-- `TokenUsage.UsedCost`, the Lua deduction logic, and Redis fixed-point number storage require no changes.
+- In chat billing, when none of the cache / audio / image refinement price keys is configured, it falls back to the legacy formula `PromptTokens × input_cost_per_token + CompletionTokens × output_cost_per_token`;
+- When `input_cost_per_image_token` / audio prices are not configured, image/audio input Tokens are billed as regular input Tokens;
+- The semantics of `TokenUsage.UsedCost`, the Lua deduction logic, and Redis fixed-point number storage are unaffected by tiered configuration.
 
 This compatibility allows existing deployments to enable tiered pricing smoothly, without a one-time full configuration adjustment.
 
@@ -549,7 +555,7 @@ After the above configuration is exported to BFE, calls to `deepseek-v3` between
 - RMB quota tiered pricing is implemented by combining the Provider time template with Model tier prices; BFE matches tiers such as `peak` based on when the request occurs and falls back to default prices when no tier matches.
 - The BFE Data Plane keeps prices as `float64` after loading (negative values fail loading); at runtime, based on Token usage and the active tier, each line item is converted via `quota.CalcCostUnits` into a 1e-8-RMB fixed-point integer and accumulated, while Redis deduction and the monetary semantics of existing configurations remain unchanged.
 - Chat billing starts from the total input Tokens and splits out cache read/write, image input, audio input, and other dimensions; when no refinement price keys are configured, it falls back to the legacy formula.
-- Anthropic usage is normalized at the protocol adapter layer to total-input semantics (`input_tokens + cache_read + cache_creation`), aligning with OpenAI's `prompt_tokens`; two billing modes are supported: `responses` (reusing chat billing) and `video_generation` (billed as `output_cost_per_video` × video count).
+- Anthropic usage is normalized at the protocol adapter layer to total-input semantics (`input_tokens + cache_read + cache_creation`), aligning with OpenAI's `prompt_tokens`; Responses API `input_tokens` follows subset semantics that already include `cached_tokens` and are taken directly as `PromptTokens` without additive normalization; two billing modes are supported: `responses` (reusing chat billing) and `video_generation` (billed as `output_cost_per_video` × video count).
 - After the Provider and Cluster concepts were separated, `model-prices.provider` serves only as a price grouping identifier and has a weak reference relationship with `/providers`, making configuration more flexible; `AIConf.ModelTable` is assembled by the Control Plane by provider at export time.
 
 ---

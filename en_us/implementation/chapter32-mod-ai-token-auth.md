@@ -18,10 +18,11 @@ Through this chapter, readers will understand the complete implementation of the
 
 The module's core responsibilities include:
 
-1. **API-Key extraction and validation**: extract the Key from the request's `Authorization: Bearer <api-key>` header, and check its existence, enabled state, expiration time, model allowlist/blocklist, source IP subnets, etc. When validation fails, a structured error response is constructed and returned to the client immediately, preventing invalid requests from reaching the backend.
+1. **API-Key extraction and validation**: extract the Key from the request's `Authorization: Bearer <api-key>` header, and check its existence, enabled state, expiration time, source IP subnets, etc. When validation fails, a structured error response is constructed and returned to the client immediately, preventing invalid requests from reaching the backend.
 2. **Quota balance pre-check**: before a request enters the backend, query the remaining quota of each `QuotaPlan` in Redis, and reject the request when the balance is insufficient or the plan has expired. This step runs only after the request is successfully authenticated; requests that do not hit an authentication rule do not trigger a quota check.
-3. **Deduction at request end**: after the response completes, deduct the `total_token` quota based on the `usage` field in the response body or the Token count estimated from content length; for the `RMB` quota, first convert the cost at the model unit price, then deduct. Requests aborted by the client without a final usage are not billed, `/count_tokens`-style endpoints skip billing, and the `deducted` flag makes deduction idempotent. Deduction failures are caught and recorded as Warn logs, and do not affect the response delivery.
-4. **Structured error information**: record the rejection reason and the hit quota plan in `AiBasicInfo.AiAuthInfo`, facilitating access-log and monitoring analysis. These fields are also output by access-log modules such as `mod_access`, providing complete context for troubleshooting.
+3. **Target model validation**: if the Token configures `Models` or `BlockModels`, the allowlist/blocklist is checked against the final target model at the forwarding stage (see "Target Model Validation (Forwarding Stage)" below); a mismatch returns 400 `CodeModelNotAllowed`.
+4. **Deduction at request end**: after the response completes, deduct the `total_token` quota based on the `usage` field in the response body or the Token count estimated from content length; for the `RMB` quota, first convert the cost at the model unit price, then deduct. Requests aborted by the client without a final usage are not billed, `/count_tokens`-style endpoints skip billing, and the `deducted` flag makes deduction idempotent. Deduction failures are caught and recorded as Warn logs, and do not affect the response delivery.
+5. **Structured error information**: record the rejection reason and the hit quota plan in `AiBasicInfo.AiAuthInfo`, facilitating access-log and monitoring analysis. These fields are also output by access-log modules such as `mod_access`, providing complete context for troubleshooting.
 
 ## Position of the Module in the BFE Module Chain
 
@@ -53,23 +54,28 @@ The reason `mod_ai_token_auth` is placed before `mod_ai_route` is that the routi
 
 `HandleRequestFinish` is the last callback point in the BFE request lifecycle, at which point all response data (including streaming accumulated Token usage and RMB cost) is ready, so placing quota deduction here ensures it happens exactly once with an accurate amount. If deduction were moved earlier to `HandleReadResponse`, the streaming response would not have ended yet, leading to under-deduction or duplicate deduction.
 
-`mod_ai_token_auth` registers three callbacks during initialization:
+`mod_ai_token_auth` registers four callbacks during initialization:
 
 - `HandleFoundProduct`: `tokenFoundProductHandler`, completes API-Key validation and the quota pre-check;
+- `HandleAfterAITargetModel`: `targetModelCheckFilter`, performs the model allowlist/blocklist check against the final target model after it is resolved and before forwarding, fired per cluster attempt;
 - `HandleReadResponse`: `tokenReadResponseHandler`, parses Token usage from the response body in non-streaming scenarios;
 - `HandleRequestFinish`: `tokenRequestFinishHandler`, performs the final quota deduction after all response processing completes.
+
+At `HandleAfterAITargetModel`, `mod_ai_token_auth` is registered before `mod_ai_rate_limit`, so the model allowlist check always precedes rate limiting.
 
 ```mermaid
 flowchart LR
     A[Request enters] --> B[mod_unified_waf]
     B --> C[mod_ai_token_auth<br/>HandleFoundProduct]
     C --> D[mod_ai_route]
-    D --> E[Backend model service]
-    E --> F[mod_body_process<br/>HandleReadResponse]
-    F --> G[mod_ai_token_auth<br/>HandleReadResponse]
-    G --> H[mod_ai_rate_limit]
-    H --> I[mod_ai_token_auth<br/>HandleRequestFinish]
-    I --> J[Return to client]
+    D --> E[Target model resolution<br/>doSingleAIForward]
+    E --> F[mod_ai_token_auth<br/>HandleAfterAITargetModel<br/>target model check]
+    F --> G[mod_ai_rate_limit<br/>HandleAfterAITargetModel]
+    G --> H[Backend model service]
+    H --> I[mod_body_process<br/>HandleReadResponse]
+    I --> J[mod_ai_token_auth<br/>HandleReadResponse]
+    J --> K[mod_ai_token_auth<br/>HandleRequestFinish]
+    K --> L[Return to client]
 ```
 
 ## API-Key Validation Flow
@@ -120,8 +126,9 @@ The actual validation logic is in `ValidateUserTokenByReq` in `bfe/bfe_modules/m
 2. **Look up the Token**: search by `product + key` in the rule table `TokenRuleTable`; if not found, return `CodeInvalidApiKey`. Before a validation failure occurs, the module writes `KeyId` into `AiBasicInfo` as early as possible, so that even if the request is later rejected, the access log can be correlated to the specific Key.
 3. **State validation**: check `Enabled` and `ExpiredTime`; a disabled or expired Key returns `CodeKeyDisabled` or `CodeKeyExpired` respectively.
 4. **Quota pre-check**: iterate over `token.QuotaPlans`, skipping `Unlimited` and `PassNoQuota` plans; for finite plans, call `plan.HasBalance` to query Redis — insufficient balance returns `CodeQuotaExhausted`, and an expired plan returns `CodeQuotaExpired`. Multiple quota plans are checked in sequence, and the request is allowed only if all of them pass.
-5. **Model permission validation**: if the Token configures `Models` or `BlockModels`, read the `model` field of the request body and match it against the allowlist/blocklist; a mismatch returns `CodeModelNotAllowed`. When configured as `*`, all models are allowed.
-6. **IP subnet validation**: if `Subnet` is configured, check whether `ClientAddr` or `RemoteAddr` is within the allowed subnets; if not, return `CodeSubnetNotAllowed`. Subnets support CIDR notation, and multiple can be configured.
+5. **IP subnet validation**: if `Subnet` is configured, check whether `ClientAddr` or `RemoteAddr` is within the allowed subnets; if not, return `CodeSubnetNotAllowed`. Subnets support CIDR notation, and multiple can be configured.
+
+The model allowlist/blocklist is not part of the authentication-stage list above; it is checked against the final target model at the forwarding stage, detailed in the next section.
 
 ```mermaid
 flowchart TD
@@ -136,9 +143,9 @@ flowchart TD
     H -->|Yes| J[Iterate QuotaPlans and query Redis]
     J --> K{Sufficient balance?}
     K -->|No| L[Return 429 CodeQuotaExhausted]
-    K -->|Yes| M[Model/subnet validation]
+    K -->|Yes| M[Subnet validation]
     M --> N{Passed?}
-    N -->|No| O[Return 403/400]
+    N -->|No| O[Return 403 CodeSubnetNotAllowed]
     N -->|Yes| P[Set TokenAuthContext]
 ```
 
@@ -152,6 +159,37 @@ if aiBasicInfo.Mode == bfe_basic.ModeVideoGeneration {
     tusage.VideoCount = GetVideoCountFromReq(req)
 }
 ```
+
+## Target Model Validation (Forwarding Stage)
+
+The Token's `Models` (allowlist) and `BlockModels` (blocklist) are validated at the forwarding stage, not by reading the `model` field of the request body during authentication. The entry point is `targetModelCheckFilter`, registered by `mod_ai_token_auth` at the `HandleAfterAITargetModel` callback point (`bfe/bfe_modules/mod_ai_token_auth/model_check.go`): every cluster attempt in `ServeHTTPForAI()` fires this callback inside `doSingleAIForward`, before `clusterInvoke` is invoked. By that time `AiBasicInfo.TargetModel` has already been resolved by `computeTargetModel` — applying, in order, the route target/fallback target model override, the cluster's `StripPrefix`/`MatchPrefix` prefix stripping, and the cluster's `ModelMapping` — so the object being validated is exactly the final model name sent upstream. The logic of `ValidateTargetModel`:
+
+```go
+func (m *ModuleAITokenAuth) ValidateTargetModel(req *bfe_basic.Request, targetModel string) *bfe_basic.AiError {
+    ctx := GetTokenAuthContext(req)
+    if ctx == nil || ctx.Token == nil {
+        return nil // no auth rule matched or unauthenticated: no check
+    }
+    tok := ctx.Token
+    if len(tok.Models) == 0 && len(tok.BlockModels) == 0 {
+        return nil // no allowlist/blocklist configured: pass
+    }
+    model := strings.TrimSpace(targetModel)
+    if model == "" {
+        // an allowlist/blocklist is configured but the target model is
+        // undetermined: reject as "model not found"
+        return ... // CodeInvalidRequest, HTTP 400
+    }
+    // check the blocklist first, then the allowlist (non-empty allowlist requires a hit)
+    // a mismatch returns CodeModelNotAllowed, HTTP 400
+}
+```
+
+On rejection, `targetModelCheckFilter` returns `BfeHandlerFinish` with a locally constructed 400 error response; that attempt is not sent upstream and triggers neither API-Key rotation nor cluster fallback. The result is recorded via `SetAiAuthInfo` into `AiBasicInfo.AiAuthInfo.RejectReason`, so access logs can correlate the rejection reason.
+
+Firing per attempt means cluster-level fallback re-validates the target model resolved for each attempt: when the primary target is rejected by the allowlist, the request carries the `RejectReason` into the backup cluster attempt, and if a later attempt succeeds, `ServeHTTPForAI()` clears the stale `RejectReason` (and `RejectQuotaPlans`) when breaking out of the forwarding loop, so the access log of a successful request does not carry an old rejection reason. Consequently the route target model override and the API-Key model allowlist compose in a "redirect first, validate second" manner: the allowlist constrains the post-forwarding target model, not the raw model in the client request body.
+
+For native Gemini paths (of the form `/v1beta/models/<model>:<action>`, in contrast to `:publishers/.../models/<model>:generateContent`), the model name is taken from the URL path (`ExtractModelFromPath` in `bfe_model_protocol/gemini`); it enters the same `TargetModel` resolution chain, so the allowlist check applies to it as well.
 
 ## Quota Plan Binding and Balance Query (Redis)
 
@@ -312,8 +350,8 @@ func isClientAbortErr(err error) bool {
 
 Estimating Tokens from content length (`EstimateToken`: `Content-Length/4` of the request body for input, response body length for output) is only a fallback and is allowed to participate in billing only when the response completed normally. For this purpose, `bfe_basic.AiBasicInfo` maintains two sets of state marks:
 
-- `MarkResponseCompleted` / `IsResponseCompleted`: set when the response finishes normally. In streaming scenarios, `mod_body_process` sets it when a termination event is seen (Anthropic `message_stop`, OpenAI `[DONE]`); in non-streaming scenarios, `tokenReadResponseHandler` sets it after the full response body is read.
-- `MarkFinalUsageSeen` / `IsFinalUsageSeen`: set when the final usage is parsed from the response. In streaming scenarios, `QuotaUsageProcessor` sets it when the final usage event arrives (such as Anthropic `message_delta`, or an event carrying `image_count` / `video_count`); in non-streaming scenarios, it is set after a non-zero `UsedQuota` is parsed. The initial usage of Anthropic `message_start` (`output_tokens = 0`) does not count as final usage.
+- `MarkResponseCompleted` / `IsResponseCompleted`: set when the response finishes normally. In streaming scenarios, `mod_body_process` sets it when a termination event is seen (Anthropic `message_stop`, OpenAI `[DONE]`, Responses API `response.completed`); in non-streaming scenarios, `tokenReadResponseHandler` sets it after the full response body is read.
+- `MarkFinalUsageSeen` / `IsFinalUsageSeen`: set when the final usage is parsed from the response. In streaming scenarios, `QuotaUsageProcessor` sets it when the final usage event arrives (such as Anthropic `message_delta`, Responses API `response.completed`, or an event carrying `image_count` / `video_count`); in non-streaming scenarios, it is set after a non-zero `UsedQuota` is parsed. The initial usage of Anthropic `message_start` (`output_tokens = 0`) does not count as final usage.
 
 The settlement rules are:
 
@@ -460,7 +498,7 @@ default:
 }
 ```
 
-The mode is determined by `bfe_basic.DetectModeFromPath` from the request path, including `/v1/responses` → `ModeResponses` and `/v1/video/generations` → `ModeVideoGeneration`.
+The mode is determined by `bfe_basic.DetectModeFromPath` from the request path (the endpoint table is `openAIEndpointModes` in `bfe_basic/openai_endpoint.go`): an optional `/v1` version prefix is stripped first, then the shared endpoint table is consulted — `/responses` maps to `ModeResponses` and `/video/generations` to `ModeVideoGeneration`; endpoints such as `/chat/completions`, `/embeddings`, and `/images/generations` map to their dedicated modes; endpoints without a dedicated mode and unknown paths fall into the default `ModeChat`; provider-native entries ending in a `/v1` segment such as `/compatible-mode/v1/responses` are likewise reduced to the endpoint table and recognized as `ModeResponses`.
 
 `calcChatCost` supports multiple fine-grained billing dimensions:
 
@@ -514,7 +552,7 @@ func (m *ModuleAITokenAuth) tokenReadResponseHandler(req *bfe_basic.Request, res
 }
 ```
 
-`UpdateCtxByUsage` no longer embeds a long gjson extraction chain; instead it delegates to the protocol adapter layer: based on the `AiBasicInfo.AuthStyle` identified at the request stage, it picks the corresponding adapter (`modelprotocol.Get(authStyle).ExtractUsageFields`), and `bfe_model_protocol` extracts the usage fields of each protocol — `PromptTokens`, `CompletionTokens`, cache read/write, image input, image/video counts, etc. — and writes them back into `TokenUsage`. This both accommodates usage differences across protocols such as OpenAI, DeepSeek, and Anthropic (e.g. DeepSeek's `prompt_cache_hit_tokens`, Anthropic's `message.usage` nesting), and allows usage extraction for new protocols to be extended independently within the adapter layer.
+`UpdateCtxByUsage` delegates the field extraction to the protocol adapter layer: based on the `AiBasicInfo.AuthStyle` identified at the request stage, it picks the corresponding adapter (`modelprotocol.Get(authStyle).ExtractUsageFields`), and `bfe_model_protocol` extracts the usage fields of each protocol — `PromptTokens`, `CompletionTokens`, cache read/write, image input, image/video counts, etc. — and writes them back into `TokenUsage`. This both accommodates usage differences across protocols such as OpenAI, DeepSeek, and Anthropic (e.g. DeepSeek's `prompt_cache_hit_tokens`, Anthropic's `message.usage` nesting), and allows usage extraction for new protocols to be extended independently within the adapter layer.
 
 When the response body truly has no `usage` field (for example, some privately deployed models do not return usage), and estimation is allowed, the module roughly estimates the output Token count as `Content-Length / 4` and combines it with the input Token count estimated from the request body to produce an approximate usage. Estimation serves only as a last resort and is not recommended for precise billing scenarios.
 
@@ -522,7 +560,7 @@ When the response body truly has no `usage` field (for example, some privately d
 
 For streaming responses, `mod_body_process` parses SSE events segment by segment in `HandleReadResponse`, and accumulates Token usage into `AiBasicInfo.TokenUsage` via `QuotaUsageProcessor.Process`. Because a streaming response has not ended yet at the `HandleReadResponse` stage, `tokenReadResponseHandler` of `mod_ai_token_auth` usually cannot obtain the complete usage; the final deduction is performed by `tokenRequestFinishHandler` at the `HandleRequestFinish` stage, reading the already populated `TokenUsage`.
 
-While parsing each SSE event, `QuotaUsageProcessor` also maintains the billing-reliability state: it calls `MarkResponseCompleted` when a termination event is seen (Anthropic `message_stop`, OpenAI `[DONE]`), and calls `MarkFinalUsageSeen` when a final usage event arrives. In Anthropic streaming, `message_start` carries only the initial usage (`output_tokens = 0`), and `message_delta` carries the final output tokens but no prompt fields — the Processor always processes the final usage event, and in the `message_delta` scenario it retains the `PromptTokens`, `CacheReadTokens`, `CacheWriteTokens`, and other fields parsed at the `message_start` stage, updating only the completion part, avoiding cache Token loss or double counting. These two state marks are exactly the basis on which `tokenRequestFinishHandler` decides "no billing on client abort, estimates usable only on normal completion".
+While parsing each SSE event, `QuotaUsageProcessor` also maintains the billing-reliability state: it calls `MarkResponseCompleted` when a termination event is seen (Anthropic `message_stop`, OpenAI `[DONE]`, Responses API `response.completed`), and calls `MarkFinalUsageSeen` when a final usage event arrives (Anthropic `message_delta`, Responses API `response.completed` — which is both a termination event and a final usage event, with its usage nested under `response.usage`). In Anthropic streaming, `message_start` carries only the initial usage (`output_tokens = 0`), and `message_delta` carries the final output tokens but no prompt fields — the Processor always processes the final usage event, and in the `message_delta` scenario it retains the `PromptTokens`, `CacheReadTokens`, `CacheWriteTokens`, and other fields parsed at the `message_start` stage, updating only the completion part, avoiding cache Token loss or double counting. These two state marks are exactly the basis on which `tokenRequestFinishHandler` decides "no billing on client abort, estimates usable only on normal completion".
 
 ```mermaid
 sequenceDiagram
@@ -578,8 +616,13 @@ func (m *ModuleAITokenAuth) Init(cbs *bfe_module.BfeCallbacks, whs *web_monitor.
     m.redisClient = client
     m.loadProductRuleConf(nil)
 
-    // Register three callbacks
+    // Register four callbacks
     cbs.AddFilter(bfe_module.HandleFoundProduct, m.tokenFoundProductHandler)
+    // The target model allow/block check runs on the AI forwarding stage
+    // callback (target model resolved), re-validated per cluster attempt.
+    // Registered before mod_ai_rate_limit so that the allow/block check
+    // always precedes rate limiting on this point.
+    cbs.AddFilter(bfe_module.HandleAfterAITargetModel, m.targetModelCheckFilter)
     cbs.AddFilter(bfe_module.HandleReadResponse, m.tokenReadResponseHandler)
     cbs.AddFilter(bfe_module.HandleRequestFinish, m.tokenRequestFinishHandler)
 
@@ -720,8 +763,8 @@ type TokenAuthContext struct {
 `mod_ai_token_auth` is the key module in the Rainway AI Gateway Data Plane that connects authentication and billing. The main points of this chapter are:
 
 - In the BFE module chain, the module sits before `mod_ai_route` and is responsible for completing API-Key validation and the quota pre-check before request routing.
-- Through three callbacks — `HandleFoundProduct`, `HandleReadResponse`, and `HandleRequestFinish` — it completes authentication, usage parsing, and quota deduction respectively.
-- The API-Key is extracted from `Authorization: Bearer <api-key>`; validation items include existence, enabled state, expiration time, model allowlist/blocklist, source subnets, and the Redis balance of each `QuotaPlan`.
+- Through four callbacks — `HandleFoundProduct`, `HandleAfterAITargetModel`, `HandleReadResponse`, and `HandleRequestFinish` — it completes authentication, target model validation, usage parsing, and quota deduction respectively.
+- The API-Key is extracted from `Authorization: Bearer <api-key>`; authentication-stage validation items include existence, enabled state, expiration time, source subnets, and the Redis balance of each `QuotaPlan`; the model allowlist/blocklist is validated at the forwarding stage against the final target model (`ValidateTargetModel`), and a mismatch returns 400 and ends that attempt.
 - `QuotaPlan.RedisKey` is generated and delivered by the Control Plane and used directly by BFE, avoiding counter resets caused by renames; the `total_token` and `RMB` units use different Lua scripts for deduction.
 - RMB quota computes cost based on model prices and the current time-period tier in `AIConf.ModelTable`; model prices are `float64` values, and each billing line item is converted via `quota.CalcCostUnits` into a 1e-8-RMB fixed-point integer before accumulation and deduction. Chat billing splits cache read/write and image/audio input dimensions out of the total input, falling back to the legacy formula when none are configured; `responses` reuses chat billing, and `video_generation` is billed as `output_cost_per_video` × video count.
 - Billing reliability is supported by the two sets of marks on `AiBasicInfo` — `MarkResponseCompleted` / `MarkFinalUsageSeen`: no billing when the client aborts without a final usage, and estimates are usable only when the response completes normally; `TokenAuthContext.deducted` makes deduction idempotent; `/count_tokens` endpoints skip billing.

@@ -31,7 +31,7 @@ The Data Plane requires high concurrency, low latency, observability, and hot up
 
 After startup, BFE listens for HTTP/HTTPS/HTTP2/WebSocket connections. Each request that enters BFE goes through stages in sequence: connection acceptance, protocol parsing, tenant identification, module callbacks, backend forwarding, and response sending. In AI Gateway mode, BFE enters the independent `ServeHTTPForAI()` forwarding path.
 
-The connection acceptance stage is handled by listeners in `bfe_server/`, responsible for TLS handshakes, session management, and protocol negotiation. HTTP request parsing is handled by protocol implementations such as `bfe_http/` and `bfe_http2/`, which produce `bfe_basic.Request` objects. BFE then enters the module callback stage, invoking the registered modules' callback functions in a fixed order. AI-related modules mainly intervene at the `HandleFoundProduct` stage, while the response stage is handled by `HandleReadResponse` and `HandleRequestFinish`.
+The connection acceptance stage is handled by listeners in `bfe_server/`, responsible for TLS handshakes, session management, and protocol negotiation. HTTP request parsing is handled by protocol implementations such as `bfe_http/` and `bfe_http2/`, which produce `bfe_basic.Request` objects. BFE then enters the module callback stage, invoking the registered modules' callback functions in a fixed order. AI-related modules mainly intervene at the `HandleFoundProduct` and `HandleAfterAITargetModel` stages, while the response stage is handled by `HandleReadResponse` and `HandleRequestFinish`.
 
 ### Dispatching Between the Traditional Path and the AI Gateway Path
 
@@ -46,7 +46,7 @@ if c.server.Config.Server.EnableAiGateway {
 }
 ```
 
-When `ai_gateway_enabled = false`, requests follow BFE's original `ServeHTTP()` path; when `ai_gateway_enabled = true`, requests enter the new `ServeHTTPForAI()` path. The two paths share connection management, timeouts, response sending, and other infrastructure, but the AI path no longer uses the original intra-tenant cluster routing; instead, it forwards based on the `AiRouteResult` computed by `mod_ai_route`.
+When `ai_gateway_enabled = false`, requests follow BFE's original `ServeHTTP()` path; when `ai_gateway_enabled = true`, requests enter the dedicated `ServeHTTPForAI()` path. The two paths share connection management, timeouts, response sending, and other infrastructure, but the AI path no longer uses the original intra-tenant cluster routing; instead, it forwards based on the `AiRouteResult` computed by `mod_ai_route`.
 
 ### AI Gateway Path Processing Flow
 
@@ -79,7 +79,6 @@ When `ai_gateway_enabled = false`, requests follow BFE's original `ServeHTTP()` 
 │  HandleFoundProduct                       │
 │  mod_ai_token_auth                        │
 │  mod_ai_route                             │
-│  mod_ai_rate_limit                        │
 └──────────────┬────────────────────────────┘
                │
                ▼
@@ -103,6 +102,10 @@ When `ai_gateway_enabled = false`, requests follow BFE's original `ServeHTTP()` 
                ▼
 ┌───────────────────────────────────────────┐
 │  aiClusterInvoke() forwarding loop        │
+│  Per attempt:                             │
+│  HandleAfterAITargetModel                 │
+│  mod_ai_token_auth (target model check)   │
+│  mod_ai_rate_limit                        │
 │  Degrade in fallbacks order on failure    │
 └──────────────┬────────────────────────────┘
                │
@@ -112,7 +115,7 @@ When `ai_gateway_enabled = false`, requests follow BFE's original `ServeHTTP()` 
 └───────────────────────────────────────────┘
 ```
 
-As shown in the diagram, the AI Gateway path aggregates the processing results of all AI-related modules at the `HandleFoundProduct` stage, and performs target selection, model override, and fallback degradation within `ServeHTTPForAI()`.
+As shown in the diagram, the AI Gateway path completes authentication and routing lookup at the `HandleFoundProduct` stage; inside the `ServeHTTPForAI()` forwarding loop, the `HandleAfterAITargetModel` callback performs the target model check and rate limiting per cluster attempt, and target selection, model override, and fallback degradation all happen within `ServeHTTPForAI()`.
 
 ## Execution Order and Collaboration of AI-Related Modules
 
@@ -140,13 +143,13 @@ var moduleList = []bfe_module.BfeModule{
 }
 ```
 
-This order determines the execution order of the modules in the `HandleFoundProduct` callback: `mod_ai_token_auth` → `mod_ai_route` → `mod_ai_rate_limit`. The three modules share state through `AiBasicInfo` and `Request.Context`, such as `ClientApiKey`, `ClientModel`, `TargetModel`, `AiRouteResult`, and so on.
+This order determines the execution order of the modules in the `HandleFoundProduct` callback: `mod_ai_token_auth` → `mod_ai_route`. The model whitelist check and rate limiting do not run at `HandleFoundProduct`; they are registered at the forwarding-stage `HandleAfterAITargetModel` callback point (fired after the target model is resolved and before forwarding, once per cluster attempt), where `mod_ai_token_auth` runs before `mod_ai_rate_limit` so that the whitelist check always precedes rate limiting. These modules share state through `AiBasicInfo` and `Request.Context`, such as `ClientApiKey`, `ClientModel`, `TargetModel`, `AiRouteResult`, and so on.
 
 The constraints on the execution order are determined by data dependencies:
 
 - `mod_ai_token_auth` runs first, identifying the caller's identity and setting `ClientApiKey`;
 - `mod_ai_route` follows immediately, relying on `ClientApiKey` to complete the routing lookup and produce `AiRouteResult`;
-- `mod_ai_rate_limit` runs last, relying on `ClientApiKey`, the target model, and other information to perform TPM/RPM/concurrency rate limiting.
+- the target model check of `mod_ai_token_auth` and `mod_ai_rate_limit` execute at the `HandleAfterAITargetModel` stage, by which time routing is complete and `AiBasicInfo.TargetModel` has been resolved after the route target model override, prefix stripping, and cluster `ModelMapping`; both perform the whitelist check and TPM/RPM/concurrency rate limiting against that target model.
 
 `mod_body_process` mainly executes at the `HandleReadResponse` stage, parsing token usage from streaming responses; its results are used by `mod_ai_token_auth` at the `HandleRequestFinish` stage for the final quota deduction. Any change to this order would break the dependency chain, causing abnormal routing, rate limiting, or quota deduction behavior. Therefore, the registration positions and comments in `bfe_modules/bfe_modules.go` must be maintained in sync.
 
@@ -275,12 +278,11 @@ The module's authentication flow includes:
 
 1. Extract the API-Key from the request;
 2. Verify the validity and status of the API-Key;
-3. Check whether the model being accessed is in the allowlist;
-4. Verify whether the source IP matches an allowed subnet;
-5. Check whether the associated quota plan has sufficient quota;
-6. After the request completes, extract the token usage from the response body and deduct the quota.
+3. Verify whether the source IP matches an allowed subnet;
+4. Check whether the associated quota plan has sufficient quota;
+5. After the request completes, extract the token usage from the response body and deduct the quota.
 
-Steps 1–5 are completed at the `HandleFoundProduct` stage; step 6 is completed at the `HandleRequestFinish` stage. The module writes `ClientApiKey` and the quota plan into `AiBasicInfo` for subsequent modules to use.
+Steps 1–4 are completed at the `HandleFoundProduct` stage; step 5 is completed at the `HandleRequestFinish` stage. The model allowlist/blocklist is not checked during authentication: every cluster attempt in `ServeHTTPForAI()` fires the `HandleAfterAITargetModel` callback before invoking the backend, and `mod_ai_token_auth`'s `targetModelCheckFilter` calls `ValidateTargetModel` to match the final target model (after the route target model override, prefix stripping, and cluster `ModelMapping`, i.e. `AiBasicInfo.TargetModel`) against the allowlist/blocklist; a mismatch returns 400 `CodeModelNotAllowed` and ends that attempt. The module writes `ClientApiKey` and the quota plan into `AiBasicInfo` for subsequent modules to use.
 
 ### mod_ai_rate_limit: The Rate Limiting Module
 
@@ -290,7 +292,7 @@ Steps 1–5 are completed at the `HandleFoundProduct` stage; step 6 is completed
 - RPM (Requests Per Minute): the maximum number of requests per minute;
 - Maximum concurrency limit.
 
-The module executes at the `HandleFoundProduct` stage and relies on information such as `ClientApiKey` set by `mod_ai_token_auth` to identify the rate limit dimension. If a request triggers rate limiting, the module returns a response early, preventing the request from entering the subsequent forwarding flow.
+The module is registered at the `HandleAfterAITargetModel` callback point (after the target model is resolved and before forwarding, fired once per cluster attempt). It relies on `ClientApiKey` set by `mod_ai_token_auth` and the target model resolved at the routing stage to identify the rate limit dimension; TPM/RPM/maximum concurrency policies are all matched against the post-forwarding target model. If a request triggers rate limiting, the module returns a 429 response and ends that attempt; a local rate limit rejection sets the `bfe_basic.ErrAiRateLimit` error marker, which is distinct from an upstream 429 and blocks both API-Key rotation and cluster fallback.
 
 ### mod_body_process: The Request/Response Body Processing Module
 
@@ -309,8 +311,9 @@ Commonly used callback points include:
 | Callback Point | Trigger Timing | AI-Related Modules |
 |----------------|----------------|--------------------|
 | `HandleBeforeLocation` | Before tenant identification | mod_trust_clientip, mod_logid, etc. |
-| `HandleFoundProduct` | After tenant identification | mod_ai_token_auth, mod_ai_rate_limit, mod_ai_route |
+| `HandleFoundProduct` | After tenant identification | mod_ai_token_auth, mod_ai_route |
 | `HandleAfterLocation` | After location/routing is determined | mod_body_process, etc. |
+| `HandleAfterAITargetModel` | After the target model is resolved and before forwarding, fired per cluster attempt | mod_ai_token_auth (target model check), mod_ai_rate_limit |
 | `HandleReadResponse` | When reading the backend response | mod_body_process |
 | `HandleRequestFinish` | When request processing completes | mod_ai_token_auth (quota deduction) |
 
@@ -324,7 +327,7 @@ Module callback functions return an `int` status and an optional `*bfe_http.Resp
 - `BfeHandlerClose`: close the connection directly;
 - `BfeHandlerRedirect`: return a redirect response.
 
-AI-related modules usually return `BfeHandlerGoOn` at the `HandleFoundProduct` stage, writing state into the context; if authentication fails or rate limiting is triggered, they return `BfeHandlerFinish` or `BfeHandlerResponse`.
+AI-related modules usually return `BfeHandlerGoOn` at the `HandleFoundProduct` stage, writing state into the context; if authentication fails or rate limiting is triggered, they return `BfeHandlerFinish` or `BfeHandlerResponse`. Consumers at the `HandleAfterAITargetModel` stage follow the same convention: a target model check failure returns 400, and a rate limit hit returns 429.
 
 ### Module Registration
 
@@ -521,7 +524,8 @@ Before the status-code whitelist decides, `shouldTriggerFallback()` consults the
 The following cases do not trigger a fallback:
 
 - A backend `4xx` status code that is not in the `aiFallbackStatusCodes` whitelist;
-- The request has already been rate limited or failed authentication at the `HandleFoundProduct` stage.
+- The request failed authentication at the `HandleFoundProduct` stage (never entering the forwarding loop);
+- An attempt is rejected by a local rate limit: when `mod_ai_rate_limit` triggers, it sets the `bfe_basic.ErrAiRateLimit` error marker, and the forwarding loop recognizes this marker and stops the attempt list immediately — no further API-Key rotation and no degradation to a backup cluster (a 429 returned by the upstream still follows the original key rotation logic).
 
 Before each fallback, `resetRequestForRetry()` resets the `OutRequest`, the backend connection, the retry count, and error information, and resets the request body to its starting position via `rewindRequestBody()`, ensuring that the next forwarding attempt uses a clean request state.
 
@@ -567,7 +571,13 @@ Different providers use different upstream path prefixes (e.g., Bailian `/compat
 - anthropic request: `/v1/messages` -> `{ProtocolPaths[anthropic]}/v1/messages` (e.g., `/apps/anthropic/v1/messages`);
 - openai request: `/v1/chat/completions` -> `{ProtocolPaths[openai]}/chat/completions` (e.g., `/compatible-mode/v1/chat/completions`).
 
-The rewrite is computed by the pure function `rewriteUpstreamPath` in `bfe_server/ai_path_rewrite.go`, executed in `doSingleAIForward` after the outbound request copy is created and before `clusterInvoke`, and applies only to the standard entry (the exact value `/v1` or the `/v1/` prefix). When `ProtocolPaths` is not configured or has no entry for the detected protocol, the path is forwarded unchanged; non-standard entries such as `/v10/xxx` or Gemini-style `/v1beta/...` are never rewritten. The rewrite only affects the outbound copy and never the inbound request, so every fallback attempt recomputes the path from the original client path — after switching to a backup cluster with a different prefix configuration, the upstream path automatically follows the new cluster's configuration.
+The rewrite is computed by the pure function `rewriteUpstreamPath` in `bfe_server/ai_path_rewrite.go`, executed in `doSingleAIForward` after the outbound request copy is created and before `clusterInvoke`. The two protocol branches follow different rules:
+
+- **openai branch**: an optional `/v1` version prefix is stripped first (`bfe_basic.StripV1Prefix`; `/v1/chat/completions` and `/chat/completions` are equivalent), then the stripped path is looked up in the shared OpenAI endpoint table in `bfe_basic` (`openAIEndpointModes` in `bfe_basic/openai_endpoint.go`, covering the main endpoints such as `/chat/completions`, `/embeddings`, `/images/generations`, `/responses`, and `/video/generations`): a path that hits the endpoint table is rewritten to `base + stripped path` (both `/chat/completions` and `/v1/chat/completions` rewrite to `/compatible-mode/v1/chat/completions`), while a custom path that misses the endpoint table passes through unchanged. A path of exactly `/v1` or `/v1/` rewrites to the base itself.
+- **anthropic branch**: still recognizes only the standard entry (the exact value `/v1` or the `/v1/` prefix); on a match the path becomes `base + original path` (e.g., `/v1/messages` -> `/apps/anthropic/v1/messages`); non-standard entries such as `/v10/xxx` pass through.
+- **gemini branch**: `ProtocolPaths` accepts only the `openai`/`anthropic` keys, so gemini is never rewritten; native paths such as `/v1beta/models/gemini-2.5-flash:generateContent` always pass through.
+
+When `ProtocolPaths` is not configured or has no entry for the detected protocol, the path is likewise forwarded unchanged. The rewrite only affects the outbound copy and never the inbound request, so every fallback attempt recomputes the path from the original client path — after switching to a backup cluster with a different prefix configuration, the upstream path automatically follows the new cluster's configuration.
 
 `ProtocolPaths` is passed through unchanged by the Control Plane from the provider referenced by the cluster (the configuration entry is the Provider's `protocol_paths` field; see [Chapter 10: Provider and Cluster Design](./chapter10-provider-and-cluster.md)). BFE also validates the key whitelist (`openai`/`anthropic`) and the value format at configuration load and hot reload, rejecting invalid configurations as a safety net when Control Plane validation is bypassed by manual edits.
 
@@ -577,13 +587,13 @@ This chapter introduced the design of BFE, the Data Plane component of the Rainw
 
 - BFE is responsible for actually forwarding AI requests and works with the Control Plane AI Gateway API through configuration distribution.
 - In AI Gateway mode, requests enter the independent `ServeHTTPForAI()` path, reusing the original callback and forwarding infrastructure.
-- `mod_ai_token_auth`, `mod_ai_rate_limit`, and `mod_ai_route` execute in a fixed order at the `HandleFoundProduct` stage, sharing state through `AiBasicInfo` and `Request.Context`.
+- `mod_ai_token_auth` and `mod_ai_route` execute in a fixed order at the `HandleFoundProduct` stage; the target model whitelist check and `mod_ai_rate_limit` are registered at the `HandleAfterAITargetModel` callback point (fired per cluster attempt), sharing state through `AiBasicInfo` and `Request.Context`.
 - `mod_body_process` parses token usage from SSE responses at the `HandleReadResponse` stage, for `mod_ai_token_auth` to perform the final quota deduction.
 - The `bfe_model_protocol` protocol adapter layer converges protocol knowledge scattered across `bfe_basic`, `mod_ai_token_auth`, `mod_body_process`, and `bfe_server` into per-protocol adapters; `AIConf.ModelProtocols` is validated against the registry at startup and hot reload, and unknown protocol names fail the load.
 - BFE's `bfe_module` framework organizes modules through callback points and return values; the registration order in `bfe_modules/bfe_modules.go` directly affects behavioral correctness.
 - Configuration loading adopts a two-layer INI + JSON structure, supports hot reload through the web interface, and new configurations atomically replace the old ones after validation completes.
 - `mod_ai_route` supports three-level routing of `apikey → entity → global`, weighted selection of `targets`, and sequential degradation of `fallbacks`, and is the core of AI Gateway forwarding.
-- Upstream path rewriting by protocol: `AIConf.ProtocolPaths` rewrites the standard entry `/v1/...` to the provider prefix, with pure pass-through when unconfigured; the rewrite only affects the outbound copy, every fallback attempt recomputes it independently, and non-standard entries are never rewritten.
+- Upstream path rewriting by protocol: for the `openai` branch of `AIConf.ProtocolPaths`, an optional `/v1` prefix is stripped and the shared endpoint table in `bfe_basic` decides whether to rewrite (both `/chat/completions` and `/v1/chat/completions` get the provider prefix); the `anthropic` branch recognizes only the standard `/v1` entry, and gemini is never rewritten; the rewrite only affects the outbound copy, and every fallback attempt recomputes it independently.
 
 ## References
 

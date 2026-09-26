@@ -275,7 +275,7 @@ TPM and RPM rules are stored as JSON arrays in the `tpm_configs` and `rpm_config
 }
 ```
 
-`model` supports a specific model name or the wildcard `*`; when no specific model matches, the default limit is used. `name` is unique within a policy and cannot be changed after creation, serving as the stable identifier for rule export.
+`model` supports a specific model name or the wildcard `*`; when no specific model matches, the default limit is used. `name` is unique within a policy and serves as the identifier for rule export and the Redis Key.
 
 ### Validation Rules
 
@@ -284,7 +284,7 @@ TPM and RPM rules are stored as JSON arrays in the `tpm_configs` and `rpm_config
 - `name` must be unique within `product_name`;
 - `max_concurrency` must be ≥ 0;
 - each rule's `name` is required, non-empty, 1–128 characters, restricted to the character set `[a-zA-Z0-9_-]`;
-- `name` must be unique within a policy and cannot be modified;
+- `name` must be unique within a policy; renaming a rule is equivalent to deleting the old rule and adding a new one (see "Redis Key Stability" below);
 - `model` cannot be empty, and `limit` must be ≥ 0.
 
 ---
@@ -300,7 +300,7 @@ Both API-Keys and Entities reference rate limit policies via the `rate_limit_pol
 | Table | `quota_plans` | `rate_limit_policies` |
 | Reference field | `quota_plan_id` | `rate_limit_policy_id` |
 | Hierarchical merge | Collect QuotaPlans from all levels | Collect Policy IDs from all levels |
-| Exported Redis Key | `QUOTA_xxx` | `RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>` |
+| Exported Redis Key | `QUOTA_xxx` | `default_bfe_rlp-<id>_RL_TPM_rlp-<id>_<name>` / `default_bfe_rlp-<id>_RL_RPM_rlp-<id>_<name>` |
 | Balance sync | Yes | No |
 
 ### Entity Hierarchical Merge Upward
@@ -335,14 +335,18 @@ Exported policy names use the uniform format `rlp-<policy_id>` to avoid naming c
 
 ### Redis Key Stability
 
-To eliminate the problem of "renaming or changing the model resets the counter," the Control Plane generates a stable Redis Key for each rule during export:
+The Control Plane generates a Redis Key for each rule during export, and the rule name is part of the Key (`BuildBFERateLimitRedisKey` in `model/shared/rate_limit_redis_key.go`):
 
 ```go
-RedisKey: fmt.Sprintf("RL_RPM_rlp-%d_%d", policyID, idx)
-RedisKey: fmt.Sprintf("RL_TPM_rlp-%d_%d", policyID, idx)
+// model/shared/rate_limit_redis_key.go
+func BuildBFERateLimitRedisKey(policyID int64, ruleType string, name string) string {
+    return fmt.Sprintf("default_bfe_rlp-%d_%s_rlp-%d_%s", policyID, ruleType, policyID, name)
+}
 ```
 
-The Key is based on `(policy_id, rule_index)`, which does not change with user edits, so modifying a rule name or `model` does not reset the counter. On the BFE side, the `redis_key` in the configuration is used preferentially to build the Redis Key; for old configurations, a compatibility fallback that keys by rule name is retained.
+TPM / RPM rules pass `ruleType` as `RL_TPM` / `RL_RPM` respectively and `name` as the rule name, producing keys such as `default_bfe_rlp-1_RL_TPM_rlp-1_tpm_1min`. On the BFE side, the full `redis_key` delivered in the configuration is used as-is.
+
+Because the rule name is encoded in the Key, renaming a rule is equivalent to deleting the old rule and adding a new one: `DiffRateLimitRedisKeys` compares the old and new policies by name, cleans up the keys of removed rules, and the new rule starts counting from zero under its new Key. Modifying other fields of a rule, such as `model`, does not change the Key and does not reset the counter.
 
 ```mermaid
 flowchart TD
@@ -354,7 +358,7 @@ flowchart TD
 
     G[RateLimitPolicyGenerator] -->|Collect enabled policies| H[rate_limit_policies.json]
     G -->|Generate API-Key bindings| I[api_key_rl_policy_bindings.json]
-    G -->|Generate redis_key per rule| J["RL_TPM_rlp-&lt;id&gt;_&lt;idx&gt;<br/>RL_RPM_rlp-&lt;id&gt;_&lt;idx&gt;"]
+    G -->|Generate redis_key per rule| J["default_bfe_rlp-&lt;id&gt;_RL_TPM_rlp-&lt;id&gt;_&lt;name&gt;<br/>default_bfe_rlp-&lt;id&gt;_RL_RPM_rlp-&lt;id&gt;_&lt;name&gt;"]
 
     H --> K[BFE mod_ai_rate_limit]
     I --> K
@@ -366,7 +370,7 @@ flowchart TD
 After receiving the configuration, BFE:
 
 1. Uses `api_key_rl_policy_bindings.json` to find the policy list for an API-Key;
-2. When a request arrives, matches rules in `rules.tpm` / `rules.rpm` by model, preferring exact model names and falling back to the `*` default limit when no match is found;
+2. When a request arrives, matches rules in `rules.tpm` / `rules.rpm` by the target model after forwarding, preferring exact model names and falling back to the `*` default limit when no match is found;
 3. After a rule matches, builds the Redis counter key from the rule's `redis_key` and performs the rate limit check;
 4. Also checks `max_concurrency`;
 5. Returns 429 Too Many Requests when any limit is exceeded.
@@ -611,7 +615,7 @@ Model price:
 - In multi-instance deployments, periodic reset is guaranteed to run on only one instance by a Redis distributed lock (key `quota:reset:scheduler:lock`, TTL 5 minutes, watchdog renewal at TTL/3, release guarded by the instance token); `POST /inner-api/v1/quota/trigger-reset` can manually trigger one round of equally protected periodic reset.
 - `quota=0` means a plan with no balance: the Control Plane computes and syncs the balance normally, while the Data Plane treats it as a valid configuration — requests hitting it receive 429 QuotaExhausted, and a missing Redis balance key is treated as exhausted rather than a 500.
 - `RateLimitPolicy` provides three types of limits — TPM, RPM, and concurrency — and rules support exact model names or the `*` default match; during export, policies merge upward along the Entity hierarchy, producing `rate_limit_policies.json` and `api_key_rl_policy_bindings.json`.
-- The Control Plane generates a stable Redis Key for each TPM/RPM rule (`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`), so modifying a rule name or `model` does not reset the counter.
+- The Control Plane generates a Redis Key from the rule name for each TPM/RPM rule (e.g. `default_bfe_rlp-<id>_RL_TPM_rlp-<id>_<name>`): renaming a rule is equivalent to deleting the old rule and adding a new one (counter reset to zero), while modifying other fields such as `model` does not reset the counter.
 - RMB quotas support tiered pricing by time of day: the Provider maintains `time_zone` and `tiers`, the Model maintains `tier_prices`, and after export BFE matches the tier based on the request time and selects the corresponding price, falling back to the default price when no tier matches.
 
 ---
