@@ -359,4 +359,4 @@ ls -l mod_ai_token_auth
 - `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/00-overview.md`
 - `bfe/docs/zh_cn/sys_design/tls_conf_reload_path.md`
-- [第二十一章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)
+- [第十四章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)

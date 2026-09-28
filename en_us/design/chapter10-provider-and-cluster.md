@@ -65,7 +65,7 @@ Key field descriptions:
 - `models`: The list of models supported by this provider; it can be maintained manually or backfilled by the model discovery interface.
 - `keys`: A list of API-Keys, each containing a `name` and the plaintext `key`. The `name` is used for cluster references.
 - `instance_pool`: The backend instance pool, containing at least one instance, and at least one instance must have `weight > 0`.
-- `model_protocols`: The supported model access protocols; the initial enum values are `openai` and `anthropic`.
+- `model_protocols`: The supported model access protocols; the current enum values are `openai`, `anthropic`, and `gemini`, with at least one required.
 - `protocol_paths`: Optional. A declarative mapping of protocol -> upstream base path, used to rewrite the standard entry `/v1/...` to the provider's native prefix; see "Protocol Path Rewriting" below.
 - `time_zone` / `tiers`: Used for peak/off-peak price matching; only the `peak` tier is supported initially.
 
@@ -289,7 +289,7 @@ When `strip_prefix=true`, `match_prefix` is required, must be non-empty, and mus
 
 `ModelProtocols` comes from the Provider's `model_protocols`; the Control Plane passes it through to `AIConf` according to the cluster's `provider` reference. BFE uses it to determine the request protocol style (such as the OpenAI-compatible format or the Anthropic Messages API).
 
-The data plane validates every cluster's `AIConf.ModelProtocols` at both startup load and hot reload: `validateClusterModelProtocols` in `bfe_server/bfe_confdata_load.go` calls `bfe_model_protocol.ValidateProtocols`, requiring every protocol in the list to be registered in the `bfe_model_protocol` adapter registry (built-in: `openai`, `anthropic`). If any unknown protocol name appears, the load or hot reload fails, reporting which cluster's configuration is invalid. An empty list is valid and treated as the default `["openai"]`. The design of the protocol adapter layer is covered in [Chapter 7: Data Plane Forwarding Design: BFE](./chapter07-data-plane-design.md).
+The data plane validates every cluster's `AIConf.ModelProtocols` at both startup load and hot reload: `validateClusterModelProtocols` in `bfe_server/bfe_confdata_load.go` calls `bfe_model_protocol.ValidateProtocols`, requiring every protocol in the list to be registered in the `bfe_model_protocol` adapter registry (built-in: `openai`, `anthropic`, `gemini`). If any unknown protocol name appears, the load or hot reload fails, reporting which cluster's configuration is invalid. An empty list is valid and treated as the default `["openai"]`. The design of the protocol adapter layer is covered in [Chapter 7: Data Plane Forwarding Design: BFE](./chapter07-data-plane-design.md).
 
 ### Protocol Path Rewriting (protocol_paths)
 
@@ -328,7 +328,7 @@ It is triggered via the OpenAPI endpoint `POST /providers/tools/discover-models`
 
 | Parameter | Description |
 |-----------|-------------|
-| `model_protocol` | Model access protocol, required, enum: `openai`, `anthropic` |
+| `model_protocol` | Model access protocol, required, enum: `openai`, `anthropic`, `gemini` |
 | `schema` | Request protocol, required, `http` or `https` |
 | `addr` | Target instance address |
 | `port` | Target instance port |

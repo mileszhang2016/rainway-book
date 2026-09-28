@@ -65,7 +65,7 @@ Provider（提供商）回答的是“下游是谁、能访问哪些模型、如
 - `models`：该 provider 支持的模型列表，可以是手动维护，也可以由模型发现接口回填。
 - `keys`：API-Key 列表，每项包含 `name` 与 `key` 明文。`name` 用于 cluster 引用。
 - `instance_pool`：后端实例池，至少包含一个实例，且至少有一个实例的 `weight > 0`。
-- `model_protocols`：支持的模型访问协议，首期枚举为 `openai`、`anthropic`。
+- `model_protocols`：支持的模型访问协议，当前枚举为 `openai`、`anthropic`、`gemini`，至少包含一种。
 - `protocol_paths`：可选，协议 → 上游 base path 的声明式映射，用于将标准入口 `/v1/...` 改写为 provider 原生前缀，详见下文「协议路径改写」。
 - `time_zone` / `tiers`：用于高峰/闲时价格匹配，初期只支持 `peak` tier。
 
@@ -289,7 +289,7 @@ flowchart LR
 
 `ModelProtocols` 来自 Provider 的 `model_protocols`，控制面按 cluster 的 `provider` 引用透传到 `AIConf`。BFE 据此判断请求协议风格（如 OpenAI 兼容格式或 Anthropic Messages API）。
 
-数据面在启动加载与热加载时都会校验每个 cluster 的 `AIConf.ModelProtocols`：`bfe_server/bfe_confdata_load.go` 中的 `validateClusterModelProtocols` 调用 `bfe_model_protocol.ValidateProtocols`，要求列表中的每个协议都已在 `bfe_model_protocol` 协议适配层注册表中注册（内置 `openai`、`anthropic`）；只要出现未知协议名，启动加载或热加载就会失败，并指明是哪个集群配置非法。空列表视为合法，按默认 `["openai"]` 处理。协议适配层的设计详见[第七章 数据面转发设计：BFE](./chapter07-data-plane-design.md)。
+数据面在启动加载与热加载时都会校验每个 cluster 的 `AIConf.ModelProtocols`：`bfe_server/bfe_confdata_load.go` 中的 `validateClusterModelProtocols` 调用 `bfe_model_protocol.ValidateProtocols`，要求列表中的每个协议都已在 `bfe_model_protocol` 协议适配层注册表中注册（内置 `openai`、`anthropic`、`gemini`）；只要出现未知协议名，启动加载或热加载就会失败，并指明是哪个集群配置非法。空列表视为合法，按默认 `["openai"]` 处理。协议适配层的设计详见[第七章 数据面转发设计：BFE](./chapter07-data-plane-design.md)。
 
 ### 协议路径改写（protocol_paths）
 
@@ -328,7 +328,7 @@ BFE 在转发时按检测到的请求协议改写上游路径，两个协议分�
 
 | 参数 | 说明 |
 |------|------|
-| `model_protocol` | 模型访问协议，必填，枚举 `openai`、`anthropic` |
+| `model_protocol` | 模型访问协议，必填，枚举 `openai`、`anthropic`、`gemini` |
 | `schema` | 请求协议，必填，`http` 或 `https` |
 | `addr` | 目标实例地址 |
 | `port` | 目标实例端口 |

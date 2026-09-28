@@ -2,7 +2,7 @@
 
 ## Chapter Goals
 
-Through this chapter, readers will learn the role and positioning of the Provider in the Rainway AI Gateway, become proficient in creating and maintaining Providers via the Dashboard and OpenAPI, correctly configure the model endpoint, model list, Provider Keys, and backend instance pool, use the model discovery tool to automatically probe models, understand the differences among supported model protocols, master the method of batch-importing model pricing via model-list.yaml, and clarify the relationship between Provider and Cluster and the impact of changes, as well as how to configure the `protocol_paths` protocol path mapping for multi-protocol providers and its caveats.
+Through this chapter, readers will learn the role and positioning of the Provider in the Rainway AI Gateway, become proficient in creating and maintaining Providers via the Dashboard and OpenAPI, correctly configure the model endpoint, model list, Provider Keys, and backend instance pool (IP mode and provider domain mode), use the model discovery tool to automatically probe models, understand the differences among the `openai`, `anthropic`, and `gemini` model protocols, master the common operations on the provider list (querying model prices, details, tiered pricing configuration, and deletion) and the configuration of peak time ranges, master the method of batch-importing model pricing via model-list.yaml, and clarify the relationship between Provider and Cluster and the impact of changes, as well as how to configure the `protocol_paths` protocol path mapping for multi-protocol providers and its caveats.
 
 ## The Concept and Role of the Provider
 
@@ -15,7 +15,7 @@ After Provider and Cluster are separated, their responsibilities become clearer:
 
 This separation brings many benefits: when the same Provider is referenced by multiple Clusters, the instance pool and keys only need to be maintained in one place, avoiding duplicate configuration; the Cluster no longer stores API Key plaintext and only references Keys in the Provider by name, improving security; the Provider can be created, updated, and deleted independently, while Clusters obtain backend capability by reference, making their lifecycles more independent; when a new protocol is added, only the Provider's model_protocols needs to be extended, without causing the Cluster model list to continuously grow.
 
-The core fields of a Provider include: a globally unique `name`, an optional `description`, the model discovery endpoint `model_endpoint`, the supported model list `models`, the API Key list `keys`, the backend instance pool `instance_pool`, the supported protocols `model_protocols`, the optional protocol path mapping `protocol_paths`, the time zone `time_zone`, and the time-of-day templates `tiers`. Among them, `models` is required and must contain at least one element; `instance_pool` is required and must contain at least one instance with weight greater than 0; and `model_protocols` is required and must contain at least one protocol.
+The core fields of a Provider include: a globally unique `name`, an optional `description`, the model discovery endpoint `model_endpoint`, the model list `models`, the API Key list `keys`, the backend instance pool `instance_pool`, the supported protocols `model_protocols`, the optional protocol path mapping `protocol_paths`, the time zone `time_zone`, and the time-of-day templates `tiers`. Among them, `models` is required and must contain at least one element; `instance_pool` is required and must contain at least one instance with weight greater than 0; and `model_protocols` is required and must contain at least one protocol.
 
 The default value of `time_zone` is `Asia/Shanghai`, used to determine which tier the current time belongs to. In the initial phase, `tiers` only supports `name=peak`, and each tier contains several `time_ranges` with a left-closed, right-open semantics. The time zone and tiers can be maintained separately via `PUT /v1/providers/{provider_name}/pricing-tiers`, without being passed when the Provider is created.
 
@@ -23,15 +23,70 @@ The default value of `time_zone` is `Asia/Shanghai`, used to determine which tie
 
 ### Creating via the Dashboard
 
-The Dashboard is a visual console for operators. The standard workflow for creating a Provider is as follows:
+The Dashboard is a visual console for operators. After logging in, go to **Resource Management → Model Providers** and click **Create Provider**; a drawer form slides in from the right, divided into five Card sections: Basic Information, Instance Pool, Model Service Configuration, Protocol Path Mapping, and Service Authentication Keys. Clicking **Edit** in the action column opens the same drawer: the name field is grayed out (the provider name cannot be changed after creation), and leaving the value of an already configured Key blank means keeping the existing value.
 
-1. Log in to the Dashboard, go to the **Provider Management** page, and click **New Provider**.
-2. Fill in the basic information: `name` must be globally unique; lowercase letters and hyphens are recommended, such as `deepseek` or `openai-official`; `description` is optional and helps the team identify the purpose.
-3. Configure the **instance pool**: fill in the backend address `addr`, port `port`, and weight `weight`. Within the same Provider, `(addr, port)` must not be duplicated, and at least one instance must have `weight > 0`.
-4. Configure the **model endpoint**: the default protocol is `https` and the default URI is `/v1/models`. Most OpenAI-compatible platforms need no change; the Claude official API usually also uses `/v1/models`.
-5. Select the **model protocols**: the first phase supports `openai` and `anthropic`; aggregation platforms may select multiple protocols at the same time.
-6. Add **Provider Keys**: each Key requires a name `name` and the actual key value `key`. The name must be unique within the Provider, and Clusters later reference the Key by this name.
-7. Save and submit. The system validates the fields; on success it returns the complete Provider record including `create_time` and `update_time`. If validation fails, the Dashboard reports the specific field errors, such as a duplicated instance pool, a protocol outside the enum range, an invalid Key name, or duplicated elements in `models`.
+The minimal configuration for first-time onboarding is as follows:
+
+| Section | Required Items |
+|---------|----------------|
+| Basic Information | Provider name |
+| Instance Pool | IP or provider domain + port + weight (fill 100 for a single instance) |
+| Model Service Configuration | Model protocol (at least one), model list API path, model list (required, at least 1 model; click "Get" to fetch, press Enter after typing to add, or use "Batch Add" to paste multiple names; must submit the form to persist) |
+| Service Authentication Keys | Usually required for providers that need authentication, such as public clouds |
+
+**Basic Information**:
+
+| Field | Required | Validation Rules |
+|-------|----------|------------------|
+| Name | Yes | 1–64 characters; only letters, digits, dots (`.`), underscores (`_`), and hyphens (`-`) are allowed; cannot start or end with a dot, underscore, or hyphen; cannot contain whitespace; cannot duplicate an existing provider name at creation. The unique identifier, which cannot be modified after creation |
+| Description | No | No more than 256 characters; cannot contain control characters |
+
+**Instance Pool**: supports either **IP Mode** or **Provider Domain Mode**, one of the two.
+
+IP Mode (the default) is suitable for self-built data centers / private deployments (vLLM / Xinference / Ollama, etc.) and allows creating multiple instance rows with "+ Create":
+
+| Field | Required | Default | Validation Rules |
+|-------|----------|---------|------------------|
+| IP Address | Yes | Empty | Valid IPv4 / IPv6; IPs must not be duplicated across instances |
+| Port | Yes | `80` | 1–65535 |
+| Weight | Yes | `100` for the first row, `0` for new rows | 0–100; the weights of all instances must sum to 100 |
+
+Provider Domain Mode is suitable for connecting to public-cloud model providers: fill in a single domain only (e.g., `api.deepseek.com`); the port defaults according to the protocol (https→443, http→80), and the weight is fixed at 100. Multiple addresses are not supported, and it cannot be mixed with IP Mode.
+
+**Model Service Configuration**:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| Model Protocol | Yes | Empty | Multi-select; supports `openai` (OpenAI-compatible), `anthropic` (Claude Messages API), and `gemini` (Google Gemini API); at least one must be selected |
+| Model List API | No | `https://{instance address}/v1/models` (the `gemini` protocol defaults to `/v1beta/models`) | Composed of protocol + instance address (read-only, from the instance pool) + URI path; the path must start with `/`. Corresponds to the Provider resource's `model_endpoint` (`schema` is the selected protocol, `addr` comes from the instance pool) |
+| Model List | Yes | Empty | Tag multi-select, at least 1 model; see "Maintaining the Model List" below |
+
+The system automatically determines the authentication header style used when calling the model discovery API based on the selected model protocol (`openai` uses `Authorization: Bearer`, `anthropic` uses `x-api-key`, and `gemini` uses `x-goog-api-key`). Customizing the `Authorization` Header in the model list API is **no longer supported**.
+
+**Maintaining the Model List**: the model list is required (at least 1 model) and carries a red required asterisk on the left of the tags. Validation rules: if the list is empty on submission, the prompt "Model list is required; please add at least 1 model" is shown; a model name cannot be an empty string; model names cannot be duplicated within the same provider. Common operations:
+
+| Operation | Description |
+|-----------|-------------|
+| "Get" | Calls the stateless discovery API `POST /v1/providers/tools/discover-models` to fetch upstream models using the current form's protocol, instance pool, model list path, and first Key, and **overwrites** the dropdown with the result |
+| "Batch Add" | Opens a text box; paste multiple model names separated by lines, commas / Chinese commas / semicolons / whitespace; after confirmation they are **merged** into the existing list (de-duplicated, existing items skipped) without overwriting |
+| Dropdown input | Type a model name and press Enter to add it; if the clipboard text can be split into 2 or more model names, pasting automatically splits it into multiple tags; a single name is still added via Enter |
+| Grayed-out condition | The "Get" button is disabled when no model protocol is selected or the instance pool has no valid address |
+| Submit | A successful "Get" or "Batch Add" does **not** save automatically; you must click **Submit** at the bottom of the drawer to write the Provider resource |
+
+> **Common pitfall**: if "Get" does not respond or fails, first check whether the instance address, port, protocol, and Key are correct, and whether BFE / the API Server can reach that backend.
+
+**Protocol Path Mapping**: corresponds one-to-one with the `protocol_paths` field of the Provider resource and is used to specify the upstream base path for each checked multi-protocol option; see "Protocol Path Configuration (protocol_paths)" below for configuration constraints and forwarding behavior. The `gemini` protocol does not support path rewriting.
+
+**Service Authentication Keys**: configure when the backend model service requires authentication. Key plaintext is stored only in the Provider resource, and Clusters reference Keys by **name**.
+
+| Field | Required | Validation Rules |
+|-------|----------|------------------|
+| Key Name | Conditionally required (once any field in the row is filled, the whole row becomes required) | 1–128 characters; cannot be duplicated within the same provider; used for selection in the Cluster-side dropdown |
+| Key Value | Conditionally required | 1–512 characters; leaving it blank during editing means no change |
+
+Use "+ Add Key" to add a row and "Delete" to remove a row; empty rows do not participate in validation and are filtered out automatically on submission; in edit mode, an already configured Key shows the hint "Key already configured; enter a new Key to change it, or leave blank to keep it unchanged".
+
+On save, the system validates field legality; on success it returns the complete Provider record including `create_time` and `update_time`. If validation fails, the Dashboard reports the specific field errors, such as a duplicated instance pool address, a protocol outside the enum range, an invalid Key name, or duplicated elements in `models`.
 
 ### Creating via OpenAPI
 
@@ -63,11 +118,50 @@ Example request body:
 
 If the request is valid, the API returns `ErrNum=200` and carries the complete record in `Data`. If `model_endpoint`, `keys`, or `time_zone` are not passed, the system fills in the documented default values. Later, some fields can be updated via `PATCH /v1/providers/{provider_name}`.
 
+## Provider List and Common Operations
+
+Go to **Resource Management → Model Providers** to see the list of currently created providers. The list fetches all data at once; searching and sorting by name / description / protocol / model are all performed in the browser.
+
+| Column | Description |
+|--------|-------------|
+| Name | The provider's unique identifier; supports search and sorting by name |
+| Description | Provider description |
+| Protocol | Supported model access protocols, e.g. `openai`, `anthropic`, `gemini`; multiple protocols are shown comma-separated |
+| Models | The configured model list; at most 2 tags are shown, with `+N` for the remainder; hover the Tooltip to see the full list |
+| Actions | Details, Query Model Prices, Tiered Pricing Configuration, Edit, Delete |
+
+The "Create Provider" button sits above the list.
+
+### Querying Model Prices
+
+Click "Query Model Prices" to jump to the **Resource Management → Model Pricing** page and filter the list by that provider's name (the `provider` field); if no pricing records exist, the prompt "No model pricing found for provider {provider}" is shown. The provider name must match the `provider` field in the pricing table so that cost accounting and this jump are correctly attributed; for how the pricing fields are maintained, see "Model Pricing Import" and [Chapter 13: Model Pricing and Cost Accounting Design](../design/chapter13-model-pricing.md).
+
+### Viewing Details
+
+Click "Details" to open a read-only drawer showing the basic information (including creation time and update time), instance pool, model service configuration (model protocols, model list API, model list), protocol path mapping, service authentication Keys (Key values masked), and a tiered pricing configuration summary (time zone and peak time range table; "Not configured" is displayed when not configured).
+
+### Tiered Pricing Configuration
+
+Click "Tiered Pricing Configuration" in the action column to open a standalone drawer used to configure the provider's **peak (busy hours)** time ranges, which are used for time-of-day price matching in model pricing. This configuration corresponds to the Provider resource's `time_zone` and `tiers` fields (see "The Concept and Role of the Provider"), but on submission it is saved separately by calling `PUT /v1/providers/{name}/pricing-tiers`, without affecting other provider fields.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| Provider Name | — | Read-only |
+| Time Zone | Yes | IANA time zone name, e.g. `Asia/Shanghai`; must pass validity validation |
+| Pricing Tier | — | Shows the "Peak" label read-only; only `peak` is supported in the initial phase |
+| Time Ranges | Yes | A table for configuring applicable weekdays and start/end times; supports the "All / Weekdays / Weekend" shortcuts; at least 1 row must be kept; multiple ranges within the same tier are ORed |
+
+Time rules: start/end times use the `HH:MM` format; the end time must be later than the start time—split into two ranges when crossing midnight; empty applicable ranges mean every day; weekday values are 0=Sunday … 6=Saturday; multiple time ranges within the same tier are matched by OR, with the semantics `start <= current time < end` (left-closed, right-open). After configuration, you must also maintain a `peak` tier price item for the same `provider` on the model pricing page; requests that do not hit peak hours fall back to the default price.
+
+### Deleting a Provider
+
+Click "Delete" and confirm. If the provider is still referenced by a business Cluster, the deletion fails with the prompt "Deletion failed: this provider may still be referenced by a cluster"; you must first change the "Provider" of the relevant Clusters or delete those Clusters before deleting the provider. Note: a `provider` with the same name existing in `model-prices` does **not** prevent the provider from being deleted.
+
 ## Configuring the Model Endpoint, Model List, and Provider Keys
 
 ### Model Endpoint
 
-`model_endpoint` is used to call the third-party platform's model list API and contains two fields, `schema` and `uri`. The default value of `schema` is `https`, and `http` is also allowed; the default value of `uri` is `/v1/models`, which must be non-empty and start with `/`. This endpoint is mainly used by the model discovery tool and does not directly affect BFE forwarding target addresses. The system no longer allows configuring `headers.Authorization` in `model_endpoint`; when calling the model discovery API, the authentication header style is determined automatically by `model_protocols`: `openai` uses `Authorization: Bearer {apikey}`, and `anthropic` uses `x-api-key: {apikey}`.
+`model_endpoint` is used to call the third-party platform's model list API and contains two fields, `schema` and `uri`. The default value of `schema` is `https`, and `http` is also allowed; the default value of `uri` is `/v1/models` (or `/v1beta/models` for the `gemini` protocol), which must be non-empty and start with `/`. This endpoint is mainly used by the model discovery tool and does not directly affect BFE forwarding target addresses. The system no longer allows configuring `headers.Authorization` in `model_endpoint`; when calling the model discovery API, the authentication header style is determined automatically by `model_protocols`: `openai` uses `Authorization: Bearer {apikey}`, `anthropic` uses `x-api-key: {apikey}`, and `gemini` uses `x-goog-api-key: {apikey}`.
 
 ### Model List
 
@@ -109,20 +203,21 @@ Example request body:
 }
 ```
 
-At execution time, if `uri` is empty, `/v1/models` is used by default; the system generates the corresponding authentication header based on `model_protocol`, calls `{schema}://{addr}:{port}{uri}`, and uses the corresponding protocol parser to extract the list of model names. The result is a string array that can be copied directly into the Provider's `models` field. This API is a stateless tool and does not modify the Provider directly; to backfill, you must call `PATCH /v1/providers/{provider_name}` to write `models`.
+At execution time, if `uri` is empty, `/v1/models` is used by default (`/v1beta/models` for the `gemini` protocol); the system generates the corresponding authentication header based on `model_protocol` (`openai` uses `Authorization: Bearer`, `anthropic` uses `x-api-key`, and `gemini` uses `x-goog-api-key`), calls `{schema}://{addr}:{port}{uri}`, and uses the corresponding protocol parser to extract the list of model names. The result is a string array that can be copied directly into the Provider's `models` field. This API is a stateless tool and does not modify the Provider directly; to backfill, you must call `PATCH /v1/providers/{provider_name}` to write `models`. The "Get" button in the Dashboard creation drawer simply wraps this API, using the current form context (protocol, instance pool, model list path, and first Key) to fetch and backfill.
 
 ## Supported Model Protocols
 
-A Provider declares the supported model access protocols via the `model_protocols` field. The enum values in the first phase include:
+A Provider declares the supported model access protocols via the `model_protocols` field. The current enum values include:
 
-| Enum Value | Description |
-|--------|------|
-| `openai` | OpenAI-compatible protocol, including most domestic Chinese compatible platforms |
-| `anthropic` | Anthropic Claude Messages API |
+| Enum Value | Description | Model Discovery Auth Header | Default Model List API Path |
+|--------|------|----------------|----------------------|
+| `openai` | OpenAI-compatible protocol, including most domestic Chinese compatible platforms | `Authorization: Bearer {apikey}` | `/v1/models` |
+| `anthropic` | Anthropic Claude Messages API | `x-api-key: {apikey}` | `/v1/models` |
+| `gemini` | Google Gemini API | `x-goog-api-key: {apikey}` | `/v1beta/models` |
 
-A Provider can support multiple protocols at the same time; for example, an aggregation platform can be configured with `["openai", "anthropic"]`, but at least one protocol is required.
+A Provider can support multiple protocols at the same time; for example, an aggregation platform can be configured with `["openai", "anthropic"]`, but at least one protocol is required. The `gemini` protocol has two special properties: first, the default path of its model discovery API is `/v1beta/models`; second, `protocol_paths` does not support path rewriting for `gemini` (its native paths are already the standard paths and work in pass-through mode). See "Protocol Path Configuration (protocol_paths)" below for details.
 
-`model_protocols` affects the forwarding behavior of the BFE Data Plane. For authentication header injection, `openai` uses `Authorization: Bearer` and `anthropic` uses `x-api-key`; Claude requests also require injecting `anthropic-version`. Usage parsing handles different response formats by protocol style—for example, the OpenAI-style `usage` field and the Claude-style `usage` field have different structures. Protocol matching validation checks whether the request's protocol style is in the `model_protocols` of the Provider corresponding to the target Cluster; if not, the request is rejected directly. When the Control Plane generates the BFE configuration, it passes `provider.model_protocols` through to `AIConf.ModelProtocols` for the Data Plane to use.
+`model_protocols` affects the forwarding behavior of the BFE Data Plane. For authentication header injection, `openai` uses `Authorization: Bearer`, `anthropic` uses `x-api-key`, and `gemini` uses `x-goog-api-key`; Claude requests also require injecting `anthropic-version`. Usage parsing handles different response formats by protocol style—for example, the OpenAI-style `usage` field and the Claude-style `usage` field have different structures. Protocol matching validation checks whether the request's protocol style is in the `model_protocols` of the Provider corresponding to the target Cluster; if not, the request is rejected directly. When the Control Plane generates the BFE configuration, it passes `provider.model_protocols` through to `AIConf.ModelProtocols` for the Data Plane to use.
 
 ## Protocol Path Configuration (protocol_paths)
 
@@ -141,7 +236,7 @@ Different providers use different upstream path prefixes, and different protocol
 
 Configuration constraints:
 
-- The key must be `openai` or `anthropic` already declared in the Provider's `model_protocols`; paths cannot be configured for undeclared protocols.
+- The key must be `openai` or `anthropic` already declared in the Provider's `model_protocols`; paths cannot be configured for undeclared protocols; `gemini` does not support path rewriting and cannot be used as a key.
 - The value must start with `/`, must not end with `/`, must not contain `..`/`?`/`#`, and must be no longer than 128 characters.
 - Omitting the field means it is disabled and request paths are forwarded unchanged.
 - PATCH updates follow the partial-update convention: omitting the field keeps the current value; explicitly passing `null` clears it (restoring pass-through).
@@ -150,6 +245,7 @@ Forwarding behavior (see `rewriteUpstreamPath` in `bfe/bfe_server/ai_path_rewrit
 
 - openai protocol: client entries with or without the `/v1` prefix can both be rewritten. An optional `/v1` prefix is stripped first, and the path is rewritten only when it hits the `bfe_basic` shared endpoint table (`openAIEndpointModes` in `bfe/bfe_basic/openai_endpoint.go`, 13 endpoints): both `/v1/chat/completions` and `/chat/completions` are rewritten to `{openai value}/chat/completions`, and `/v1` or `/v1/` is rewritten to the `{openai value}` itself. Custom paths that miss the endpoint table are forwarded unchanged, remaining compatible with existing clients.
 - anthropic protocol: only the standard entry `/v1/...` is rewritten (`/v1/messages` -> `{anthropic value}/v1/messages`); non-standard entries are forwarded unchanged. When no path is configured for the protocol, no rewrite occurs.
+- gemini protocol: never rewritten. `ProtocolPaths` only allows `openai`/`anthropic` as valid keys, and gemini native paths (e.g. `/v1beta/models/gemini-2.5-flash:generateContent`) are always passed through.
 
 Caveats:
 
@@ -273,7 +369,7 @@ The configuration ultimately received by BFE is generated automatically by the C
 
 ### 1. "instance_pool invalid" when creating a Provider
 
-Check whether at least one instance is filled in; whether `(addr, port)` is duplicated; and whether at least one instance has `weight > 0`.
+Check whether at least one instance is filled in; whether IPs are duplicated across instances in IP Mode; whether the port is in the 1–65535 range; whether weights are between 0 and 100 and the weights of all instances sum to 100 (in Provider Domain Mode the weight is fixed at 100 and not subject to this constraint); and whether at least one instance has `weight > 0`.
 
 ### 2. 409 returned when updating a Provider's Keys or Models
 
@@ -285,7 +381,7 @@ The Provider is still referenced by at least one Cluster. Delete or modify the C
 
 ### 4. Model discovery returns an empty list or an error
 
-Check whether `model_protocol` matches the actual platform; whether `addr`, `port`, and `uri` are correct; and whether `apikey` is valid. For the Claude platform, confirm that `model_protocol` is set to `anthropic`.
+Check whether `model_protocol` matches the actual platform; whether `addr`, `port`, and `uri` are correct; and whether `apikey` is valid. For the Claude platform, confirm that `model_protocol` is set to `anthropic`; for the Google Gemini platform, choose `gemini` (the model discovery default path is `/v1beta/models` and the authentication header is `x-goog-api-key`). If clicking "Get" does not respond, first check whether the instance address, port, protocol, and Key are correct, and whether BFE / the API Server can reach that backend.
 
 ### 5. Forwarding fails after a Cluster references a Provider
 
@@ -342,6 +438,20 @@ curl -X POST https://control-plane.example.com/v1/providers/tools/discover-model
   }'
 ```
 
+Example with the `gemini` protocol (when `uri` is left empty, `/v1beta/models` is used by default and the `x-goog-api-key` authentication header is used automatically):
+
+```bash
+curl -X POST https://control-plane.example.com/v1/providers/tools/discover-models \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_protocol": "gemini",
+    "schema": "https",
+    "addr": "generativelanguage.googleapis.com",
+    "port": 443,
+    "apikey": "AIzaSyaaaaaaaaaaaa"
+  }'
+```
+
 ### Cluster TOML Semantics Illustration
 
 ```toml
@@ -370,12 +480,14 @@ A Cluster does not declare `instance_pool`, `model_endpoint`, or `provider_type`
 
 The Provider is the core resource in the Control Plane of the Rainway AI Gateway for describing downstream model providers. After the responsibilities of Provider and Cluster are separated, the Cluster focuses on forwarding policies while the Provider focuses on access information, improving configuration reusability, security, and maintainability.
 
-Key points of this chapter: the data model and field meanings of the Provider; the flows for creating and updating Providers via the Dashboard and OpenAPI; the configuration methods and constraints of the model endpoint, model list, and Provider Keys; using the stateless model discovery tool `/providers/tools/discover-models`; the configuration methods, constraints, and forwarding behavior of the `protocol_paths` protocol path mapping; the impact of the `openai` and `anthropic` protocols on authentication headers, version headers, usage parsing, and protocol matching; the process and caveats of batch-importing model pricing via `model-list.yaml`; the price fields for image input tokens and per-video billing, and the `responses` and `video_generation` billing modes; the strong reference relationship between Provider and Cluster and the synchronization and conflict handling during changes; and troubleshooting ideas for common issues plus configuration examples.
+Key points of this chapter: the data model and field meanings of the Provider; the flows for creating and updating Providers via the Dashboard and OpenAPI (the Dashboard drawer's five sections: Basic Information, Instance Pool, Model Service Configuration, Protocol Path Mapping, and Service Authentication Keys); the differences and weight constraints between the instance pool IP Mode and Provider Domain Mode; the configuration methods and constraints of the model endpoint, model list, and Provider Keys; using the stateless model discovery tool `/providers/tools/discover-models`; the common operations on the provider list, including querying model prices, viewing details, tiered pricing configuration (peak time ranges, IANA time zone, left-closed right-open matching), and deletion; the configuration methods, constraints, and forwarding behavior of the `protocol_paths` protocol path mapping; the impact of the `openai`, `anthropic`, and `gemini` protocols on authentication headers, version headers, usage parsing, and protocol matching; the process and caveats of batch-importing model pricing via `model-list.yaml`; the price fields for image input tokens and per-video billing, and the `responses` and `video_generation` billing modes; the strong reference relationship between Provider and Cluster and the synchronization and conflict handling during changes; and troubleshooting ideas for common issues plus configuration examples.
 
 Properly planning the separation of Provider and Cluster is an important prerequisite for subsequent route rules, API-Key quotas, and rate limiting policies to take effect. It is recommended that in production you first maintain Providers and model prices in a unified way, and then create Clusters for different business lines as needed. Regularly comparing the provider lists returned by `/providers` and `/model-prices/actions/get-providers` helps promptly detect and backfill cases where price records drift from actual Providers, ensuring accurate cost accounting.
 
 ## References
 
+- `ai-gateway-web/docs/zh-cn/03-model-provider.md` (Dashboard model provider user manual, the authoritative basis for the console content in this chapter)
+- `ai-gateway-web/docs/zh-cn/06-model-prices.md` (Dashboard model pricing user manual)
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/providers.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/model-prices.md`
 - `ai-gateway-api/design-docs/sys-design/details/provider与cluster概念分离.md`

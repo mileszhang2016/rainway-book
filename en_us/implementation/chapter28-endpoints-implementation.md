@@ -12,7 +12,7 @@ Through this chapter, readers will understand the actual code organization of th
 - The concrete implementations of parameter binding, permission validation, and the unified response format in the interface layer;
 - Complete Action examples for one OpenAPI endpoint and one InnerAPI endpoint.
 
-For the design background on the Control Plane's three-layer architecture and the responsibility division between OpenAPI and InnerAPI, see [Chapter 6: Control Plane Core Design: AI Gateway API](../design/chapter06-control-plane-design.md); for the InnerAPI incremental export and version control mechanism, see [Chapter 21: Config Export and Version Control Design](../design/chapter14-config-export-and-version-control.md).
+For the design background on the Control Plane's three-layer architecture and the responsibility division between OpenAPI and InnerAPI, see [Chapter 6: Control Plane Core Design: AI Gateway API](../design/chapter06-control-plane-design.md); for the InnerAPI incremental export and version control mechanism, see [Chapter 14: Config Export and Version Control Design](../design/chapter14-config-export-and-version-control.md).
 
 ---
 
@@ -679,7 +679,7 @@ func exportActionProcess(req *http.Request) (interface{}, error) {
 }
 ```
 
-Internally, `APIKeyRuleManager.ConfigExport` calls `VersionControlManager.ExportConfig`, computes the MD5 signature of the configuration data, and compares it with the `config_versions` table: if the configuration has not changed, it returns `Data: nil` and Conf Agent will not trigger a BFE hot reload; if it has changed, it returns the full configuration with a new version number. For more details, see [Chapter 21: Config Export and Version Control Design](../design/chapter14-config-export-and-version-control.md).
+Internally, `APIKeyRuleManager.ConfigExport` calls `VersionControlManager.ExportConfig`, computes the MD5 signature of the configuration data, and compares it with the `config_versions` table: if the configuration has not changed, it returns `Data: nil` and Conf Agent will not trigger a BFE hot reload; if it has changed, it returns the full configuration with a new version number. For more details, see [Chapter 14: Config Export and Version Control Design](../design/chapter14-config-export-and-version-control.md).
 
 ---
 
@@ -738,4 +738,4 @@ The following table summarizes the core code locations covered in this chapter a
 - `ai-gateway-api/endpoints/innerapi_v1/quota_reset/quota_reset.go`
 - `ai-gateway-api/endpoints/innerapi_v1/mod_api_key/export.go`
 - [Chapter 6: Control Plane Core Design: AI Gateway API](../design/chapter06-control-plane-design.md)
-- [Chapter 21: Config Export and Version Control Design](../design/chapter14-config-export-and-version-control.md)
+- [Chapter 14: Config Export and Version Control Design](../design/chapter14-config-export-and-version-control.md)
