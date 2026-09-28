@@ -216,6 +216,8 @@ func extractUsageFields(data []byte) modelprotocol.UsageFields {
 
 这种分层 fallback 使得网关无需为每个模型单独配置字段映射，只要模型遵循主流约定即可自动识别。
 
+流式场景下，"终止事件"与"最终 usage 事件"的识别规则也收敛在协议适配层（`bfe_model_protocol` 各适配器的 `IsStreamTerminal` / `IsFinalUsageEvent`）：openai 适配器的最终 usage 事件识别为 Anthropic `message_delta`（与非流式顶层类型 `message`、无类型的 `include_usage` chunk、Responses API `response.completed` 并列）——因此跨协议流（以 Bearer 认证被识别为 openai、后端却返回 Anthropic 风格响应体）不会丢失最终 usage 而被少计费；终止事件识别同样覆盖 Anthropic `message_stop` 与 Responses API `response.completed`。真正遵循 OpenAI 协议的流不受影响。
+
 ### 提取规则要点
 
 | 字段 | 来源 | 说明 |

@@ -207,7 +207,7 @@ type BfeModule interface {
 }
 ```
 
-`bfe_module/bfe_callback.go` 定义了 9 个回调点：
+`bfe_module/bfe_callback.go` 定义了 10 个回调点：
 
 ```go
 // bfe/bfe_module/bfe_callback.go
@@ -217,6 +217,7 @@ const (
     HandleBeforeLocation
     HandleFoundProduct
     HandleAfterLocation
+    HandleAfterAITargetModel
     HandleForward
     HandleReadResponse
     HandleRequestFinish
@@ -227,6 +228,7 @@ const (
 AI 网关常用回调点为：
 
 - `HandleFoundProduct`：用于认证、路由选择；
+- `HandleAfterAITargetModel`：用于目标模型解析后、转发前的模型白名单校验与限流（按集群 attempt 触发）；
 - `HandleReadResponse`：用于解析后端响应体；
 - `HandleRequestFinish`：用于请求结束时扣减配额。
 

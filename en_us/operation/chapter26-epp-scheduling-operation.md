@@ -19,7 +19,7 @@ For the working principles and design semantics of EPP scheduling, see [Chapter 
 
 Before using EPP intelligent scheduling, confirm that the following components are installed and running with the deployment:
 
-- **ai-gateway-epp (EPP component)**: deployed by instance group; 2 instances per group in production (primary/standby for each other), single-instance groups allowed in test environments. Instances run with command-line parameters; the key parameters are as follows:
+- **ai-gateway-epp (EPP component)**: deployed by instance group, with 1–2 instances per group: 2 instances per group in production (primary/standby for each other), and single-instance groups allowed in test environments (primary only, no standby). Groups with more than 2 instances are rejected with 422 during `/epp-pool` validation. Instances run with command-line parameters; the key parameters are as follows:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -33,6 +33,9 @@ Before using EPP intelligent scheduling, confirm that the following components a
 | `-metrics-port` | `9090` | Prometheus metrics port |
 | `-grpc-tls-cert` / `-grpc-tls-key` | empty (plaintext) | Server-side TLS certificate for ext_proc and health gRPC; recommended in production, verified on the BFE side with `EPPTLS.CAFile` |
 | `-refresh-metrics-interval` | `50ms` | Scrape interval for backend `/metrics` metrics |
+| `-local-config-dir` | Environment variable `AI_GATEWAY_EPP_LOCAL_CONFIG_DIR` (empty by default) | When non-empty, cluster-level scheduling configs are loaded from local JSON files (`cluster_table.json`, `epp_data_config.json`) instead of InnerAPI, for local debugging and integration testing. The files are re-read every polling cycle and changes take effect in the next cycle (no restart needed); a missing file or invalid JSON keeps the last successfully loaded configuration |
+
+Release binaries can be cross-compiled and packaged as linux/amd64 and linux/arm64 tarballs via `make release` in the `ai-gateway-epp` repository.
 
 - **BFE**: accesses EPP via `GslbBasic.BalanceMode=EPP` and the ordered `EPPAddr=[primary,standby]`; the related configuration is automatically distributed by AI Gateway API via server_data_conf, and hot-loaded by Conf Agent — no manual editing is needed.
 - **AI Gateway API**: OpenAPI and InnerAPI running normally; EPP instances poll `epp_data` and `cluster_table` via InnerAPI, with authentication and version-increment mechanisms consistent with other Data Plane components.
@@ -86,7 +89,7 @@ Validation rules:
 - Instance `id` is non-empty and globally unique within the pool (EPP matches this value with `-instance-id`);
 - `host` is a Hostname or IP (IPv6 literals without brackets), `port` is a valid port;
 - `(host, port)` combinations are globally unique within the pool;
-- Exactly 2 instances per group in production (primary/standby); single-instance groups allowed in test environments (primary only, no standby).
+- 1–2 instances per group (2 instances per group in production as primary/standby; single-instance groups allowed in test); groups with more than 2 instances are rejected with 422.
 
 ---
 
@@ -269,6 +272,7 @@ Export semantics: `BalanceMode=WRR` with empty `EPPAddr`; epp_config and assignm
 | Degraded export | AI Gateway API error logs | When an EPP-mode Cluster has no valid assignment, an error-level log is output (including Cluster name and reason), and the export degrades that Cluster to `BalanceMode=WRR` | Alert on any error log; pair with `unassigned_clusters` inspection |
 | BFE EPP calls | BFE monitoring port `/monitor/epp_metrics` | `epp_calls_total{cluster,result}` (result ∈ ok/no_pool/unknown_pool/draining/transport), `epp_fallback_local_total{cluster}`, `epp_failover_total{cluster}`, `epp_failback_total{cluster}`, `epp_active_addr_index{cluster}` | A surge of `epp_calls_total{result!="ok"}`, failover counter growth, or sustained growth of `epp_fallback_local_total` all indicate EPP path anomalies |
 | EPP instances | EPP `/metrics` (default `:9090`) | `ai_epp_assignment_no_match` (this instance has no role in the assignment), `ai_epp_poller_failures_total` / `ai_epp_poller_backoff_state` (polling failures and backoff), `ai_epp_engine_reloads_total` (engine hot reloads), `ai_epp_cell_state` (Cell role and state) | `assignment_no_match=1` means `-instance-id` is inconsistent with `/epp-pool`; check the deployment; persistently non-zero poller failures mean the Control Plane is unreachable |
+| Request correlation | EPP logs (demux) | EPP logs carry an `x-request-id`: demux reads it from the headers of the first ext_proc message (passing through the value injected by the gateway) and, when absent, generates a UUID and writes it back into the headers; the llm-d engine logs use the same request ID | When troubleshooting, correlate the BFE → EPP → llm-d engine logs of a single request by `x-request-id` |
 
 To determine whether a request actually went through EPP scheduling (rather than the fallback WRR): BFE's silent fallback for EPP failures also returns 200, so the criterion should be whether `epp_calls_total{result="ok"}` grows, not the response code alone.
 
@@ -282,7 +286,7 @@ To determine whether a request actually went through EPP scheduling (rather than
 - Instance ids non-empty and globally unique within the pool;
 - `host` is a Hostname or IP, `port` is a valid port;
 - `(host, port)` globally unique within the pool;
-- Exactly 2 instances per group in production; single-instance groups allowed in test.
+- 1–2 instances per group (production: 2 instances per group as primary/standby; test: single-instance groups allowed); more than 2 instances per group returns 422.
 
 **`/clusters` (balance_mode and epp_config)**
 
@@ -310,7 +314,7 @@ To determine whether a request actually went through EPP scheduling (rather than
 - Draining a backend = setting the Provider instance `weight=0`; removal takes effect within seconds in the cluster_table export and EPP discovery; taking EPP instances online/offline = modifying `/epp-pool`, with dangling assignments repaired automatically.
 - EPP instance failures are switched with hysteresis by BFE `EPPCheck`; the standby does not automatically take over scheduling, and fallback traffic is carried by BFE's local WRR; on full overload EPP has no candidate and BFE falls back, business uninterrupted.
 - Disabling EPP scheduling only requires `balance_mode=WRR`; epp_config and assignments remain dormant and can be switched back.
-- Observability covers three layers: AI Gateway API error logs (degraded export), BFE `/monitor/epp_metrics` (`epp_calls_total` / `epp_fallback_local_total`), and EPP `/metrics` (`ai_epp_assignment_no_match`, etc.).
+- Observability covers three layers: AI Gateway API error logs (degraded export), BFE `/monitor/epp_metrics` (`epp_calls_total` / `epp_fallback_local_total`), and EPP `/metrics` (`ai_epp_assignment_no_match`, etc.); EPP logs carry an `x-request-id` so the BFE → EPP → llm-d engine logs of a request can be correlated by request ID.
 
 ---
 
@@ -324,5 +328,6 @@ To determine whether a request actually went through EPP scheduling (rather than
 - `ai-gateway-api/design-docs/modifications/2026-09-08-epp-scheduling-integration/api-changes.md`
 - `ai-gateway-api/design-docs/sys-design/details/EPP调度对接.md`
 - `ai-gateway-epp/cmd/epp/config.go`
+- `ai-gateway-epp/docs/zh_cn/modifications/2026-09-14-local-config-file/design.md`
 - `integration-test/test-cases/测试设计文档/scenario-SC28-EPP调度端到端/场景说明.md`
 - [Chapter 16 EPP Scheduling Design](../design/chapter16-epp-scheduling-design.md)

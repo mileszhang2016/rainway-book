@@ -130,7 +130,7 @@ BFE 收到重载请求后，会重新读取对应模块的配置文件并更新�
 
 ### tls_conf 版本化热加载与 client CA/CRL 重定位
 
-Conf Agent 下发 TLS 配置采用"版本目录 + 符号链接"方式：它将新版本配置（含 `client_ca`、`client_crl` 等目录的完整副本）写入版本目录 `tls_conf_<version>`，然后先调用 `GET /reload/tls_conf?path=tls_conf_<version>`，让 BFE 在符号链接切换**之前**对版本目录这份自包含配置做一次完整加载校验；仅当 BFE 返回成功后，Conf Agent 才切换 `tls_conf` 软链接并清理过期版本。
+Conf Agent 下发 TLS 配置采用"版本目录 + 符号链接"方式：它将新版本配置（含 `client_ca`、`client_crl` 等目录的完整副本，目录项递归复制并保持相对目录结构）写入版本目录 `tls_conf_<version>`，然后先调用 `GET /reload/tls_conf?path=tls_conf_<version>`，让 BFE 在符号链接切换**之前**对版本目录这份自包含配置做一次完整加载校验；仅当 BFE 返回成功后，Conf Agent 才切换 `tls_conf` 软链接并清理过期版本。
 
 `TLSConfReload` 会把版本目录中的全部依赖（`server_cert_conf` / `tls_rule_conf` 以及 client CA/CRL 基目录）都随 `path` 一起重定位到版本目录：client CA/CRL 基目录如果仍从已激活目录 `<confRoot>/tls_conf/client_ca|crl` 读取，当变更涉及"仅存在于版本目录、激活目录中不存在"的 client CA 时，reload 会在 `ClientCALoad` 阶段报"找不到 CA 文件"，Conf Agent 因此无法完成本次切换，后续 reload 也会以同样原因失败。因此重定位是版本目录自包含校验的必要条件。
 
@@ -171,6 +171,15 @@ cat /home/work/bfe/conf/mod_ai_token_auth_20260102120000/token_rule.data | head 
 ```
 
 输出中应包含 `"version": "20260102120000"` 字样。
+
+### 4. 识别 reload 循环卡死
+
+Conf Agent 对每一次失败的 reload 都会累计连续失败计数；当同一 Reloader 的 store（`StoreFile2TmpDir`，写版本目录/软链切换）或 trigger（`TriggerBFEReload`，调用 BFE `/reload`）阶段持续失败时，每累计 10 次会输出一条 `reload keeps failing` 汇总 ERROR，包含 stage、连续失败次数与版本号，并指明"symlink not switched, bfe still runs old config"——即软链接未切换、BFE 仍在运行旧配置。看到该日志说明 reload 循环已卡死，应按 stage 字段定位：
+
+- `stage=StoreFile2TmpDir`：检查 BFE 配置目录的磁盘空间与写权限、是否残留未带 `.conf-agent-version` 标记的半成品目录；
+- `stage=TriggerBFEReload`：检查 BFE 监控端口（默认 8421）是否可达，以及 BFE 侧 reload 校验报错（如 TLS 配置关联检查失败）。
+
+对应阶段修复后，reload 成功一次即会输出 `reload recovered` 并重置计数。
 
 ---
 
@@ -227,6 +236,13 @@ ALTER TABLE users DROP COLUMN `roles`;
 
 ALTER TABLE users DROP INDEX name_uni;
 ALTER TABLE users ADD UNIQUE KEY `name_uni` (`name`, `type`);
+```
+
+再如升级到 v0.0.10 时，存量库需要对 Entity 与 Provider 表补充以下列：
+
+```sql
+ALTER TABLE entities ADD COLUMN description VARCHAR(255) NOT NULL DEFAULT '';
+ALTER TABLE providers ADD COLUMN protocol_paths JSON;
 ```
 
 升级前务必：
@@ -330,7 +346,7 @@ ls -l mod_ai_token_auth
 - `VersionControlManager` 基于 MD5 签名与 `config_versions` 表实现增量同步；配置未变化时返回 `Data: null`，避免无意义的配置下发。
 - Conf Agent 的每个 `Reloader` 由 prober、file_store、trigger 三部分组成，分别负责拉取、持久化与触发 BFE 热加载。
 - BFE 通过监控端口的 `/reload/{module}` 接口完成热加载，各模块对应独立的热加载路径；`TLSConfReload` 会把 client CA/CRL 基目录随 `?path=` 版本目录重定位，保证版本目录自包含校验可通过。
-- 生效版本可通过 Conf Agent 日志、软链接指向或配置文件中的 `version` 字段查看。
+- 生效版本可通过 Conf Agent 日志、软链接指向或配置文件中的 `version` 字段查看；连续 reload 失败时每 10 次输出的 `reload keeps failing` 汇总 ERROR（含 stage 字段）是识别 reload 循环卡死的信号。
 - 版本回滚可利用 Conf Agent 保留的历史版本目录手动切换软链接并重新加载，无需重启 BFE。
 - 升级时需按顺序执行数据库迁移、AI Gateway API 替换、Dashboard 升级与 Conf Agent 配置检查，并注意鉴权头与配置字段的兼容性。
 

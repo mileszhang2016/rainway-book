@@ -207,7 +207,7 @@ type BfeModule interface {
 }
 ```
 
-`bfe_module/bfe_callback.go` defines 9 callback points:
+`bfe_module/bfe_callback.go` defines 10 callback points:
 
 ```go
 // bfe/bfe_module/bfe_callback.go
@@ -217,6 +217,7 @@ const (
     HandleBeforeLocation
     HandleFoundProduct
     HandleAfterLocation
+    HandleAfterAITargetModel
     HandleForward
     HandleReadResponse
     HandleRequestFinish
@@ -227,6 +228,7 @@ const (
 The callback points commonly used by the AI gateway are:
 
 - `HandleFoundProduct`: used for authentication and route selection;
+- `HandleAfterAITargetModel`: used for the model allowlist check and rate limiting after the target model is resolved and before forwarding (fired per cluster attempt);
 - `HandleReadResponse`: used for parsing backend response bodies;
 - `HandleRequestFinish`: used for deducting quota when a request finishes.
 

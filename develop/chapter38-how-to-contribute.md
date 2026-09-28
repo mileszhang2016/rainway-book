@@ -70,17 +70,21 @@ make
 
 ## 代码获取与仓库结构
 
-壬远AI网关由多个仓库组成，贡献者通常需要关注以下三个核心仓库：
+壬远AI网关由多个仓库组成，贡献者通常需要关注以下核心仓库：
 
 | 仓库 | 角色 | 主要变更场景 |
 |---|---|---|
 | `rainway-ai-gateway/ai-gateway-api` | 控制面（Control Plane） | API、业务模型、配置导出、版本控制 |
 | `bfenetworks/bfe` | 数据面（Data Plane） | 流量转发、AI 路由、Token 认证、限流模块 |
 | `bfenetworks/conf-agent` | 配置拉取代理 | 热加载配置、下发配置到 BFE |
+| `rainway-ai-gateway/log-reader` | 访问日志采集 | 消费 BFE 访问日志，经 `mod_kafka` / `mod_log_mysql` 写入 Kafka / MySQL |
+| `rainway-ai-gateway/ai-gateway-observability` | 报表可观测部署配置 | Doris 库表、Routine Load / INSERT JOB 与 Grafana 数据源、Dashboard 的部署脚本和配置 |
+
+访问日志字段的跨仓库联动遵循固定流程：`bfe-access-pb` 协议字段或 log-reader 解析字段变更后，需运行 `ai-gateway-observability` 仓库的 `skills/gen-req-log-api` 重新生成 `api/depends_api/req_log.md`（PB 字段 → log-reader JSON 字段的权威映射），再据其驱动 Doris 表结构与 Grafana Dashboard 的 schema 更新。
 
 ### Fork 与 Clone
 
-三个仓库均采用 [Git Flow 分支模型](http://nvie.com/posts/a-successful-git-branching-model/)，日常开发在 `develop` 分支进行。贡献者应先 Fork 官方仓库，再 Clone 自己的 Fork：
+上述仓库均采用 [Git Flow 分支模型](http://nvie.com/posts/a-successful-git-branching-model/)，日常开发在 `develop` 分支进行。贡献者应先 Fork 官方仓库，再 Clone 自己的 Fork：
 
 ```bash
 git clone https://github.com/your-github-account/ai-gateway-api
@@ -462,7 +466,7 @@ BFE 还要求提交带 `Signed-off-by:` 签名，以确认贡献者接受 [Devel
 
 ## 提交信息规范与 PR 流程
 
-三个核心仓库的 `CONTRIBUTING.md` 均采用 Git Flow 分支模型，PR 流程相似。本节以 `ai-gateway-api` 为例说明。
+核心仓库的 `CONTRIBUTING.md` 均采用 Git Flow 分支模型，PR 流程相似。本节以 `ai-gateway-api` 为例说明。
 
 ### 本地工作流
 
@@ -513,7 +517,7 @@ AI 网关功能通常同时涉及控制面、数据面与配置下发。贡献�
 1. **先在 `ai-gateway-api` 完成设计文档**：`design-docs/modifications/`、`api-define/`、`sys-design/`。
 2. **同步更新 BFE 配置格式**：若导出给数据面的 JSON/TOML 结构变化，需同步修改 `bfe/` 中对应模块的配置解析。
 3. **同步更新 Conf Agent**：若配置下发路径或版本号规则变化，需在 `conf-agent/` 中同步。
-4. **分别提交 PR**：每个仓库独立 PR，PR 描述中相互引用（如 `Depends on rainway-ai-gateway/ai-gateway-api#123`）。
+4. **分别提交 PR**：每个仓库独立 PR，PR 描述中相互引用（如 `Depends on rainway-ai-gateway/ai-gateway-api#<编号>`）。
 5. **统一 reviewer**：跨仓库变更建议找同一位或同一组 reviewer，保证设计一致性。
 
 跨仓库变更最容易出现的问题包括：控制面导出的字段名与数据面解析不一致、版本号或配置路径改动后 Conf Agent 无法识别、以及错误码或默认值在两个仓库中语义不同。设计阶段应在 `design-changes.md` 中明确数据面消费的配置格式与版本策略，并在 PR 中提供端到端验证方案。

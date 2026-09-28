@@ -216,6 +216,8 @@ The composed extraction logic forms a "priority + fallback" strategy to accommod
 
 This layered fallback allows the gateway to identify usage automatically as long as a model follows mainstream conventions, without configuring a field mapping per model.
 
+In streaming scenarios, the recognition of "termination events" and "final usage events" is also converged in the protocol adapter layer (`IsStreamTerminal` / `IsFinalUsageEvent` of each adapter in `bfe_model_protocol`): the openai adapter's final-usage-event recognition includes the Anthropic `message_delta` (alongside the non-streaming top-level type `message`, the type-less `include_usage` chunk, and the Responses API `response.completed`) — so a cross-protocol stream (a request authenticated as openai via Bearer while the backend answers with an Anthropic-style response body) does not lose its final usage and get undercharged; termination-event recognition likewise covers the Anthropic `message_stop` and the Responses API `response.completed`. Streams that genuinely follow the OpenAI protocol are unaffected.
+
 ### Key Extraction Rules
 
 | Field | Source | Description |

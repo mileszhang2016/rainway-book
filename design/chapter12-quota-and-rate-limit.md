@@ -275,7 +275,7 @@ TPM 与 RPM 规则以 JSON 数组形式存储在 `tpm_configs` 与 `rpm_configs`
 }
 ```
 
-`model` 支持具体模型名或通配符 `*`，未命中具体模型时使用默认限制。`name` 在同一策略内唯一且创建后不可修改，是规则导出的稳定标识。
+`model` 支持具体模型名或通配符 `*`，未命中具体模型时使用默认限制。`name` 在同一策略内唯一，是规则导出与 Redis Key 的标识。
 
 ### 校验规则
 
@@ -284,7 +284,7 @@ TPM 与 RPM 规则以 JSON 数组形式存储在 `tpm_configs` 与 `rpm_configs`
 - `name` 在 `product_name` 内唯一；
 - `max_concurrency` 必须 ≥ 0；
 - 每条规则的 `name` 必填、非空、长度 1-128 字符，字符集限制为 `[a-zA-Z0-9_-]`；
-- `name` 在同一策略内唯一且不可修改；
+- `name` 在同一策略内唯一；重命名一条规则等价于删除旧规则并新增规则（见下文“Redis Key 稳定性”）；
 - `model` 不能为空，`limit` 必须 ≥ 0。
 
 ---
@@ -300,7 +300,7 @@ API-Key 与 Entity 均通过 `rate_limit_policy_id` 字段引用限流策略：
 | 表 | `quota_plans` | `rate_limit_policies` |
 | 引用字段 | `quota_plan_id` | `rate_limit_policy_id` |
 | 层级合并 | 收集所有层级 QuotaPlan | 收集所有层级 Policy ID |
-| 导出 Redis Key | `QUOTA_xxx` | `RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>` |
+| 导出 Redis Key | `QUOTA_xxx` | `default_bfe_rlp-<id>_RL_TPM_rlp-<id>_<name>` / `default_bfe_rlp-<id>_RL_RPM_rlp-<id>_<name>` |
 | 余额同步 | 有 | 无 |
 
 ### Entity 层级向上合并
@@ -335,14 +335,18 @@ func (m *RateLimitPolicyManager) fetchEntityRateLimitPolicyIDs(ctx context.Conte
 
 ### Redis Key 稳定性
 
-为了消除"改名/改 model 导致计数器重置"的问题，控制面在导出时为每条规则生成稳定的 Redis Key：
+控制面在导出时为每条规则生成 Redis Key，规则名是 Key 的组成部分（`model/shared/rate_limit_redis_key.go` 的 `BuildBFERateLimitRedisKey`）：
 
 ```go
-RedisKey: fmt.Sprintf("RL_RPM_rlp-%d_%d", policyID, idx)
-RedisKey: fmt.Sprintf("RL_TPM_rlp-%d_%d", policyID, idx)
+// model/shared/rate_limit_redis_key.go
+func BuildBFERateLimitRedisKey(policyID int64, ruleType string, name string) string {
+    return fmt.Sprintf("default_bfe_rlp-%d_%s_rlp-%d_%s", policyID, ruleType, policyID, name)
+}
 ```
 
-Key 基于不会随用户编辑而变化的 `(policy_id, rule_index)`，因此修改规则名或 `model` 不会重置计数器。BFE 侧优先使用配置中的 `redis_key` 构建 Redis Key；对旧配置保留按规则名兜底的兼容逻辑。
+TPM / RPM 规则分别传入 `ruleType` 为 `RL_TPM` / `RL_RPM`，`name` 为规则名，生成的 Key 形如 `default_bfe_rlp-1_RL_TPM_rlp-1_tpm_1min`。BFE 侧直接使用配置中下发的完整 `redis_key`。
+
+由于规则名直接编码在 Key 中，重命名一条规则等价于删除旧规则并新增一条规则：`DiffRateLimitRedisKeys` 按 name 比较新旧策略，被移除的旧规则 Key 会被清理，新规则使用新 Key、计数器从零开始。修改规则的 `model` 等其它字段不改变 Key，计数器不重置。
 
 ```mermaid
 flowchart TD
@@ -354,7 +358,7 @@ flowchart TD
 
     G[RateLimitPolicyGenerator] -->|收集启用策略| H[rate_limit_policies.json]
     G -->|生成 API-Key 绑定| I[api_key_rl_policy_bindings.json]
-    G -->|为每条规则生成 redis_key| J["RL_TPM_rlp-&lt;id&gt;_&lt;idx&gt;<br/>RL_RPM_rlp-&lt;id&gt;_&lt;idx&gt;"]
+    G -->|为每条规则生成 redis_key| J["default_bfe_rlp-&lt;id&gt;_RL_TPM_rlp-&lt;id&gt;_&lt;name&gt;<br/>default_bfe_rlp-&lt;id&gt;_RL_RPM_rlp-&lt;id&gt;_&lt;name&gt;"]
 
     H --> K[BFE mod_ai_rate_limit]
     I --> K
@@ -366,7 +370,7 @@ flowchart TD
 BFE 收到配置后：
 
 1. 根据 `api_key_rl_policy_bindings.json` 找到 API-Key 对应的策略列表；
-2. 请求到达时，按模型匹配 `rules.tpm` / `rules.rpm` 中的规则，优先匹配具体模型名，未命中时使用 `*` 默认限制；
+2. 请求到达时，按转发后目标模型匹配 `rules.tpm` / `rules.rpm` 中的规则，优先匹配具体模型名，未命中时使用 `*` 默认限制；
 3. 命中规则后，使用规则中的 `redis_key` 构建 Redis 计数器 key 进行限流检查；
 4. 同时检查 `max_concurrency`；
 5. 任一限制超出时返回 429 Too Many Requests。
@@ -611,7 +615,7 @@ Model 价格：
 - 多实例部署下，周期重置由 Redis 分布式锁（key `quota:reset:scheduler:lock`，TTL 5 分钟，按 TTL/3 看门狗续期，instance token 校验释放）保证仅一个实例执行；`POST /inner-api/v1/quota/trigger-reset` 可手动触发一次同等保护的周期重置。
 - `quota=0` 表示无余额计划：控制面正常计算并同步余额，数据面将其视为合法配置，命中请求返回 429 QuotaExhausted，Redis 余额 key 缺失视为耗尽而非 500。
 - `RateLimitPolicy` 提供 TPM、RPM、并发数三类限制，规则支持具体模型名或 `*` 默认匹配；导出时按 Entity 层级向上合并，生成 `rate_limit_policies.json` 与 `api_key_rl_policy_bindings.json`。
-- 控制面为每条 TPM/RPM 规则生成稳定的 Redis Key（`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`），修改规则名或 `model` 不会导致计数器重置。
+- 控制面为每条 TPM/RPM 规则按规则名生成 Redis Key（形如 `default_bfe_rlp-<id>_RL_TPM_rlp-<id>_<name>`）：重命名规则等价于删除旧规则并新增规则（计数器清零），修改 `model` 等其它字段不会重置计数器。
 - RMB 配额支持分时段定价：Provider 维护 `time_zone` 与 `tiers`，Model 维护 `tier_prices`，导出后由 BFE 根据请求时刻匹配 tier 并选择对应价格，未命中时 fallback 到默认价格。
 
 ---

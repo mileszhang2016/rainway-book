@@ -265,22 +265,44 @@ type FileStore struct {
 
 ### 写入临时版本目录
 
-`StoreFile2TmpDir` 每次都会先删除旧临时目录，再创建新版本目录 `ConfDir_{version}`，然后依次完成：
+`StoreFile2TmpDir` 每次生成新版本目录 `ConfDir_{version}` 并写入内容。版本时间戳精度为秒，跨配置同秒下发或双进程竞争时，新版本目录名可能与当前激活目录完全相同；此时**就地重建**——直接在激活目录内重写内容，绝不 `RemoveAll` 激活目录，因为它是 `CopyFiles` 静态配置可能的唯一副本。其余情况下先删除旧临时目录再重建。写入依次完成：
 
-1. 将 `CopyFiles` 从当前 `ConfDir` 递归复制到临时目录。
+1. 将 `CopyFiles` 从当前 `ConfDir` 递归复制到临时目录。**目录项保持自身条目名**：目录复制为版本目录下的同名子目录（如 tls_conf 场景下 `client_ca` / `client_crl` 子目录整体复制为版本目录下的 `client_ca/`、`client_crl/`），内容不被压扁到版本目录根——BFE 按相对路径引用这些文件，压扁会导致加载失败。
 2. 将 `prober` 返回的文件内容以格式化后的 JSON 写入临时目录。
 3. 写入 `.conf-agent-version` 标记文件，用于后续识别哪些目录是 Conf Agent 管理的版本目录。
 
+任一步失败时函数返回错误，并清理半成品的版本目录（就地重建场景除外），避免无标记的半成品目录长期堆积。
+
 ```go
-func (fileStore *FileStore) StoreFile2TmpDir(ctx context.Context, version string, files map[string][]byte) error {
+func (fileStore *FileStore) StoreFile2TmpDir(ctx context.Context, version string, files map[string][]byte) (retErr error) {
     tmpDir := fileStore.tmpDir(version)
 
-    os.RemoveAll(tmpDir)
-    os.MkdirAll(tmpDir, os.ModePerm)
+    // 目标恰为当前激活目录时就地重建，绝不 RemoveAll 激活目录
+    activeTarget, evalErr := filepath.EvalSymlinks(fileStore.ConfDir)
+    absTmp, absErr := filepath.Abs(tmpDir)
+    inPlace := evalErr == nil && absErr == nil && activeTarget == absTmp
+    if !inPlace {
+        os.RemoveAll(tmpDir)
+        os.MkdirAll(tmpDir, os.ModePerm)
+    }
+
+    // store 失败时清理半成品目录（激活目录除外）
+    defer func() {
+        if retErr != nil && !inPlace {
+            os.RemoveAll(tmpDir)
+        }
+    }()
 
     for _, copyFile := range fileStore.CopyFiles {
         file := filepath.Join(fileStore.ConfDir, copyFile)
-        xfile.FileCopyRecursive(file, tmpDir)
+        // 目录项复制到 tmpDir/<name>，保持相对目录结构
+        target := tmpDir
+        if info, err := os.Stat(file); err == nil && info.IsDir() {
+            target = filepath.Join(tmpDir, copyFile)
+        }
+        if err := xfile.FileCopyRecursive(file, target); err != nil {
+            // 源不存在则记录日志并跳过，其余错误返回
+        }
     }
 
     for fileName, fileContent := range files {
@@ -302,7 +324,7 @@ func (fileStore *FileStore) StoreFile2TmpDir(ctx context.Context, version string
 - 如果是其他类型文件：直接删除。
 - 如果不存在：直接创建新 symlink。
 
-随后调用 `xfile.FileLink` 创建 `ConfDir -> ConfDir_{version}` 的链接，并触发旧版本清理。
+切换前还会校验目标版本目录带有 `.conf-agent-version` 标记：无标记的目录被视为不完整的版本目录（如写入中断的半成品），拒绝切换并记录 ERROR——避免把 BFE 指向缺文件的目录而导致加载失败。校验通过后调用 `xfile.FileLink` 创建 `ConfDir -> ConfDir_{version}` 的链接，并触发旧版本清理。
 
 ```go
 func (fileStore *FileStore) UpdateDefaultConfDir(ctx context.Context, version string) error {
@@ -320,6 +342,11 @@ func (fileStore *FileStore) UpdateDefaultConfDir(ctx context.Context, version st
     case os.IsNotExist(err):
     default:
         os.RemoveAll(fileStore.ConfDir)
+    }
+
+    // 无 .conf-agent-version 标记的版本目录拒绝切换
+    if _, err := os.Stat(filepath.Join(fileStore.tmpDir(version), versionMarkerFile)); err != nil {
+        return err
     }
 
     xfile.FileLink(fileStore.tmpDir(version), fileStore.ConfDir)
@@ -397,7 +424,7 @@ func (trigger *Trigger) TriggerBFEReload(ctx context.Context, version string) er
 
 ### 清理旧版本
 
-`cleanupOldVersions` 会扫描 `ConfDir` 父目录下所有以 `ConfDir_` 开头、包含 `.conf-agent-version` 标记、且不是 `.backup` 的目录，按修改时间排序后保留最新的 `VersionKeepCount` 个，删除其余版本。当前 symlink 指向的版本永远不会被删除。
+`cleanupOldVersions` 会扫描 `ConfDir` 父目录下所有以 `ConfDir_` 开头、包含 `.conf-agent-version` 标记、且不是 `.backup` 的目录，按修改时间排序后保留最新的 `VersionKeepCount` 个，删除其余版本。当前 symlink 指向的版本永远不会被删除。除此之外，清理阶段还做无标记空目录的尽力清扫：对以 `ConfDir_` 开头、无 `.conf-agent-version` 标记、且为空的目录直接删除（记录 `RemoveStaleEmptyDir` 日志）——写入中断留下的半成品目录没有标记，不清扫会无限堆积；非空的无标记目录则保留不动（可能是用户自管目录）。
 
 ```go
 func (fileStore *FileStore) cleanupOldVersions(ctx context.Context, keep int) error {
@@ -461,6 +488,15 @@ flowchart LR
     E -->|失败| G[日志告警<br>BFE 仍运行已加载版本]
 ```
 
+### 健壮性与自愈
+
+围绕"切换软链是唯一的生效点"这一核心，file_store 与 reloader 在多个环节做了防御，使异常场景可识别、可恢复、不留垃圾：
+
+- **切换前校验版本标记**：`UpdateDefaultConfDir` 在创建软链前检查目标目录的 `.conf-agent-version` 标记，无标记即拒绝切换（记录 `UpdateDefaultConfDir.CheckMarker` ERROR），杜绝把 BFE 指向写入中断的半成品目录。
+- **store 失败清理半成品目录**：`StoreFile2TmpDir` 任一步失败都会删除本次写入的临时版本目录（就地重建场景除外），无标记的半成品目录不会堆积。
+- **清扫无标记空目录**：`cleanupOldVersions` 在常规版本清理之外，尽力清扫无 `.conf-agent-version` 标记的空目录（记录 `RemoveStaleEmptyDir` 日志）；非空的无标记目录视为用户自管，保留不动。
+- **跨阶段连续失败汇总与恢复通告**：reloader 跨 store / trigger 两个阶段累计连续失败计数（`noteFailure`），每 10 次输出一条 `reload keeps failing` 汇总 ERROR（含失败阶段、连续失败次数、目标版本，以及"symlink 未切换、BFE 仍运行旧配置"的状态说明），避免故障期间日志里只有零散的单行错误而被监控漏掉；任一轮 reload 成功即清零计数，若此前处于失败态则输出 `reload recovered`（含连续失败次数）INFO 日志。
+
 ### 运维视角
 
 从运维排查角度，Conf Agent 的日志通常能直接定位问题阶段：
@@ -468,7 +504,9 @@ flowchart LR
 - `probe fail`：检查 Conf Agent 到 AI Gateway API 的网络连通性、Token 授权、`bfe_cluster` 参数是否匹配。
 - `StoreFile2TmpDir fail`：检查本地磁盘空间、`CopyFiles` 中指定的文件是否存在于当前 `ConfDir`、文件系统权限。
 - `TriggerBFEReload fail`：检查 BFE monitor 端口是否监听、`BFEReloadAPI` 路径是否正确、BFE 加载数据文件时是否报格式错误。
-- `UpdateDefaultConfDir fail`：通常是 symlink/junction 创建失败，检查目录权限、目标目录是否被占用。
+- `UpdateDefaultConfDir fail`：通常是 symlink/junction 创建失败，检查目录权限、目标目录是否被占用；若伴随 `CheckMarker` 错误，说明目标版本目录缺少 `.conf-agent-version` 标记（写入中断的半成品），检查磁盘空间与上一轮 store 日志。
+- `reload keeps failing`：store / trigger 阶段连续失败已达 10 的倍数，汇总日志的 `stage` 字段指示失败阶段——`StoreFile2TmpDir` 对应磁盘空间与 `CopyFiles` 检查，`TriggerBFEReload` 对应 BFE monitor 端口与数据文件格式检查；此时 symlink 未切换，BFE 仍运行旧配置。
+- `reload recovered`：reload 链路已从连续失败中恢复，连续失败计数清零，无需处理。
 
 当日志中出现 `reload succ update` 时，表示 prober、file_store、trigger、symlink 切换均已完成，旧版本将在下一轮清理中被回收。
 
@@ -533,6 +571,7 @@ Conf Agent 是壬远 AI 网关实现“控制面下发、数据面无中断加�
 - **版本化存储**：每次生成 `ConfDir_{version}` 临时目录，写入 `.conf-agent-version` 标记；切换时通过 symlink/junction 原子指向新版本。
 - **热加载触发**：`trigger` 调用 BFE monitor 端口的 `/reload/{module}`，并在 URL 中传递临时目录路径。
 - **清理与回滚**：`VersionKeepCount` 控制保留版本数；失败发生在 symlink 切换前不会影响数据面，symlink 切换失败则保留 BFE 已加载版本并记录日志。
+- **健壮性与自愈**：切换软链前校验 `.conf-agent-version` 标记、store 失败清理半成品目录、清理阶段清扫无标记空目录；reloader 跨 store / trigger 两阶段累计连续失败计数，每 10 次输出 `reload keeps failing` 汇总 ERROR，恢复时输出 `reload recovered`。
 
 理解 Conf Agent 的实现，有助于运维人员排查“配置未生效”“回滚失败”“版本目录膨胀”等问题，也为后续扩展新的配置任务类型提供了清晰的修改路径。
 

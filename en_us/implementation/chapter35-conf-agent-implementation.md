@@ -265,22 +265,44 @@ type FileStore struct {
 
 ### Writing to the Temporary Version Directory
 
-`StoreFile2TmpDir` always deletes the old temporary directory first, then creates the new version directory `ConfDir_{version}`, and completes the following steps in order:
+`StoreFile2TmpDir` creates the new version directory `ConfDir_{version}` and writes the content on each run. Version timestamps have second precision; when configurations arrive within the same second or two agent processes race, the new version directory name can be identical to the currently active directory. In that case the store **rebuilds in place** — rewriting content directly inside the active directory — and never `RemoveAll`s the active directory, because it may hold the only copy of the `CopyFiles` static configuration. In all other cases it deletes the old temporary directory first and then recreates it. The writes complete the following steps in order:
 
-1. Recursively copy `CopyFiles` from the current `ConfDir` into the temporary directory.
+1. Recursively copy `CopyFiles` from the current `ConfDir` into the temporary directory. **Directory entries keep their entry name**: a directory is copied as a same-named subdirectory of the version directory (in the tls_conf scenario, the `client_ca` / `client_crl` subdirectories are copied wholesale as `client_ca/`, `client_crl/` inside the version directory) instead of being flattened into the version directory root — BFE references these files by relative path, and flattening would break loading.
 2. Write the file contents returned by `prober` into the temporary directory as formatted JSON.
 3. Write the `.conf-agent-version` marker file, used later to identify which directories are version directories managed by Conf Agent.
 
+If any step fails, the function returns an error and cleans up the half-written version directory (except in the in-place rebuild scenario), so that unmarked half-done directories do not pile up.
+
 ```go
-func (fileStore *FileStore) StoreFile2TmpDir(ctx context.Context, version string, files map[string][]byte) error {
+func (fileStore *FileStore) StoreFile2TmpDir(ctx context.Context, version string, files map[string][]byte) (retErr error) {
     tmpDir := fileStore.tmpDir(version)
 
-    os.RemoveAll(tmpDir)
-    os.MkdirAll(tmpDir, os.ModePerm)
+    // Rebuild in place when the target is the currently active dir; never RemoveAll it.
+    activeTarget, evalErr := filepath.EvalSymlinks(fileStore.ConfDir)
+    absTmp, absErr := filepath.Abs(tmpDir)
+    inPlace := evalErr == nil && absErr == nil && activeTarget == absTmp
+    if !inPlace {
+        os.RemoveAll(tmpDir)
+        os.MkdirAll(tmpDir, os.ModePerm)
+    }
+
+    // On store failure, clean up the half-done dir (never the active one).
+    defer func() {
+        if retErr != nil && !inPlace {
+            os.RemoveAll(tmpDir)
+        }
+    }()
 
     for _, copyFile := range fileStore.CopyFiles {
         file := filepath.Join(fileStore.ConfDir, copyFile)
-        xfile.FileCopyRecursive(file, tmpDir)
+        // Directory entries are copied to tmpDir/<name> to keep the relative layout.
+        target := tmpDir
+        if info, err := os.Stat(file); err == nil && info.IsDir() {
+            target = filepath.Join(tmpDir, copyFile)
+        }
+        if err := xfile.FileCopyRecursive(file, target); err != nil {
+            // log and skip when the source does not exist; return otherwise
+        }
     }
 
     for fileName, fileContent := range files {
@@ -302,7 +324,7 @@ func (fileStore *FileStore) StoreFile2TmpDir(ctx context.Context, version string
 - If it is any other type of file: delete it directly.
 - If it does not exist: create the new symlink directly.
 
-It then calls `xfile.FileLink` to create the link `ConfDir -> ConfDir_{version}` and triggers cleanup of old versions.
+Before switching, it also validates that the target version directory carries the `.conf-agent-version` marker: a directory without the marker is treated as an incomplete version directory (e.g. a half-written one from an interrupted store) and the switch is refused with an ERROR log — preventing BFE from being pointed at a directory missing files and failing to load. After the check passes, it calls `xfile.FileLink` to create the link `ConfDir -> ConfDir_{version}` and triggers cleanup of old versions.
 
 ```go
 func (fileStore *FileStore) UpdateDefaultConfDir(ctx context.Context, version string) error {
@@ -320,6 +342,11 @@ func (fileStore *FileStore) UpdateDefaultConfDir(ctx context.Context, version st
     case os.IsNotExist(err):
     default:
         os.RemoveAll(fileStore.ConfDir)
+    }
+
+    // Refuse to switch to a version dir without the .conf-agent-version marker.
+    if _, err := os.Stat(filepath.Join(fileStore.tmpDir(version), versionMarkerFile)); err != nil {
+        return err
     }
 
     xfile.FileLink(fileStore.tmpDir(version), fileStore.ConfDir)
@@ -397,7 +424,7 @@ Note the role of `ReloadFile`: some BFE modules (e.g. `mod_ai_route`) require `p
 
 ### Cleaning Up Old Versions
 
-`cleanupOldVersions` scans all directories under the parent directory of `ConfDir` that start with `ConfDir_`, contain the `.conf-agent-version` marker, and are not `.backup` directories. It sorts them by modification time, keeps the latest `VersionKeepCount` directories, and deletes the rest. The version currently pointed to by the symlink is never deleted.
+`cleanupOldVersions` scans all directories under the parent directory of `ConfDir` that start with `ConfDir_`, contain the `.conf-agent-version` marker, and are not `.backup` directories. It sorts them by modification time, keeps the latest `VersionKeepCount` directories, and deletes the rest. The version currently pointed to by the symlink is never deleted. In addition, the cleanup phase performs a best-effort sweep of unmarked empty directories: directories starting with `ConfDir_`, lacking the `.conf-agent-version` marker, and being empty are removed directly (logging `RemoveStaleEmptyDir`) — half-written directories left by interrupted stores carry no marker and would otherwise pile up forever; non-empty unmarked directories are left untouched (they may be user-managed).
 
 ```go
 func (fileStore *FileStore) cleanupOldVersions(ctx context.Context, keep int) error {
@@ -461,6 +488,15 @@ flowchart LR
     E -->|fail| G[log warning<br>BFE keeps running loaded version]
 ```
 
+### Robustness and Self-Healing
+
+Centered on the principle that "switching the symlink is the only activation point", file_store and reloader defend at multiple layers so that abnormal scenarios are recognizable, recoverable, and leave no garbage behind:
+
+- **Version marker validation before switching**: `UpdateDefaultConfDir` checks the `.conf-agent-version` marker of the target directory before creating the symlink; without the marker the switch is refused (logging `UpdateDefaultConfDir.CheckMarker` ERROR), preventing BFE from being pointed at a half-written directory.
+- **Half-done directory cleanup on store failure**: if any step of `StoreFile2TmpDir` fails, the temporary version directory being written is removed (except in the in-place rebuild scenario), so unmarked half-done directories do not pile up.
+- **Sweeping unmarked empty directories**: beyond the regular version cleanup, `cleanupOldVersions` best-effort sweeps empty directories without the `.conf-agent-version` marker (logging `RemoveStaleEmptyDir`); non-empty unmarked directories are treated as user-managed and left alone.
+- **Cross-stage consecutive-failure summary and recovery notice**: the reloader accumulates a consecutive failure counter across the store and trigger stages (`noteFailure`); every 10 failures it emits a summary ERROR `reload keeps failing` (including the failing stage, the consecutive count, the target version, and the state note "symlink not switched, BFE still runs old config"), so a stuck reload loop does not stay silent with only scattered single-line errors that monitoring might miss; any successful reload round resets the counter, and if the loop was previously failing, a `reload recovered` INFO log (with the consecutive failure count) is emitted.
+
 ### Operations Perspective
 
 From a troubleshooting perspective, Conf Agent logs usually let you pinpoint the failing stage directly:
@@ -468,7 +504,9 @@ From a troubleshooting perspective, Conf Agent logs usually let you pinpoint the
 - `probe fail`: check network connectivity from Conf Agent to the AI Gateway API, Token authorization, and whether the `bfe_cluster` parameter matches.
 - `StoreFile2TmpDir fail`: check local disk space, whether the files specified in `CopyFiles` exist in the current `ConfDir`, and filesystem permissions.
 - `TriggerBFEReload fail`: check whether the BFE monitor port is listening, whether the `BFEReloadAPI` path is correct, and whether BFE reports a format error when loading the data file.
-- `UpdateDefaultConfDir fail`: usually a symlink/junction creation failure; check directory permissions and whether the target directory is in use.
+- `UpdateDefaultConfDir fail`: usually a symlink/junction creation failure; check directory permissions and whether the target directory is in use; if accompanied by a `CheckMarker` error, the target version directory lacks the `.conf-agent-version` marker (a half-written one from an interrupted store) — check disk space and the previous round's store logs.
+- `reload keeps failing`: consecutive failures in the store / trigger stages have reached a multiple of 10; the `stage` field in the summary log indicates the failing stage — `StoreFile2TmpDir` points to the disk space and `CopyFiles` checks, `TriggerBFEReload` to the BFE monitor port and data-file format checks; the symlink was not switched and BFE still runs the old configuration.
+- `reload recovered`: the reload path has recovered from consecutive failures and the counter is reset; no action needed.
 
 When `reload succ update` appears in the logs, it means prober, file_store, trigger, and the symlink switch have all completed, and the old versions will be reclaimed in the next round of cleanup.
 
@@ -533,6 +571,7 @@ Conf Agent is the key component that enables the Rainway AI Gateway to "deliver 
 - **Versioned storage**: a `ConfDir_{version}` temporary directory is created each time and a `.conf-agent-version` marker is written; at switch time a symlink/junction atomically points to the new version.
 - **Hot-reload triggering**: `trigger` calls `/reload/{module}` on BFE's monitor port, passing the temporary-directory path in the URL.
 - **Cleanup and rollback**: `VersionKeepCount` controls how many versions are kept; failures before the symlink switch do not affect the Data Plane, while a symlink-switch failure keeps BFE running the loaded version and records a log.
+- **Robustness and self-healing**: the `.conf-agent-version` marker is validated before switching the symlink, half-done directories are cleaned up on store failure, and unmarked empty directories are swept during cleanup; the reloader accumulates consecutive failures across the store and trigger stages, emits a summary ERROR `reload keeps failing` every 10 failures, and logs `reload recovered` upon recovery.
 
 Understanding Conf Agent's implementation helps operators troubleshoot problems such as "configuration not taking effect," "rollback failure," and "version directory bloat," and also provides a clear modification path for extending new configuration task types.
 

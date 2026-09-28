@@ -6,18 +6,19 @@ This book is written for **users and developers of the Rainway AI Gateway**. It 
 
 ## Version Notes
 
-This book is continuously updated along with the Rainway AI Gateway releases. The current version of this book corresponds to **Rainway AI Gateway v0.6.0**. Release address: <https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.6.0>.
+This book is continuously updated along with the Rainway AI Gateway releases. The current version of this book corresponds to **Rainway AI Gateway v0.7.0**. Release address: <https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.7.0>.
 
-v0.6.0 includes the following component versions:
+v0.7.0 includes the following component versions:
 
 | Component | Version | Description |
 |---|---|---|
-| AI Gateway API | v0.0.9 | Control Plane |
-| AI Gateway EPP | v0.0.1 | EPP scheduling (new component) |
-| BFE | v1.8.7 | Data Plane |
-| Dashboard | v0.0.9 | Management console (embedded in the API image) |
+| AI Gateway API | v0.0.10 | Control Plane |
+| AI Gateway EPP | v0.0.2 | EPP scheduling |
+| BFE | v1.8.8 | Data Plane |
+| Dashboard | v0.0.10 | Management console (embedded in the API image) |
 | conf-agent | v0.0.7 | Configuration hot reload agent |
-| Log Reader | v1.3.0 | Access log → Kafka |
+| Log Reader | v1.4.0 | Access log → Kafka / MySQL (mod_kafka / mod_log_mysql) |
+| ai-gateway-observability | v0.0.1 | Standard reporting form: Doris / Grafana configuration and deployment scripts |
 
 ## Table of Contents
 
@@ -88,7 +89,7 @@ See [writing-guide.md](./writing-guide.md) (currently available in Chinese only)
 - `ai-gateway-epp/`: EPP scheduling component (based on llm-d; provides backend selection for EPP-mode Clusters via ext_proc)
 - `conf-agent/`: Configuration agent
 - `ai-gateway-web/`: Management console (Dashboard) frontend
-  - Detailed console usage documentation: <https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.9/docs/zh-cn>
+  - Detailed console usage documentation: <https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.10/docs/zh-cn>
 
 ## License
 

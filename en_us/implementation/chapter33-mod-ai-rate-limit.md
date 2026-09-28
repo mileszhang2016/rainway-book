@@ -17,32 +17,37 @@ This chapter corresponds to [Chapter 21: Quota and Rate Limit Design](../design/
 
 `mod_ai_rate_limit` is a built-in module of the BFE Data Plane responsible for AI request rate limiting, located in `bfe/bfe_modules/mod_ai_rate_limit/`. It performs distributed rate limiting on requests entering the AI gateway path, supporting three types of limits configured by dimensions such as product, API-Key, and model: TPM (Tokens Per Minute), RPM (Requests Per Minute), and maximum concurrency.
 
-In the BFE module pipeline, `mod_ai_rate_limit` registers at the `HandleFoundProduct` callback point. The actual registration order is in `bfe/bfe_modules/bfe_modules.go`: `mod_ai_token_auth` → `mod_ai_route` → `mod_body_process` → `mod_ai_rate_limit`. Since `mod_body_process` mainly works in the `HandleReadResponse` phase, the actual execution order at the `HandleFoundProduct` phase is `mod_ai_token_auth` → `mod_ai_route` → `mod_ai_rate_limit`. This order is determined by data dependencies: `mod_ai_token_auth` first completes API-Key authentication and writes `ClientApiKey` into `AiBasicInfo`; `mod_ai_route` then performs route lookup; `mod_ai_rate_limit` relies on `ClientApiKey` and `ClientModel` to look up the bound policy and perform rate limiting. Any change to this order would break the dependency chain.
+In the BFE module pipeline, `mod_ai_rate_limit` registers at the `HandleAfterAITargetModel` callback point. This callback fires after the target model is resolved and before forwarding, once per cluster attempt (every `doSingleAIForward` call, including API-Key rotation and cluster fallback). `mod_ai_token_auth` and `mod_ai_rate_limit` both fire at `HandleAfterAITargetModel`, and the registration order guarantees that `mod_ai_token_auth` runs before rate limiting (see `moduleList` in `bfe/bfe_modules/bfe_modules.go`: `mod_ai_token_auth` → `mod_ai_route` → `mod_body_process` → `mod_ai_rate_limit`), so the model allowlist/blocklist check always precedes rate limiting. The rate limit decision depends on two kinds of data: `ClientApiKey`, written by `mod_ai_token_auth` at the `HandleFoundProduct` stage, and the post-forwarding target model `AiBasicInfo.TargetModel` resolved at the routing stage. Any change to this order would break the dependency chain.
 
 The core responsibilities of the module can be summarized as follows:
 
-1. **Policy matching**: match the product-line rules and rate limit policies in `ai_rate_limit.data` based on the request's `product`, `ClientApiKey`, and `ClientModel`;
+1. **Policy matching**: match the product-line rules and rate limit policies in `ai_rate_limit.data` based on the request's `product`, `ClientApiKey`, and the post-forwarding target model (`TargetModel`);
 2. **Rate limit checks**: for a matched policy, perform concurrency, RPM, and TPM checks in sequence; the request is rejected if any limit is exceeded;
 3. **Post-processing**: in the `HandleRequestFinish` phase, release the concurrency count and correct the TPM pre-consumed value based on the actual Token consumption.
+
+Because the callback fires per cluster attempt while the rate limit check must run at most once per request, `PolicyLimiterContext` (stored in `Request.Context` as `mod_ai_rate_limit.policy_limiter_ctx`) doubles as an idempotency guard: the callback entry first checks whether this Context already exists and passes through immediately if so, ensuring that repeated callbacks from key rotation and fallback never count twice.
 
 The module state machine is as follows:
 
 ```mermaid
 flowchart TD
-    A[HandleFoundProduct] --> B{AiBasicInfo exists?}
+    A[HandleAfterAITargetModel] --> B{AiBasicInfo exists?}
     B -->|No| C[Return BfeHandlerGoOn]
-    B -->|Yes| D[runProductRules]
-    D --> E[Condition-match product rules]
-    E --> F[Get API-Key bound policy]
-    F --> G[Concurrency check]
-    G --> H[RPM check]
-    H --> I[TPM check]
-    I --> J{Any limit triggered?}
-    J -->|Yes| K[Execute hit_action<br/>Return 429]
-    J -->|No| L[Return BfeHandlerGoOn]
-    L --> M[Forward to backend]
-    M --> N[HandleRequestFinish]
-    N --> O[Release concurrency / TPM correction]
+    B -->|Yes| D{PolicyLimiterContext already exists?}
+    D -->|Yes| C
+    D -->|No| E[runProductRules]
+    E --> F[Condition-match product rules]
+    F --> G[Get API-Key bound policy]
+    G --> H[Match policy models against TargetModel]
+    H --> I[Concurrency check]
+    I --> J[RPM check]
+    J --> K[TPM check]
+    K --> L{Any limit triggered?}
+    L -->|Yes| M[Execute hit_action<br/>Set ErrAiRateLimit and return 429]
+    L -->|No| N[Return BfeHandlerGoOn]
+    N --> O[Forward to backend]
+    O --> P[HandleRequestFinish]
+    P --> Q[Release concurrency / TPM correction]
 ```
 
 ## TPM, RPM, and Concurrency Rate Limit Algorithms
@@ -56,12 +61,12 @@ All three types of rate limiting in `mod_ai_rate_limit` ultimately rely on Redis
 | Object limited | Number of requests being processed simultaneously | Request count per unit window | Token consumption per unit window |
 | Redis data structure | `STRING` (INCR/DECR) | `ZSET` (sorted set of timestamps) | `HASH` (bucketed counting) |
 | Window type | No window; relies on TTL | Sliding window | Sliding window + sub-bucket peak |
-| When the actual value is obtained | `HandleFoundProduct` | `HandleFoundProduct` | Pre-consumed at `HandleFoundProduct`, corrected at `HandleRequestFinish` |
+| When the actual value is obtained | `HandleAfterAITargetModel` | `HandleAfterAITargetModel` | Pre-consumed at `HandleAfterAITargetModel`, corrected at `HandleRequestFinish` |
 | Release on failure | `HandleRequestFinish` calls `ConnRelease` | No release needed | No release needed |
 
 ### Concurrency Rate Limiting
 
-Concurrency rate limiting is implemented with a single Redis counter. When a request arrives, `ConcurrencyLimiter.ConnAcquire` is called to perform an atomic `INCR` on the counter; when the request finishes, `ConnRelease` is called in `HandleRequestFinish` to perform a `DECRBY`. `ConcurrencyLimiter` is defined in `bfe/bfe_util/limit_rate/redis_concurrency_limiter.go`:
+Concurrency rate limiting is implemented with a single Redis counter. When a request arrives (at the `HandleAfterAITargetModel` stage, fired per cluster attempt, with the `PolicyLimiterContext` idempotency guard ensuring only one acquire per request), `ConcurrencyLimiter.ConnAcquire` is called to perform an atomic `INCR` on the counter; when the request finishes, `ConnRelease` is called in `HandleRequestFinish` to perform a `DECRBY`. `ConcurrencyLimiter` is defined in `bfe/bfe_util/limit_rate/redis_concurrency_limiter.go`:
 
 ```go
 func (l *ConcurrencyLimiter) ConnAcquire(agent *RedisLRAgent) (bool, int64, int64, error) {
@@ -95,7 +100,7 @@ This approach has per-request precision and can limit the request count per unit
 
 ### TPM Rate Limiting
 
-TPM rate limiting is the most complex scenario, because Token consumption cannot be determined until the request is actually complete. `mod_ai_rate_limit` adopts a two-phase "pre-consume + correction" approach: at the `HandleFoundProduct` phase, it predicts the possible Token consumption based on the request's prompt Token count and pre-consumes it; at the `HandleRequestFinish` phase, it corrects the counter via `UpdateTokenUsage` based on the difference between the actual Token consumption parsed by `mod_body_process` and the pre-consumed value.
+TPM rate limiting is the most complex scenario, because Token consumption cannot be determined until the request is actually complete. `mod_ai_rate_limit` adopts a two-phase "pre-consume + correction" approach: at the `HandleAfterAITargetModel` phase, it predicts the possible Token consumption based on the request's prompt Token count and pre-consumes it; at the `HandleRequestFinish` phase, it corrects the counter via `UpdateTokenUsage` based on the difference between the actual Token consumption parsed by `mod_body_process` and the pre-consumed value.
 
 `TPMLimiter` is defined in `bfe/bfe_util/limit_rate/redis_tpm_limiter.go`:
 
@@ -122,7 +127,7 @@ func (r *tpmLimiterItem) predictTokenUsage(promptToken int64) int64 {
 }
 ```
 
-Here `ReservedX` and `ReservedOff` are currently fixed at 0, so the predicted value is actually 0. This means the current implementation mainly writes the actual Token consumption during the post-completion correction phase, and the TPM check at the `HandleFoundProduct` phase does not become the primary interception mechanism. These two fields are reserved to support a prediction model based on prompt Tokens in the future.
+Here `ReservedX` and `ReservedOff` are currently fixed at 0, so the predicted value is actually 0. This means the current implementation mainly writes the actual Token consumption during the post-completion correction phase, and the TPM check at the `HandleAfterAITargetModel` phase does not become the primary interception mechanism. These two fields are reserved to support a prediction model based on prompt Tokens in the future.
 
 The Redis data structure for TPM is a Hash, where the Key is the Redis Key, each Field is the start timestamp of a sub-bucket, and the Value is the number of Tokens consumed in that bucket. The Lua script `redis_tpm_limit_check.lua` maintains both the overall window threshold and the sub-bucket peak threshold:
 
@@ -140,7 +145,7 @@ sequenceDiagram
     participant RC as Redis
     participant BP as mod_body_process
 
-    R ->> M: HandleFoundProduct
+    R ->> M: HandleAfterAITargetModel (once per request, PolicyLimiterContext guard)
     M ->> M: predictTokenUsage = 0
     M ->> RC: CheckAndConsumeToken(0)
     RC -->> M: allowed
@@ -155,11 +160,19 @@ sequenceDiagram
 
 ## Redis Rate Limit Key Design
 
-### The Need for Stable Keys
+### The Control Plane Generates the Full Key
 
-In early versions of `mod_ai_rate_limit`, the Redis Key was composed of the policy ID and the rule name (`default_bfe_<policyId>_rpm_<ruleName>`). When the management plane only modified the rule name, the Redis Key changed, causing the historical counters to reset to zero. To avoid this problem, the current architecture has the Control Plane generate a stable `redis_key` and deliver it along with the configuration.
+When the Control Plane exports the rate-limit configuration, it generates a full Redis Key for every rule and delivers it with the configuration. The generation logic lives in `model/shared/rate_limit_redis_key.go`:
 
-When the Control Plane exports the configuration, it generates the Key based on `(policy_id, rule_index)`, which do not change when users edit the rules. The format is `RL_TPM_rlp-<id>_<idx>` and `RL_RPM_rlp-<id>_<idx>`. On the BFE side, the `redis_key` field in the configuration takes priority; if an old configuration does not carry this field, it falls back to the legacy rule-name-based logic to ensure backward compatibility. This design is detailed in `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`.
+```go
+func BuildBFERateLimitRedisKey(policyID int64, ruleType string, name string) string {
+    return fmt.Sprintf("default_bfe_rlp-%d_%s_rlp-%d_%s", policyID, ruleType, policyID, name)
+}
+```
+
+TPM / RPM rules pass `RL_TPM` / `RL_RPM` as `ruleType` and the rule name as `name`, producing keys such as `default_bfe_rlp-1_RL_TPM_rlp-1_tpm_1min`. The rule name is part of the Key: renaming a rule is equivalent to deleting the old rule and adding a new one — the new rule uses a new Key and its counters start over; changing other fields such as `model` does not change the Key, and counters are not reset.
+
+On the BFE side, the `redis_key` field in the configuration takes priority; if the configuration does not carry this field, it falls back to the local construction logic described below. This design is detailed in `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`.
 
 ### Key Construction on the BFE Side
 
@@ -194,11 +207,11 @@ The concurrency rate limit Key is uniformly `default_bfe_<policyId>_con`.
 
 | Scenario | Behavior |
 |----------|----------|
-| New configuration carries `redis_key` | BFE uses this field directly to build the Redis Key |
-| Old configuration lacks `redis_key` | Falls back to the legacy Key based on `name`; counter behavior unchanged |
-| Rule name modified (other fields unchanged) | `redis_key` unchanged; counters not reset |
+| Configuration carries `redis_key` | BFE uses this field directly to build the Redis Key |
+| Configuration lacks `redis_key` | Falls back to the legacy Key based on `name` (or the threshold tuple when the rule is unnamed); counter behavior unchanged |
+| Rule renamed (other fields unchanged) | The rule name is encoded in the Key; renaming is equivalent to deleting the old rule and adding a new one — a new Key is used and counters start over |
 | Model modified (other fields unchanged) | `redis_key` unchanged; counters not reset |
-| Rule deleted/added | The indexes of subsequent rules change, so the corresponding Keys change and counters reset |
+| Rule deleted/added | The Control Plane cleans up the deleted rule's Key; the new rule uses a new Key and counters start over |
 
 ## Rate Limit Triggering and the Response (429)
 
@@ -256,6 +269,15 @@ func (m *ModuleAiRateLimit) executePolicyAction(...) (int, *bfe_http.Response) {
 
 The final response has the HTTP status code `429 Too Many Requests`. The response body carries metadata such as the error code, the rate limit type, and the API-Key, making it easy for clients to identify the cause of the rate limit.
 
+### Distinguishing Local Rate Limits from Upstream 429
+
+A local rate limit rejection and an upstream 429 follow completely different paths in the forwarding loop. When `runProductRules` decides a limit is hit, besides constructing the 429 response it also sets `req.ErrCode = bfe_basic.ErrAiRateLimit` (a global sentinel error marker defined in `bfe_basic/error_code.go`). The `ServeHTTPForAI()` forwarding loop recognizes this marker in two places:
+
+- **Cluster fallback guard**: when an attempt ends with a local rate limit, `ErrCode == bfe_basic.ErrAiRateLimit` terminates the attempt list immediately, with no degradation to a backup cluster;
+- **Key rotation guard**: the key-level retry inside `aiClusterInvoke` recognizes this marker and stops rotating, returning as-is (the key is not marked used, and no session-affinity penalty is applied).
+
+An upstream 429 returned by the model service does not carry this marker and is still handled by the original logic: the current key is marked used and rotation moves to another key in the same cluster; cluster-level fallback is decided by `shouldTriggerFallback()` only after rotation still fails. This distinction ensures that a rejection comes from the gateway's own quota control rather than transient noise from an upstream key.
+
 ### Behavior on Redis Failure
 
 The module configuration `IsRejectOnRedisError` controls whether requests are rejected when Redis fails. When a Redis call fails and this switch is `true`, the module records `IsRedisError` and triggers the `FINISH` action to return 429; when it is `false`, the request is allowed to pass, avoiding a complete service outage caused by a Redis failure.
@@ -294,7 +316,7 @@ OpenDebug = false
 1. Call `ConfLoad` to read `mod_ai_rate_limit.conf`;
 2. Create `redisClient` and `redisAgent` based on the Redis configuration;
 3. Call `loadProductRuleTable` to load `ai_rate_limit.data`;
-4. Register `limitFoundProductHandler` with `HandleFoundProduct`;
+4. Register `targetModelCheckHandler` with `HandleAfterAITargetModel` (`mod_ai_token_auth`'s target model check is also registered at this point, before this module, so the whitelist check always precedes rate limiting);
 5. Register `limitRequestFinishHandler` with `HandleRequestFinish`;
 6. Register the monitoring and hot reload Web Handlers.
 
@@ -310,7 +332,7 @@ func (m *ModuleAiRateLimit) Init(cbs *bfe_module.BfeCallbacks, whs *web_monitor.
         return err
     }
 
-    cbs.AddFilter(bfe_module.HandleFoundProduct, m.limitFoundProductHandler)
+    cbs.AddFilter(bfe_module.HandleAfterAITargetModel, m.targetModelCheckHandler)
     cbs.AddFilter(bfe_module.HandleRequestFinish, m.limitRequestFinishHandler)
     // ...
 }
@@ -392,22 +414,49 @@ The `getPrometheus` method periodically aggregates the in-memory `LimiterStats` 
 
 ## Key Code Snippets
 
-### Product-Line Rule Matching
+### Callback Entry and Idempotency Guard
 
-`runProductRules` retrieves the rule list for the product and matches them in order; on a match, it calls `executeCheckLimitPolicy`:
+`targetModelCheckHandler` is the entry point for `HandleAfterAITargetModel`. The callback fires per cluster attempt (key rotation and fallback both re-fire it), so it first checks whether a `PolicyLimiterContext` already exists: if it does, the request has already been rate-limit-checked and the handler passes through immediately — this is the once-per-request idempotency guard:
 
 ```go
-func (m *ModuleAiRateLimit) runProductRules(req *bfe_basic.Request, meta *bfe_basic.AiBasicInfo) (int, *bfe_http.Response) {
+func (m *ModuleAiRateLimit) targetModelCheckHandler(req *bfe_basic.Request) (int, *bfe_http.Response) {
+    // Fired per cluster attempt (key rotation / fallback); the policy check
+    // must run at most once per request.
+    if getPolicyLimiterContext(req) != nil {
+        return bfe_module.BfeHandlerGoOn, nil
+    }
+
+    meta := req.GetAiBasicInfo()
+    if meta == nil {
+        return bfe_module.BfeHandlerGoOn, nil
+    }
+
+    // policies are matched and metered against the resolved target model
+    targetModel := meta.TargetModel
+
+    req.InitAiRateLimitHitInfo()
+    return m.runProductRules(req, meta, targetModel)
+}
+```
+
+### Product-Line Rule Matching
+
+`runProductRules` retrieves the rule list for the product and matches them in order; on a match, it calls `executeCheckLimitPolicy`. When a limit is hit, it sets the `bfe_basic.ErrAiRateLimit` marker:
+
+```go
+func (m *ModuleAiRateLimit) runProductRules(req *bfe_basic.Request, meta *bfe_basic.AiBasicInfo, targetModel string) (int, *bfe_http.Response) {
     product := req.Route.Product
     rules := m.productTable.getProductRules(product)
     // ...
+    ctx := &PolicyLimiterContext{}
+    setPolicyLimiterContext(req, ctx)
     for _, rule := range rules {
         if !rule.cond.Match(req) {
             continue
         }
-        ret, res := m.executeCheckLimitPolicy(req, meta, rule, ctx)
+        ret, res := m.executeCheckLimitPolicy(req, meta, rule, ctx, targetModel)
         if ret != bfe_module.BfeHandlerGoOn {
-            req.ErrCode = ErrAiRateLimit
+            req.ErrCode = bfe_basic.ErrAiRateLimit
             return ret, res
         }
     }
@@ -417,16 +466,16 @@ func (m *ModuleAiRateLimit) runProductRules(req *bfe_basic.Request, meta *bfe_ba
 
 ### Policy Check Order
 
-`executeCheckLimitPolicy` performs checks in the order of concurrency, RPM, and TPM; any failure triggers `hit_action`:
+`executeCheckLimitPolicy` first matches the post-forwarding target model against `policy.Models` (`matchModel(policy.Models, targetModel)`; policies that do not match are skipped), then performs checks in the order of concurrency, RPM, and TPM; any failure triggers `hit_action`:
 
 ```go
-if !ls.checkConcurrency(req, meta, m.redisAgent, ctx, clientModel, m.isRejectOnRedisError) {
+if !ls.checkConcurrency(req, meta, m.redisAgent, ctx, targetModel, m.isRejectOnRedisError) {
     return m.executePolicyAction(req, meta, policyId, policy, rule)
 }
-if !ls.checkRPM(req, meta, m.redisAgent, ctx, clientModel, m.isRejectOnRedisError) {
+if !ls.checkRPM(req, meta, m.redisAgent, ctx, targetModel, m.isRejectOnRedisError) {
     return m.executePolicyAction(req, meta, policyId, policy, rule)
 }
-if !ls.checkTPM(req, meta, m.redisAgent, ctx, clientModel, m.isRejectOnRedisError) {
+if !ls.checkTPM(req, meta, m.redisAgent, ctx, targetModel, m.isRejectOnRedisError) {
     return m.executePolicyAction(req, meta, policyId, policy, rule)
 }
 ```
@@ -459,11 +508,12 @@ func (m *ModuleAiRateLimit) limitRequestFinishHandler(req *bfe_basic.Request, re
 
 ## Chapter Summary
 
-- `mod_ai_rate_limit` is the module of the BFE Data Plane responsible for AI request rate limiting. It registers at the `HandleFoundProduct` callback point and relies on `ClientApiKey` set by `mod_ai_token_auth` to identify rate limit dimensions.
+- `mod_ai_rate_limit` is the module of the BFE Data Plane responsible for AI request rate limiting. Its main logic registers at the `HandleAfterAITargetModel` callback point (after the target model is resolved and before forwarding, fired per cluster attempt), and TPM/RPM/maximum concurrency policies are matched against the post-forwarding target model (`AiBasicInfo.TargetModel`); `mod_ai_token_auth` and `mod_ai_rate_limit` fire at the same point, and the registration order guarantees the whitelist check precedes rate limiting.
+- The callback fires per cluster attempt, but the rate limit check runs at most once per request: `PolicyLimiterContext` doubles as an idempotency guard, and repeated callbacks from key rotation and fallback pass through directly.
 - The module supports three types of limits: TPM, RPM, and maximum concurrency, implemented on Redis Hash, Redis ZSET, and Redis String respectively, all guaranteeing atomicity via Lua scripts.
-- TPM adopts a two-phase "pre-consume + correction" approach: pre-consumption by predicted Tokens at the `HandleFoundProduct` phase, and correction based on actual Token consumption at the `HandleRequestFinish` phase.
+- TPM adopts a two-phase "pre-consume + correction" approach: pre-consumption by predicted Tokens at the `HandleAfterAITargetModel` phase, and correction based on actual Token consumption at the `HandleRequestFinish` phase.
 - The Control Plane generates a stable `redis_key` for each TPM/RPM rule (`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`); BFE prioritizes this field when building Redis Keys and falls back to the legacy logic when it is not specified.
-- After rate limiting is triggered, the module executes `FINISH` or `CLOSE` according to `hit_action`; by default it returns 429 Too Many Requests, carrying the rate limit type and error code in the response body.
+- After rate limiting is triggered, the module executes `FINISH` or `CLOSE` according to `hit_action`; by default it returns 429 Too Many Requests, carrying the rate limit type and error code in the response body. A local rate limit sets the `bfe_basic.ErrAiRateLimit` marker, which blocks key rotation and cluster fallback, while an upstream 429 still follows the original key rotation logic.
 - The configuration uses an INI + JSON two-layer structure and supports hot reload via `/reload/mod_ai_rate_limit`; during hot reload, the statistical counts of old limiters are preserved to avoid monitoring jumps.
 - The module exposes Prometheus metrics such as `tpm_match`, `tpm_hit`, `rpm_match`, `rpm_hit`, `con_match`, and `con_hit`, supporting observability split by `policy_id` and `inst_id`.
 

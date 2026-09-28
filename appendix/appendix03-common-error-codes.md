@@ -2,9 +2,9 @@
 
 本书涉及两类错误码：BFE 数据面在 AI 网关场景下返回的 OpenAI 兼容错误码，以及 AI Gateway API 控制面 OpenAPI 返回的 `ErrNum` 业务错误码。两者分别由 BFE 官方文档与控制面接口定义文档维护，本书不重复罗列，仅说明两类错误码在 AI 网关场景下的关键语义。
 
-## BFE 数据面错误码（v1.8.7）
+## BFE 数据面错误码（v1.8.8）
 
-- [BFE AI 网关错误码说明](https://github.com/bfenetworks/bfe/blob/refs/tags/v1.8.7/docs/zh_cn/sys_design/ai_error_codes.md)
+- [BFE AI 网关错误码说明](https://github.com/bfenetworks/bfe/blob/refs/tags/v1.8.8/docs/zh_cn/sys_design/ai_error_codes.md)
 
 该文档覆盖以下内容：
 

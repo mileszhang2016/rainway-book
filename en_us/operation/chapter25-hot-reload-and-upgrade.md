@@ -130,7 +130,7 @@ After receiving the reload request, BFE re-reads the configuration file of the c
 
 ### tls_conf Versioned Hot Reload and Client CA/CRL Relocation
 
-Conf Agent distributes TLS configuration using a "versioned directory + symbolic link" approach: it writes the new configuration (including complete copies of the `client_ca` and `client_crl` directories) into a versioned directory `tls_conf_<version>`, then first calls `GET /reload/tls_conf?path=tls_conf_<version>` so that BFE performs a full load validation of this self-contained configuration unit **before** the symbolic link is switched. Only after BFE returns success does Conf Agent switch the `tls_conf` symlink and clean up expired versions.
+Conf Agent distributes TLS configuration using a "versioned directory + symbolic link" approach: it writes the new configuration (including complete copies of the `client_ca` and `client_crl` directories, with directory entries copied recursively while preserving the relative directory structure) into a versioned directory `tls_conf_<version>`, then first calls `GET /reload/tls_conf?path=tls_conf_<version>` so that BFE performs a full load validation of this self-contained configuration unit **before** the symbolic link is switched. Only after BFE returns success does Conf Agent switch the `tls_conf` symlink and clean up expired versions.
 
 `TLSConfReload` relocates every dependency of the versioned directory (`server_cert_conf` / `tls_rule_conf` and the client CA/CRL base directories) into the directory given by `path` together: if the client CA/CRL base directories were still read from the activated directory `<confRoot>/tls_conf/client_ca|crl`, a change involving a client CA that exists only in the version directory but not in the activated one would fail the reload at the `ClientCALoad` stage with "CA file not found". Conf Agent would therefore be unable to complete the switch, and subsequent reloads would fail again for the same reason. The relocation is thus a necessary condition for the self-contained validation of the version directory.
 
@@ -171,6 +171,15 @@ cat /home/work/bfe/conf/mod_ai_token_auth_20260102120000/token_rule.data | head 
 ```
 
 The output should contain `"version": "20260102120000"`.
+
+### 4. Recognizing a Stuck Reload Loop
+
+Conf Agent increments a consecutive-failure counter on every failed reload. When the store (`StoreFile2TmpDir`, writing the version directory / switching the symlink) or trigger (`TriggerBFEReload`, calling the BFE `/reload`) stage of the same Reloader keeps failing, a summary ERROR `reload keeps failing` is emitted every 10 consecutive failures, carrying the stage, the consecutive failure count, and the version, and stating "symlink not switched, bfe still runs old config" — that is, the symlink was not switched and BFE still runs the old configuration. Seeing this log means the reload loop is stuck; locate the cause by the stage field:
+
+- `stage=StoreFile2TmpDir`: check disk space and write permissions on the BFE configuration directory, and for leftover half-finished directories without the `.conf-agent-version` marker;
+- `stage=TriggerBFEReload`: check that the BFE monitor port (default 8421) is reachable, and look at the BFE-side reload validation errors (such as TLS configuration association check failures).
+
+Once the offending stage is fixed, a single successful reload logs `reload recovered` and resets the counter.
 
 ---
 
@@ -227,6 +236,13 @@ ALTER TABLE users DROP COLUMN `roles`;
 
 ALTER TABLE users DROP INDEX name_uni;
 ALTER TABLE users ADD UNIQUE KEY `name_uni` (`name`, `type`);
+```
+
+Likewise, when upgrading to v0.0.10, existing databases need the following columns added to the Entity and Provider tables:
+
+```sql
+ALTER TABLE entities ADD COLUMN description VARCHAR(255) NOT NULL DEFAULT '';
+ALTER TABLE providers ADD COLUMN protocol_paths JSON;
 ```
 
 Before upgrading, be sure to:
@@ -330,7 +346,7 @@ ls -l mod_ai_token_auth
 - `VersionControlManager` implements incremental synchronization based on MD5 signatures and the `config_versions` table; when the configuration has not changed, it returns `Data: null`, avoiding meaningless configuration delivery.
 - Each `Reloader` of Conf Agent consists of three parts — prober, file_store, and trigger — responsible for pulling, persistence, and triggering the BFE hot reload, respectively.
 - BFE completes hot reload through the `/reload/{module}` interface on the monitoring port, and each module has an independent hot reload path; `TLSConfReload` relocates the client CA/CRL base directories into the `?path=` versioned directory so that the self-contained version-directory validation can pass.
-- The active version can be checked via the Conf Agent log, the symlink target, or the `version` field in the configuration file.
+- The active version can be checked via the Conf Agent log, the symlink target, or the `version` field in the configuration file; the summary ERROR `reload keeps failing` (with the stage field) emitted every 10 consecutive reload failures is the signal for recognizing a stuck reload loop.
 - Version rollback can use the historical version directories retained by Conf Agent: manually switch the symlink and reload, without restarting BFE.
 - When upgrading, perform database migration, AI Gateway API replacement, Dashboard upgrade, and Conf Agent configuration checks in order, and pay attention to the compatibility of authentication headers and configuration fields.
 

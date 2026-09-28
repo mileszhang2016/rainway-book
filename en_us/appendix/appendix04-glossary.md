@@ -5,9 +5,6 @@
 **AI Business Cluster (Cluster)**
 : A logical backend unit that references a Provider and configures forwarding policies, determining how traffic is forwarded, which models are used, and how Key weights are distributed.
 
-**AI Gateway Instance Pool**
-: The list of Data Plane BFE engine addresses registered in the Dashboard, used by the Control Plane to push configurations to designated BFE nodes.
-
 **API Key**
 : The credential used by callers to access Rainway AI Gateway, carried in the request header (no Bearer prefix required). It can be attached to an Entity to inherit quota, rate limiting, and routing policies.
 
@@ -15,6 +12,9 @@
 
 **BFE**
 : Baidu's open-source Layer-7 load balancer and traffic gateway. In Rainway AI Gateway, it serves as the Data Plane forwarding engine, responsible for authentication, rate limiting, quota enforcement, routing, and forwarding of AI requests.
+
+**BFE Cluster (BFECluster)**
+: The resource that registers the list of Data Plane BFE engine addresses (Server Data). Records are maintained by deployment seed data (the `db_ddl.sql` seed, where the default cluster references the built-in instance pool `BFE.aipool`) and no OpenAPI management endpoint is exposed; the Control Plane uses it to determine which BFE nodes configurations are delivered to.
 
 **Balancer**
 : BFE's load balancing module, responsible for distributing requests among multiple backend instances within a Cluster.
@@ -89,6 +89,9 @@
 
 **Product (Product Line)**
 : The top-level resource isolation unit in BFE; in AI Gateway mode it is mainly used for product line identification and configuration context loading.
+
+**protocol_paths (Protocol Path Mapping)**
+: An optional field on a Provider declaring the upstream base path for each model protocol (`openai`/`anthropic`); BFE rewrites the standard entry `/v1/...` to the provider's native prefix based on it, and forwards unchanged when it is unconfigured.
 
 ## Q
 

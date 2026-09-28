@@ -9,7 +9,9 @@ AI 网关承接大量大模型调用流量，请求链路涉及认证、路由�
 - 应当关注哪些关键监控指标，覆盖路由命中、配额命中、限流触发等场景；
 - 如何将 BFE 与 Prometheus、Zabbix 等监控系统集成；
 - AI 网关错误码体系的分类与排查思路；
-- 基于日志与指标的告警配置建议。
+- 基于日志与指标的告警配置建议；
+- 报表系统的两种部署形态（轻量形态与标准形态）及其数据链路差异；
+- 内置报表查询 API（`/report/*`）的功能与关键设计（查询层抽象、分钟聚合、分区管理、双后端一致性）。
 
 阅读本章后，读者应能独立完成 AI 网关可观测性方案的规划、配置与日常排障。
 
@@ -101,6 +103,16 @@ AI 可观测字段统一占用 `bfe-access-pb` 的 701-900 编号区间，按用
 | `ai_video_count` | 787 | int64 | 生成视频数量（video_generation 模式） |
 
 其中 `ai_image_input_tokens` 与 `ai_video_count` 依赖 `bfe-access-pb` v0.3.5，采集逻辑位于 `bfe_modules/mod_access_pb3/request_log.go` 的 `reqAiInfoGen()`，取值来自 `bfe_basic.TokenUsage` 的 `ImageInputTokens` 与 `VideoCount`，由 `mod_ai_token_auth` 在响应阶段解析 usage 时填充。
+
+### 耗时字段的零值语义
+
+访问日志的五个耗时字段 `ClusterServeTime` / `BackendServeTime` / `WriteClientTime` / `SessionOffsetTime` / `ProxyDelayTime` 统一经 `bfe_modules/mod_access_pb3/request_log.go` 的 `durationMsUint32` 收口：任一端点为零值时间或差值为负时一律写 0。
+
+`ProxyDelayTime`（`proxy_delay_time`）衡量"读完请求到收到后端首字节"的代理延迟，计时终点 `Stat.BackendFirst` 只在请求真正调用过后端时才会设置：鉴权拒绝（401）、无路由（404）、redirect、连接被关闭等未调用后端即结束的请求中它保持零值。若直接对"真实时间戳 − 零值时间戳"的负差值做 uint32 毫秒转换，会回绕成 21 亿毫秒量级的垃圾值（观测值 2217714954，约 25 天），超过 MySQL INT 列上限（2147483647），导致 log-reader `mod_log_mysql` 批量 INSERT 访问日志时整批失败。`durationMsUint32` 以 IsZero + 非负双防护统一防护上述五个字段：未调用后端或差值为负的耗时输出 0，下游 MySQL / Doris 落库与计费对账不受脏数据影响。
+
+### Responses API 缓存计量的 subset 语义
+
+Responses API 的 `input_tokens` 已包含 `cached_tokens`（`total_tokens = input_tokens + output_tokens`，与 Chat Completions / Gemini 的总输入口径一致）。协议适配层（`bfe/bfe_model_protocol/utils/usage_parse.go` 的 `ParseOpenAIUsageFields`）对 Responses 链直接取 `input_tokens` 作为 `PromptTokens`，不再叠加缓存拆分项——访问日志中 `ai_input_tokens` 为总输入、`ai_cache_read_tokens` 为其子集。Anthropic 协议则不同：`input_tokens` 只统计未命中缓存的新鲜 Token，不含 `cache_read_input_tokens` / `cache_creation_input_tokens`，协议适配层（`ParseAnthropicUsageFields`）保留 additive 归一化（`PromptTokens = input_tokens + cache_read + cache_creation`），与 OpenAI `prompt_tokens` 的总输入语义对齐。两种口径的差异在解析层统一收口，下游计费拆分与报表无需按协议区分。
 
 ### 控制面操作日志（审计数据源）
 
@@ -206,6 +218,65 @@ groups:
 | 预处理 | 正则匹配 `bfe_mod_ai_route_REQ_TOTAL\s+(\d+)` |
 
 对于复杂的指标解析，也可使用 Zabbix UserParameter 调用本地脚本，将 BFE 监控接口输出转换为 Zabbix Sender 可接收的格式。
+
+## 报表系统：轻量形态与标准形态
+
+日志与指标解决的是"数据采集"，报表解决的是"数据消费"。传统链路中，访问日志经 Kafka、Doris、Grafana 三个外部组件才能转化为可读的大盘，对小规模与私有化部署过重。为此，壬远 AI 网关将报表设计为两种可切换的部署形态，共享同一套查询 API 与控制台页面：
+
+| 项 | 轻量形态 | 标准形态 |
+|----|----------|----------|
+| 数据链路 | BFE 访问日志 → log-reader `mod_log_mysql` 插件 → MySQL | BFE 访问日志 → log-reader `mod_kafka` → Kafka → Doris Routine Load → Doris |
+| 明细表 | MySQL `bfe_ai_request_log`（89 列，与 Doris **同名同列**） | Doris `bfe_ai_request_log` |
+| 预聚合 | ai-gateway-api 内置分钟聚合 JOB | Doris 侧 INSERT JOB |
+| 报表展示 | ai-gateway-web 报表页（调用 `/report/*` API） | Grafana Dashboard（`/report/*` 也可直接查询 Doris） |
+| 外部依赖 | 仅需 MySQL | Kafka + Doris（+ Grafana） |
+| 适用场景 | 小规模 / 私有化部署，建议日均日志量 ≤ 百万级 | 大规模部署，日志量超 MySQL 容量时 |
+
+标准形态的官方组件（ai-gateway-observability 仓库）命名如下：Doris 侧建库 `bfe_observability`，含明细表 `bfe_ai_request_log` 与分钟聚合表 `bfe_ai_metrics_1m`；明细经 Routine Load `bfe_ai_log_load` 从 Kafka 灌入，分钟预聚合由 INSERT JOB `bfe_ai_metrics_1m_job` 在 Doris 侧完成；Grafana 以 MySQL 协议直连 Doris FE 查询端口（默认 9030）作为数据源，Dashboard 配置为 `grafana/dashboards/bfe-ai-gateway-observability.json`。部署入口为 `doris/setup.sh` 与 `grafana/setup.sh`：操作手册见 `doris/docs/user/HOWTO.md`、`grafana/docs/user/HOWTO.md`，表结构设计见 `doris/docs/design/TABLE_DESIGN.md`，Dashboard 面板与 SQL 见 `grafana/docs/design/DASHBOARD_DESIGN.md`，PB 字段 → log-reader JSON 字段映射见 `api/depends_api/req_log.md`。
+
+两条链路的关键设计取舍：
+
+- **插件直写数据库，不经控制面中转**。log-reader 随 BFE 部署在数据面，日志链路可用性不能依赖控制面（ai-gateway API）的发布与负载；访问日志是数据面最高吞吐的数据流，经 api 中转会形成汇聚瓶颈。这与既有 `mod_kafka` 直写 Kafka 的惯例一致。
+- **同名同列的表设计**。MySQL 明细表与 Doris 明细表同名同列，`ARRAY<STRUCT>` 列在 MySQL 侧以 JSON 列承载（仅用于明细展示，不做过滤条件）。查询 API 对两种后端返回结构一致的响应，差异仅在可选字段的有无。
+- **幂等写入**。唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model)` 与 Doris UNIQUE KEY 一致，写入采用 `INSERT ... ON DUPLICATE KEY UPDATE` 覆盖语义，log-reader 重发或 `-b` 补读不会产生重复数据。
+- **单集群单形态**。同一集群同时启用两种落库形态时，两套报表会因各自的数据缺口窗口而不一致，部署上应二选一。
+- **schema-first**。两张报表表（明细表 + 分钟聚合表）的 DDL 由 ai-gateway-api 仓库随版本发布（`db_ddl_report_mysql.sql`），部署流程先执行建表，再启用 log-reader 插件，插件自身不提供自动建表。
+- **最小权限账号**。log-reader 写入账号仅持有目标库目标表的 INSERT/UPDATE 权限（幂等覆盖需要 UPDATE），无 DDL/DELETE；ai-gateway-api 查询/聚合账号持有 SELECT 与聚合表 INSERT/DELETE、明细表 DELETE（非分区降级清理）及 ALTER TABLE（分区管理）。
+
+## 报表查询 API 设计
+
+报表查询 API 随 AI Gateway API v0.0.10 提供，统一挂载在 `/open-api/v1/report/*` 下，指标口径与既有 Grafana Dashboard 面板同源（QPS、错误率、Token 吞吐、平均/分位延迟、成本等）。无论底层是 MySQL 还是 Doris，同一套 API 与控制台页面均可使用。
+
+### 端点概览
+
+| 端点 | 功能 | 说明 |
+|------|------|------|
+| `GET /report/overview` | 总览指标卡 | 请求总量、错误率、Token 合计、平均/分位延迟、TTFT/TPOT、成本（按币种）、限流命中、鉴权拒绝等 |
+| `GET /report/timeseries` | 时序数据 | 按 `metric`（`qps`/`tokens`/`latency`/`ttft`/`tpot`/`cost`）返回桶化序列；桶由服务端按窗口自动计算（≤6h→1min，≤3d→5min，≤7d→30min） |
+| `GET /report/rankings` | TopN 排行 | 按维度（模型/请求模型/提供商/API Key/主机/状态码/协议/模式）排行，默认 10 条、上限 50 |
+| `GET /report/distribution` | 占比分布 | 状态码、协议、模式、是否流式的占比饼图数据，空值归一为 `unknown` |
+| `GET /report/logs` | 日志明细分页 | 明细行投影（字段名与表列名一致），支持 `err_only`、`keyword` 模糊匹配，`log_time` 倒序 |
+
+通用约定：`start`/`end` 为 Unix 秒、窗口上限 7 天；`models`、`apikey_ids`、`providers`、`hosts`、`stream`、`status_codes` 等过滤项可组合；所有端点要求 `FeatureReport + ActionReadAll` 权限（System scope 授予管理员，Product scope 预留 `Read` 给租户自助用量报表）。
+
+### 查询层抽象与双后端
+
+查询层定义 `ReportStorager` 接口（`Overview`/`TimeSeries`/`Rankings`/`Distribution`/`Logs` 五个方法），MySQL 与 Doris 各一套实现（`storage/mysqlreport`、`storage/dorisreport`），通过 `[Report].Backend` 配置切换。`ReportManager`（`model/ireport`）只做参数绑定校验（go-playground/validator 惯例）、窗口与枚举校验、bucket 计算和指标口径常量，自身不含 SQL。两后端的 SQL 方言差异（时间桶函数、分位数函数等）被封在各自实现内：
+
+- **分位数降级**：MySQL 无原生分位数，`latency_p50/p90/p99` 字段恒不存在，前端按字段有无降级展示；Doris 后端返回完整分位数。
+- **时区无关渲染**：DATETIME → Unix 秒统一采用 `TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', col)` 算术差（不做时区解读），避免会话时区导致的时间偏移——log-reader 按 UTC 墙钟存储，两侧口径一致。
+
+### MySQL 形态的后台 JOB（仅轻量形态）
+
+MySQL 没有 Doris 的定时 INSERT 聚合，预聚合由 ai-gateway-api 内嵌 JOB 完成（Doris 形态不启动 JOB）：
+
+- **分钟聚合 JOB**：按 `AggregateIntervalSec`（默认 60s）周期，把上一整分钟的明细 `GROUP BY` 37 个维度写入聚合表 `bfe_ai_metrics_1m`（37 维 + 24 指标，与 Doris 聚合表维度集合一致）。写入采用「`DELETE` 时间窗 + `INSERT SELECT`」单事务，窗口重放幂等；多副本部署用 MySQL `GET_LOCK('report_agg_job', 0)` 抢锁防重。进程重启不补历史窗口（接受 ≤1 分钟空洞，与 Doris INSERT JOB 语义对称）。
+- **分区管理 JOB**：每 6h 巡检，向前预建 3 天分区、DROP 超出 `RetentionDays`（默认 7 天）的过期分区；探测到非分区表时自动降级为 `DELETE ... LIMIT` 分批清理。分区必须先于数据到达建好（MySQL 无动态分区，缺分区写入直接报错），因此 JOB 启动时会立即补建一次。
+- **DDL 归属**：两张表的 DDL 归 ai-gateway-api 仓库发布。理由是其对 schema 依赖面最广（聚合 JOB 按列取数、分区管理执行 ALTER、明细查询三处依赖），且是该代码库唯一有 MySQL DDL 管理传统的仓库。
+
+### 模块装配与发布顺序
+
+`[Report]` 配置缺省时报表模块整体不装配，`/report/*` 路由不注册（404），属纯增量能力。发布顺序为：发布含 DDL 与报表模块的 api 版本 → 部署流程执行 DDL（schema-first，初始分区覆盖建表日后 3 天）→ 启用 log-reader `mod_log_mysql` 插件 → 配置 `[Report].Backend = "mysql"`（或 `"doris"` 接存量 Doris）→ ai-gateway-web 报表页同步发布。
 
 ## 错误码体系
 
@@ -316,6 +387,8 @@ StdOut      = false
 - 控制面操作日志记录每一次配置变更的操作者、资源、变更摘要（含 diff_keys）与请求上下文，敏感字段已脱敏，可通过 `GET /open-api/v1/operation-logs` 审计查询；
 - 关键监控指标包括 `REQ_TOTAL`、路由命中/未命中/兜底、限流触发、配额命中与拒绝、Token 消耗速率、TTFT/TPOT 等；
 - Prometheus 可通过 Pull 方式采集 BFE 指标，Zabbix 可通过 HTTP Agent 或自定义脚本接入；
+- 报表系统提供轻量（log-reader 直写 MySQL，无需 Kafka/Doris/Grafana）与标准（Kafka → Doris → Grafana）两种形态，单集群应只启用一种；两形态明细表同名同列，共享同一套 `/report/*` 查询 API 与控制台报表页；
+- 报表查询 API 通过 `ReportStorager` 接口屏蔽 MySQL/Doris 方言差异，MySQL 形态由内置分钟聚合 JOB 与分区管理 JOB 提供预聚合与生命周期管理，`[Report]` 缺省时模块不装配（端点 404）；
 - 错误码体系分为认证与准入、限流检查、配额扣减、转发与协议适配四个层级，与访问日志字段存在明确对应关系；
 - 告警应覆盖错误率、限流、配额、路由命中率、延迟与重试等维度，并按产品线或租户拆分通知。
 
@@ -329,5 +402,13 @@ StdOut      = false
 - `bfe/docs/zh_cn/modules/mod_ai_rate_limit/mod_ai_rate_limit.md` — AI 限流模块文档
 - `ai-gateway-api/docs/zh_cn/config_param.md` — AI Gateway API 配置文件说明
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/operation-logs.md` — 操作日志接口定义
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/report.md` — 报表查询接口定义
+- `ai-gateway-api/design-docs/modifications/2026-09-15-report-query-api/change-summary.md` — 报表查询 API 变更摘要
+- `ai-gateway-api/db_ddl_report_mysql.sql` — 报表明细表与聚合表 DDL（MySQL 形态）
+- `log-reader/doc/modules/mod_log_mysql/mod_log_mysql.md` — mod_log_mysql 插件说明
+- `ai-gateway-observability/doris/docs/user/HOWTO.md` — Doris 部署手册（标准形态）
+- `ai-gateway-observability/doris/docs/design/TABLE_DESIGN.md` — Doris 表结构设计
+- `ai-gateway-observability/grafana/docs/design/DASHBOARD_DESIGN.md` — Grafana Dashboard 面板与 SQL 设计
+- `ai-gateway-observability/api/depends_api/req_log.md` — PB 字段 → log-reader JSON 字段映射
 - `bfe_basic/request_ai_basic.go` — AI 上下文与错误码 Go 语言定义
 - `bfe_modules/mod_access_pb3/` — 访问日志输出模块

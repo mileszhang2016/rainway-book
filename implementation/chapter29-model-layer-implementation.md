@@ -650,6 +650,25 @@ _, err = m.planStorager.UpdateQuotaPlan(ctx, &QuotaPlanFilter{
 
 需要注意，手动重置路径（`QuotaPlanManager.ResetBalance`）仍走 `ResetToQuota`（内部即 `SetRemaining` 的 `IncrBy(delta)`），因为手动重置要求把剩余量补到配额总量、需要基于当前值算差额；周期重置则要求“无条件归零到配额总量”，两者语义不同，实现也刻意分开。
 
+## 报表模块：ReportManager 与双后端 Storager
+
+报表查询（`/report/*`）是 Manager + Storager 模式在多数据源下的应用。控制面库之外的报表库（MySQL `bfe_report` 或 Doris `bfe_observability`）只读查询，不走 `itxn.TxnStorager` 事务体系，因此模型层直接定义查询接口并由存储层实现：
+
+```go
+// ai-gateway-api/model/ireport/types.go
+type ReportStorager interface {
+    Overview(ctx context.Context, f *Filter) (*OverviewResult, error)
+    TimeSeries(ctx context.Context, metric string, f *Filter, bucketSec int) ([]*MetricPoint, error)
+    Rankings(ctx context.Context, dimension string, f *Filter, limit int) ([]*RankingItem, error)
+    Distribution(ctx context.Context, dimension string, f *Filter) ([]*DistItem, error)
+    Logs(ctx context.Context, f *LogFilter) (*LogQueryResult, error)
+}
+```
+
+`ReportManager`（`model/ireport/manager.go`）的职责与同层其他 Manager 一致——参数绑定校验（go-playground/validator 惯例）、枚举与窗口校验（时间窗 ≤7 天）、bucket 计算（≤6h→60s、≤3d→300s、≤7d→1800s）与指标口径常量（错误率 = `error_count/request_count`、TTFT/TPOT 仅聚合流式请求等），自身不含 SQL，查询全部委托 `ReportStorager`。双后端（`storage/mysqlreport`、`storage/dorisreport`）共享同一接口，方言差异（时间桶函数、分位数函数）封在各自实现内，Manager 与接口层对后端无感知。
+
+装配由 `stateful/container/rdb/components.go` 按 `[Report].Backend` 完成：配置为 `mysql` 时装配 MySQL 实现并启动聚合/分区 JOB；为 `doris` 时装配 Doris 实现（聚合由 Doris 侧既有 INSERT JOB 完成，不启动 JOB）；配置缺省则 `ReportManager` 为 nil，接口层据此不注册 `/report/*` 路由（见第二十八章的条件装配）。鉴权上新增 `FeatureReport`：System scope 授予 `ReadAll`（当前控制台仅管理员），Product scope 授予 `Read` 为租户自助用量报表预留。
+
 ## 关键代码片段
 
 ### 1. 事务抽象接口

@@ -19,7 +19,7 @@ EPP 调度的工作原理与设计语义见 [第十六章 EPP智能调度设计]
 
 使用 EPP 智能调度前，确认以下组件已随部署安装并运行：
 
-- **ai-gateway-epp（EPP 组件）**：以实例组为单位部署，生产环境每组 2 实例（互为主备），测试环境允许单实例组。实例经命令行参数运行，关键参数如下：
+- **ai-gateway-epp（EPP 组件）**：以实例组为单位部署，每组 1~2 个实例：生产环境每组 2 实例互为主备，测试环境可单实例组（仅主、无备）；超过 2 个实例的组在 `/epp-pool` 校验时返回 422。实例经命令行参数运行，关键参数如下：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -33,6 +33,9 @@ EPP 调度的工作原理与设计语义见 [第十六章 EPP智能调度设计]
 | `-metrics-port` | `9090` | Prometheus 指标端口 |
 | `-grpc-tls-cert` / `-grpc-tls-key` | 空（明文） | ext_proc 与 health gRPC 服务端 TLS 证书；生产环境建议开启，BFE 侧以 `EPPTLS.CAFile` 校验 |
 | `-refresh-metrics-interval` | `50ms` | 后端 `/metrics` 指标抓取周期 |
+| `-local-config-dir` | 环境变量 `AI_GATEWAY_EPP_LOCAL_CONFIG_DIR`（缺省空） | 非空时从本地目录的 JSON 文件（`cluster_table.json`、`epp_data_config.json`）加载集群级调度配置，不连接 InnerAPI，用于本地调试与集成测试；每个轮询周期重读文件，修改在下一个周期生效（无需重启），文件缺失或 JSON 非法时沿用上一份成功配置 |
+
+发布二进制可通过 `ai-gateway-epp` 仓库的 `make release` 交叉编译并打包 linux/amd64 与 linux/arm64 的 tarball。
 
 - **BFE**：经 `GslbBasic.BalanceMode=EPP` 与有序 `EPPAddr=[主,备]` 访问 EPP，相关配置由 AI Gateway API 经 server_data_conf 自动下发，Conf Agent 完成热加载，无需手工编辑。
 - **AI Gateway API**：OpenAPI 与 InnerAPI 正常运行；EPP 实例经 InnerAPI 轮询 `epp_data` 与 `cluster_table`，鉴权与版本增量机制与其他数据面组件一致。
@@ -86,7 +89,7 @@ curl -X GET "https://control-plane.example.com/open-api/v1/epp-pool"
 - 实例 `id` 非空、池内全局唯一（EPP 以 `-instance-id` 与此值匹配）；
 - `host` 为 Hostname 或 IP（IPv6 字面量不带括号），`port` 为合法端口；
 - `(host, port)` 组合池内全局唯一；
-- 生产环境每组恰 2 实例（主备），测试环境允许单实例组（仅主、无备）。
+- 每组 1~2 个实例（生产 2 实例互为主备，测试可单实例组），超过 2 个实例的组返回 422。
 
 ---
 
@@ -269,6 +272,7 @@ curl -X PUT "https://control-plane.example.com/open-api/v1/clusters/llm-cluster-
 | 降级导出 | AI Gateway API error 日志 | EPP 模式 Cluster 无有效分配时输出 error 级日志（含 Cluster 名与原因），导出降级为该 Cluster `BalanceMode=WRR` | error 日志出现即告警；配合 `unassigned_clusters` 巡检 |
 | BFE EPP 调用 | BFE 监控端口 `/monitor/epp_metrics` | `epp_calls_total{cluster,result}`（result ∈ ok/no_pool/unknown_pool/draining/transport）、`epp_fallback_local_total{cluster}`、`epp_failover_total{cluster}`、`epp_failback_total{cluster}`、`epp_active_addr_index{cluster}` | `epp_calls_total{result!="ok"}` 突增、failover 计数增长、`epp_fallback_local_total` 持续增长均提示 EPP 链路异常 |
 | EPP 实例 | EPP `/metrics`（默认 `:9090`） | `ai_epp_assignment_no_match`（本实例在分配中无任何角色）、`ai_epp_poller_failures_total` / `ai_epp_poller_backoff_state`（轮询失败与退避）、`ai_epp_engine_reloads_total`（引擎热加载次数）、`ai_epp_cell_state`（Cell 角色与状态） | `assignment_no_match=1` 说明 `-instance-id` 与 `/epp-pool` 不一致，部署核对；poller 失败持续非零说明控制面不可达 |
+| 请求链路关联 | EPP 日志（demux） | EPP 日志携带 `x-request-id`：demux 从首个 ext_proc 消息的请求头读取该值（网关注入则透传），未携带时生成 UUID 并回写到请求头，llm-d 引擎日志使用同一 request ID | 排障时按 `x-request-id` 串联 BFE → EPP → llm-d 引擎三方日志，定位单请求全链路 |
 
 判断请求是否真正经过 EPP 调度（而非兜底 WRR）：BFE 对 EPP 失败静默回退也返回 200，因此应以 `epp_calls_total{result="ok"}` 是否增长为准，不能只看响应码。
 
@@ -282,7 +286,7 @@ curl -X PUT "https://control-plane.example.com/open-api/v1/clusters/llm-cluster-
 - 实例 id 非空、池内全局唯一；
 - `host` 为 Hostname 或 IP，`port` 为合法端口；
 - `(host, port)` 池内全局唯一；
-- 生产每组恰 2 实例；测试允许单实例组。
+- 每组 1~2 个实例（生产 2 实例互为主备，测试允许单实例组），超过 2 个实例/组返回 422。
 
 **`/clusters`（balance_mode 与 epp_config）**
 
@@ -310,7 +314,7 @@ curl -X PUT "https://control-plane.example.com/open-api/v1/clusters/llm-cluster-
 - 摘流后端 = Provider 实例 `weight=0`，cluster_table 导出与 EPP discovery 秒级摘除；上下线 EPP 实例 = 修改 `/epp-pool`，悬空分配自动修复。
 - EPP 实例故障由 BFE `EPPCheck` 滞回切换；standby 不自动承担调度，兜底流量由 BFE 本地 WRR 承接；全过载时 EPP 无候选、BFE 兜底，业务不中断。
 - 关闭 EPP 调度只需 `balance_mode=WRR`，epp_config 与分配休眠保留，可再切回。
-- 观测覆盖三层：AI Gateway API error 日志（降级导出）、BFE `/monitor/epp_metrics`（`epp_calls_total` / `epp_fallback_local_total`）、EPP `/metrics`（`ai_epp_assignment_no_match` 等）。
+- 观测覆盖三层：AI Gateway API error 日志（降级导出）、BFE `/monitor/epp_metrics`（`epp_calls_total` / `epp_fallback_local_total`）、EPP `/metrics`（`ai_epp_assignment_no_match` 等）；EPP 日志携带 `x-request-id`，可按 request ID 串联 BFE → EPP → llm-d 引擎三方日志。
 
 ---
 
@@ -324,5 +328,6 @@ curl -X PUT "https://control-plane.example.com/open-api/v1/clusters/llm-cluster-
 - `ai-gateway-api/design-docs/modifications/2026-09-08-epp-scheduling-integration/api-changes.md`
 - `ai-gateway-api/design-docs/sys-design/details/EPP调度对接.md`
 - `ai-gateway-epp/cmd/epp/config.go`
+- `ai-gateway-epp/docs/zh_cn/modifications/2026-09-14-local-config-file/design.md`
 - `integration-test/test-cases/测试设计文档/scenario-SC28-EPP调度端到端/场景说明.md`
 - [第十六章 EPP智能调度设计](../design/chapter16-epp-scheduling-design.md)

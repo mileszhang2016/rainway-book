@@ -235,6 +235,7 @@ CREATE TABLE entity_types (
 CREATE TABLE entities (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
+    description VARCHAR(255) NOT NULL DEFAULT '',
     type VARCHAR(64) NOT NULL,
     parent_id VARCHAR(64) DEFAULT NULL,
     allow_models TEXT COMMENT 'JSON array',
@@ -246,6 +247,8 @@ CREATE TABLE entities (
     update_time BIGINT NOT NULL
 );
 ```
+
+`description` is an optional description field: 0-255 characters, with control characters not allowed. Existing deployments can add the column via `ALTER TABLE entities ADD COLUMN description VARCHAR(255) NOT NULL DEFAULT ''`. The field is searchable and sortable in the Dashboard entity list, making it easy to filter organizational nodes by business meaning.
 
 ### `api_keys` Table
 

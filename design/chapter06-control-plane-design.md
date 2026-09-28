@@ -311,15 +311,19 @@ router.Use(middleware.MCCors)
 `change_summary`（`mediumtext`，存 JSON）记录变更前后的关键字段快照，由 `model/ioperlog/change_summary.go` 的 `BuildChangeSummary` 构造：
 
 - `before` / `after`：变更前后的字段 map，均先经 `MaskSensitiveFields` 脱敏；
-- `diff_keys`：仅 update 类日志携带，表示 after 相对 before **新增或值发生变化的键**（before 独有的键不计入，避免部分更新请求产生假阳性 diff），键名排序后存储。
+- `diff_keys`：仅 update 类日志携带，表示 after 相对 before **新增或值发生变化的键**（before 独有的键不计入，避免部分更新请求产生假阳性 diff；未提交的字段即 nil 值键，在快照构造时经 `ParamToMap` 丢弃），键名排序后存储。
+
+cluster 资源的审计快照是一个例外：它不使用 `ParamToMap` 的默认映射，而是手写为与 `GET /clusters` 一致的 API 小写词汇（如 `hash_strategy` 落字符串枚举、`epp_config` 落解码 JSON 对象、`balance_mode` 空值规范为 `WRR`），并裁剪 `id` / `ready` / `product_id` / `scheduler` / `sub_clusters` 等 API 未暴露的内部字段，保证 `change_summary` 与 API 语义一致。
 
 脱敏规则（`model/ioperlog/mask.go`）按小写键名匹配，并对嵌套 map 递归处理：
 
 | 键名 | 脱敏结果 |
 |------|----------|
-| `password` / `secret` / `session_key` / `private_key`（及无下划线变体） | `******` |
+| `password` / `secret` / `session_key` / `private_key` / `token` / `access_token` / `refresh_token` / `session_token` / `id_token` / `secret_key` / `client_secret` / `access_key`（及无下划线变体） | `******` |
 | `api_key` / `apikey` / `key` | 保留首尾 4 位，中间以 `****` 代替；长度不超过 8 时整体脱敏 |
 | `certificate` / `cert` / `cert_body` / `private_key_body` | `[已更新]` |
+
+`error_msg` 在源头构造审计条目时即做值级脱敏：对 API-Key 等敏感明文做全文替换，消息中出现的 Key 明文被替换为保留首尾 4 位的掩码形式（`ioperlog.MaskErrorMessage`，`model/api_key/api_key_operation_log.go` 调用），避免错误回显泄露凭证。
 
 ### 覆盖范围
 
@@ -337,7 +341,7 @@ router.Use(middleware.MCCors)
 | auth/users（含 session reset） | create / update / delete / reset |
 | auth/tokens | create / delete |
 
-domain 与 rate_limit_policy 当前不产生操作日志。
+quota_plan 与 rate_limit_policy 没有独立的 OpenAPI 资源，但会随 Entity / API-Key 的嵌套创建、更新、删除产生审计日志：`resource_type` 分别为 `quota_plan` / `rate_limit_policy`，`resource_parent_id` 记录所属 Entity 或 API-Key。domain 当前不产生操作日志。
 
 ### 查询接口
 

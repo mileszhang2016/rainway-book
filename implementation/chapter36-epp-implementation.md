@@ -32,6 +32,9 @@ ai-gateway-epp 是基于 llm-d EPP 的多 Cluster 调度器：它以配置驱动
 | `-default-pool` | 空 | 请求缺失 inference-pool metadata 时的兜底 Cluster（空 = 拒绝） |
 | `-engine-drain-timeout` | `60s` | 引擎热交换时旧引擎的在飞请求 drain 上限 |
 | `-refresh-metrics-interval` | `50ms` | 后端 `/metrics` 指标抓取周期 |
+| `-local-config-dir` | 环境变量 `AI_GATEWAY_EPP_LOCAL_CONFIG_DIR`，缺省空 | 本地配置目录：非空时以 `LocalFileSource` 从本地 JSON 加载集群级配置，不连接 InnerAPI（空 = 使用 InnerAPI） |
+
+构建方面，仓库 Makefile 的 `make release` 交叉编译 linux/amd64 与 linux/arm64 的发布 tarball，`make clean` 清理构建产物。
 
 ### 双 poller + Cell 引擎架构
 
@@ -60,9 +63,11 @@ flowchart TD
 - **epp_data poller**（`pkg/poller/epp_data.go` 的 `EppDataWatcher`）：单次拉取同时获得两段配置。对 assignment 全量视图以 `-instance-id` 自匹配角色（`resolveRole` 纯函数：primary 命中 → `RolePrimary`，standby 命中 → `RoleStandby`，均未命中 → `RoleNone` 跳过），再与本地 Cell 集合 diff，驱动 `pkg/cell/manager.go` 的 `Ensure` / `Promote` / `Demote` / `Drop`。`epp_config` 段与 assignment 段在同一 version 快照内处理，两段天然一致。本实例无任何角色时置 `ai_epp_assignment_no_match` 指标，便于部署排查 id 配错。
 - **cluster_table discovery poller**（`pkg/poller/discovery.go`）：把 cluster_table 导出的后端实例列表 diff 为各 Cluster 的端点集合；`Weight==0` 的实例视为摘流直接跳过，已从导出中消失的实例随之摘除。
 
+两个 poller 的数据源可切换为本地文件：`-local-config-dir`（环境变量 `AI_GATEWAY_EPP_LOCAL_CONFIG_DIR`）非空时，`cmd/epp/main.go` 以 `pkg/poller/local_source.go` 的 `LocalFileSource` 取代 InnerAPI 客户端，从本地目录读取 `cluster_table.json` 与 `epp_data_config.json`（内容即 InnerAPI 响应的 `Data.Config` 层，不含 envelope 与 version 字段），完全不连接 InnerAPI。取数-消费流程、Cell 生命周期与引擎编译-切换链路完全复用；本地文件无版本语义，每轮询周期（默认 5s）全量重读，修改在下一个周期生效，文件缺失或 JSON 非法按轮询失败处理（指数退避重试、沿用上一份成功配置）。目录中还可放置 `epp_pool.json`（实例池定义），仅供调试参考，EPP 不消费。该模式面向本地调试与集成测试，生产仍以 InnerAPI 热加载为准。
+
 Cell 引擎的热交换在 `pkg/cell/manager.go`：epp_config 变化时按 Cluster 重新编译引擎（`pkg/cell/compile.go`，llm-d loader 加载完整 `EndpointPickerConfig`），hash 比对后原子换指针，旧引擎 drain（默认 60 秒）后销毁；单个 Cluster 编译失败只影响该 Cluster（沿用旧引擎），不波及其他 Cluster。
 
-demux（`pkg/demux/server.go`）是 ext_proc gRPC 服务端：从首个消息的 `MetadataContext` 提取 `llm-d.ai → inference-pool`（即 Cluster 名）路由到对应 Cell；非 primary Cell 返回 `ErrCellDraining`（BFE 据此把 `cell is not serving` 归类为 draining 错误并在下一地址重试）；决策结果经响应 `dynamic_metadata` 的 `envoy.lb → x-gateway-destination-endpoint` 返回。
+demux（`pkg/demux/server.go`）是 ext_proc gRPC 服务端：从首个消息的 `MetadataContext` 提取 `llm-d.ai → inference-pool`（即 Cluster 名）路由到对应 Cell；非 primary Cell 返回 `ErrCellDraining`（BFE 据此把 `cell is not serving` 归类为 draining 错误并在下一地址重试）；决策结果经响应 `dynamic_metadata` 的 `envoy.lb → x-gateway-destination-endpoint` 返回。demux 同时承担请求关联：从首个 ext_proc 消息的请求头读取 `x-request-id`，缺失时生成 UUID 并回写到请求头——llm-d 引擎日志与 EPP 自身日志共享同一 request ID，每请求 logger 均携带该值，BFE → EPP → 推理引擎三方日志可按 request ID 串联。
 
 ---
 
@@ -76,7 +81,7 @@ demux（`pkg/demux/server.go`）是 ext_proc gRPC 服务端：从首个消息的
 |------|------|
 | `epp_pool.go` | 实例池读写：`/epp-pool` 的 GET/PATCH 语义（全量替换 `epp_instances`）与字段校验（组名唯一、id 唯一、`(host,port)` 唯一、组规模） |
 | `epp_config.go` | `epp_config` 简化形态的结构定义与字段校验（枚举、范围、秒数取值、session 亲和成对规则） |
-| `compiler.go` | 编译器：把简化 `epp_config` 确定性展开为完整 `EndpointPickerConfig`——固定注入 `cluster-table-discovery` / `utilization-filter` / scorer / `max-score-picker` / `openai-parser`，按档位与 `cache_affinity` 映射 (kv, queue) 权重，按开关条件注入亲和 scorer，展开 `flowControl` 段与 `featureGates`；规则以代码模板固化并有单测覆盖 |
+| `compiler.go` | 编译器：把简化 `epp_config` 确定性展开为完整 `EndpointPickerConfig`——固定注入 `cluster-table-discovery` / `utilization-filter` / scorer / `max-score-picker` / `openai-parser`，按档位与 `cache_affinity` 映射 (kv, queue) 权重，按开关条件注入亲和 scorer，展开 `flowControl` 段与 `featureGates`；规则以代码模板固化并有单测覆盖；`flowControl` 始终显式携带 priority 0 band（EPP 所有请求运行于 band 0，避免 llm-d 隐藏 band 默认值 5000 并发 / 1GB 内存把全局 `max_requests` 静默截断；`max_requests` 缺省 / `-1` 时 band 0 显式取 10000 并发、5Gi 内存） |
 | `assignment.go` | 分配器：贪心 + 确定性 tie-break 的选组选主算法，upsert `epp_assignments`（只存 primary_instance_id） |
 | `reconciler.go` | 周期对账（30 秒，可配）：扫描全部 `balance_mode=EPP` 的 Cluster，对无有效分配或分配悬空者自动修复（组内重选 → 跨组重分配 → 清除分配），幂等，大部分轮次零写入 |
 | `epp_data.go` | epp_data generator：导出时合并两段配置——epp_config 段（按 Cluster 编译）+ assignment 段（`epp_assignments` 与 `epp_instances` 读时 join 的全量视图，单实例组 `standby=null`），走 `VersionControlManager.ExportConfig` 框架（topic `ConfigTopicEppData`，MD5 签名 + version 增量） |
@@ -106,14 +111,17 @@ BFE 侧的实现集中在配置解析、负载均衡与反向代理三个位置�
 
 `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`：
 
-- `BalanceModeEPP = "EPP"` 枚举（`:66`）；`GslbBasicConf` 携带 `EPPAddr *[]string`（有序主备）与 `EPPCheck` / `EPPTimeout` / `EPPTLS` / `EPPBreaker` 四个可选结构（`:423-432`），全部带缺省值；
-- EPP 模式校验（`:785` 起）：`BalanceMode=EPP` 时 `EPPAddr` 非空（`:786`），`checkEPPAddrs` 校验元素为 `host:port` 且列表内去重（`:822`），`EPPCheckConfCheck` / `EPPTimeoutConfCheck` / `EPPTLSConfCheck` 填充缺省并校验（`Insecure=false` 时 `CAFile` 必须可读）；
+- `BalanceModeEPP = "EPP"` 枚举（`:66`）；`GslbBasicConf` 携带 `EPPAddr *[]string`（有序主备）与 `EPPCheck` / `EPPTimeout` / `EPPTLS` / `EPPBreaker` 四个可选结构（`:481-485`），全部带缺省值；
+- EPP 模式校验（`GslbBasicConfCheck`，`:808` 起）：`BalanceMode=EPP` 时 `EPPAddr` 非空（`:838`），`checkEPPAddrs` 校验元素为 `host:port` 且列表内去重（`:880`），`EPPCheckConfCheck` / `EPPTimeoutConfCheck` / `EPPBreakerConfCheck` / `EPPTLSConfCheck` 填充缺省并校验。`EPPTLS` 未配置时自动填充 `{Insecure: true}`（TLS 但跳过证书校验）并输出告警日志，提示显式配置（`:862-866`）；`EPPTLSConfCheck`（`:1023`）按三选一互斥校验：`Plaintext`（明文拨号）与 `Insecure` / `CAFile` 互斥，非 Plaintext 且 `Insecure=false` 时 `CAFile` 必须可读；
+- 拨号侧 `epp.NewGrpcConn`（`bfe/bfe_util/epp/epp_client.go`）按 `plaintext` 选用 `insecure.NewCredentials()` 明文凭证，否则按 `insecureSkip` / `caFile` 构造 TLS 配置；
 - 校验失败走 fail-fast：该次 reload 报错拒绝、保留旧配置生效，不静默降级。
+
+运维约束：滚动升级须先全量升级 BFE 二进制，再下发含 `Plaintext` 的 cluster_conf 配置。旧版本 BFE 不认识 `Plaintext` 字段，该配置会被解析为"无 CAFile 的 TLS"形态而拒绝加载（fail-fast），导致热加载失败。
 
 ### ext_proc 调用与调度接入
 
 - `bfe/bfe_util/epp/epp_client.go`：ext_proc gRPC 客户端。每 EPP 地址维护长连接（stream 按请求建立）；首个 `ProcessingRequest` 由 `BuildEnvoyGRPCHeaders` 构造请求头，并注入 `MetadataContext.FilterMetadata["llm-d.ai"] = {"inference-pool": <cluster名>}`；响应路径经 `EppResponseBodyFilter` 流式回传 body，回传采用有界缓冲，溢出时整流放弃并计数打点，保证 EndOfStream 一定送达。
-- `bfe/bfe_balance/bal_gslb/bal_gslb.go`：`BalanceGslb` 持有 `eppAddrs` 有序地址表与活跃索引。`initEPP` / `closeEPP`（`:124-168`）管理连接与每个地址的后台健康检查 goroutine（gRPC health，参数来自 `EPPCheck`）；`chooseBackendFromEPP`（`:173-277`）构造并发送首个 ext_proc 消息，等待决策；`BalanceEpp`（`:492-528`）把 EPP 决策地址映射为本地后端构造临时 backend；`SetGslbBasic`（`:88-111`）按 `BalanceMode` 分发——EPP 构建/刷新地址状态机，非 EPP 关闭 EPP 连接。
+- `bfe/bfe_balance/bal_gslb/bal_gslb.go`：`BalanceGslb` 持有 `eppAddrs` 有序地址表与活跃索引。`SetGslbBasic`（`:92`）按 `BalanceMode` 分发，并记录 `EPPTLS.Plaintext` 明文拨号模式（`:166`）；`initEPP` / `closeEPP`（`:203` / `:252`）管理连接与每个地址的后台健康检查 goroutine（gRPC health，参数来自 `EPPCheck`）；`chooseBackendFromEPP`（`:287`）构造并发送首个 ext_proc 消息，等待决策；`BalanceEpp`（`:699`）把 EPP 决策地址映射为本地后端构造临时 backend。
 - `bfe/bfe_server/reverseproxy.go`（`:345-355`）：请求侧接入。EPP 模式调 `BalanceEpp`；失败回退本地 `Balance()`（WRR）；重试复用同连接建新 stream。
 - 滞回状态机：活跃地址连续失败 `FailThreshold` 次 failover 到下一地址，进入 `Cooldown` 冷却期不回切；冷却期后更高优先级地址连续通过 `SuccessThreshold` 次检查才 failback。对 `Unavailable / cell is not serving` 与 `unknown inference pool` 错误不等健康检查周期，直接在同 Cluster 的下一地址重试该请求。
 
@@ -130,6 +138,7 @@ sequenceDiagram
     BFE->>EPP: ProcessingRequest（RequestBody）
     EPP->>EPP: filter（utilization-filter）+ 加权打分 + max-score-picker
     EPP-->>BFE: 决策端点地址（envoy.lb → x-gateway-destination-endpoint）
+    Note over EPP: 读取或生成 x-request-id 并回写请求头，三方日志同 ID 关联
     BFE->>RS: 按决策地址构造临时 backend 转发
     RS-->>BFE: 响应
     BFE->>EPP: ResponseHeaders + 流式 body 回传
@@ -156,9 +165,9 @@ sequenceDiagram
 | `pkg/innerapi/client.go` | InnerAPI HTTP 客户端：`{ErrNum, ErrMsg, Data, WorkMode}` envelope、`?version=` 增量、`Data==null` 语义；`EppDataConfigPath = "/configs/epp_data/config"` |
 | `pkg/cell/manager.go` | Cell 生命周期与引擎原子热交换（hash 比对 → 编译 → 换指针 → 旧引擎 drain 销毁）；`ai_epp_engine_reloads_total` / `ai_epp_cell_state` |
 | `pkg/cell/compile.go` | 以 llm-d loader 加载编译后的 `EndpointPickerConfig`；单 Cluster 编译失败沿用旧引擎（防御兜底） |
-| `pkg/demux/server.go` | ext_proc gRPC server：`extractPool` 从 metadata 提取 inference-pool 路由 Cell；非 primary 返回 `ErrCellDraining`；决策地址写入 `envoy.lb → x-gateway-destination-endpoint` |
+| `pkg/demux/server.go` | ext_proc gRPC server：`extractPool` 从 metadata 提取 inference-pool 路由 Cell；非 primary 返回 `ErrCellDraining`；决策地址写入 `envoy.lb → x-gateway-destination-endpoint`；从首个消息请求头读取或生成 `x-request-id` 并回写，作为请求关联键贯穿引擎与 EPP 日志 |
 | `cmd/epp/plugins.go` | 插件注册：`prefix-cache-scorer`、`session-affinity-scorer`、`flowcontrol` 插件族、`approx-prefix-cache` producer、`cluster-table-discovery`；`flowControl` feature gate 默认关闭，由配置 `featureGates` 启用 |
-| `cmd/epp/main.go` | 组装：解析配置 → 建 InnerAPI client → 启动 epp_data 与 cluster_table 两个 poller → 起 demux/health/metrics 服务 |
+| `cmd/epp/main.go` | 组装：解析配置 → 按 `-local-config-dir` 二选一建数据源（本地文件源 / InnerAPI client）→ 启动 epp_data 与 cluster_table 两个 poller → 起 demux/health/metrics 服务 |
 
 调度插件的语义要点：utilization-filter 先于打分执行（fail-closed），后端指标缺失时中性化（kv 得分视为 1.0、filter 不生效）；prefix-cache-scorer 的索引是本地 per-endpoint LRU；session-affinity-scorer 从 `session_affinity_header` 解析 session id，binding 状态为本地内存；亲和 scorer 均为加权求和中的普通一项（输出 clamp [0,1] × 固定权重 1.0），属于软亲和。
 
@@ -181,7 +190,8 @@ sequenceDiagram
 - `ai-gateway-api/model/epp_pool/`（`compiler.go`、`assignment.go`、`reconciler.go`、`epp_data.go`）
 - `ai-gateway-api/endpoints/openapi_v1/epp_pool/`、`endpoints/openapi_v1/epp_assignments/`、`endpoints/innerapi_v1/epp_data/`
 - `ai-gateway-epp/docs/zh_cn/modifications/2026-09-08-epp-scheduling-integration/design-changes.md`
-- `ai-gateway-epp/pkg/poller/epp_data.go`、`pkg/poller/discovery.go`、`pkg/cell/manager.go`、`pkg/demux/server.go`
+- `ai-gateway-epp/docs/zh_cn/modifications/2026-09-14-local-config-file/design.md`
+- `ai-gateway-epp/pkg/poller/epp_data.go`、`pkg/poller/discovery.go`、`pkg/poller/local_source.go`、`pkg/cell/manager.go`、`pkg/demux/server.go`
 - `bfe/docs/zh_cn/modifications/2026-09-06-epp-ai-gateway-integration/design-changes.md`
 - `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`
 - `bfe/bfe_balance/bal_gslb/bal_gslb.go`、`bfe/bfe_balance/bal_gslb/epp_metrics.go`

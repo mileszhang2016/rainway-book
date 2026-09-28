@@ -5,7 +5,7 @@
 Through this chapter, readers will understand:
 - How the Rainway AI Gateway addresses the core problems enterprises face when integrating LLM services at scale;
 - The overall architecture of the Rainway AI Gateway and the division of responsibilities between the Control Plane and the Data Plane;
-- How the core components (AI Gateway API, Dashboard, BFE, Conf Agent, Service Controller) work together;
+- How the core components (AI Gateway API, Dashboard, BFE, Conf Agent, Service Controller, Log Reader) work together;
 - The full lifecycle of a configuration from creation to taking effect;
 - Typical deployment topologies.
 
@@ -83,7 +83,7 @@ Before using the Rainway AI Gateway, you need to understand the following key co
 
 | Concept | English | One-line Description |
 |---|---|---|
-| AI Gateway instance pool | Server Data | Registers Data Plane BFE engine addresses; the Control Plane uses it to know who to deliver configurations to |
+| BFE cluster | BFECluster | Registers Data Plane BFE engine addresses; the Control Plane uses it to know who to deliver configurations to (Server Data, maintained by deployment seed data, no OpenAPI management endpoint) |
 | Model provider | Provider | Describes a model service provider, including protocol type, backend instance pool, model list, and authentication keys |
 | AI business cluster | Cluster | The backend cluster to which traffic is actually forwarded; declares its upstream capability by referencing a Provider |
 | Organization | Entity | Represents organizational structures such as departments, teams, or projects; the mount point for quota, rate limit, model access control, and routing rules |
@@ -92,9 +92,9 @@ Before using the Rainway AI Gateway, you need to understand the following key co
 | Quota plan | Quota Plan | Sets a budget cap for an Entity / API-Key, denominated in RMB or Tokens |
 | Rate limit policy | Rate Limit Policy | Limits request rate along dimensions such as RPM / TPM / concurrency |
 
-### AI Gateway Instance Pool
+### BFE Cluster (BFECluster)
 
-The "AI Gateway instance pool" corresponds to the list of engine addresses of Data Plane BFE instances, and is used to register which BFE nodes can pull configurations from the Control Plane. It answers the question "to whom should configurations be delivered". It differs in meaning from the backend instance pool (`instance_pool`) in a Provider: the former is the Data Plane entry, while the latter is the upstream model service endpoint.
+The "BFE cluster" corresponds to BFE's Server Data configuration. It registers the list of engine addresses of Data Plane BFE instances, identifying which BFE nodes can pull configurations from the Control Plane. Its records are maintained by deployment seed data (the `db_ddl.sql` seed, where the default cluster references the built-in instance pool `BFE.aipool`), and no OpenAPI management endpoint is exposed. It answers the question "to whom should configurations be delivered". It differs in meaning from the backend instance pool (`instance_pool`) in a Provider: the former is the Data Plane entry, while the latter is the upstream model service endpoint.
 
 ### Model Provider (Provider)
 
@@ -194,6 +194,10 @@ Thanks to Conf Agent, the Control Plane does not need to connect to the Data Pla
 ### Service Controller (Service Discovery)
 
 Service Controller is used to discover backend services in Kubernetes environments and synchronize service addresses to AI Gateway API. In this way, backend instances in a Cluster can automatically follow K8s service changes, reducing manual maintenance costs.
+
+### Log Reader (Data Plane Log Collection)
+
+Log Reader is the Data Plane log collection component (repository `rainway-ai-gateway/log-reader`). Deployed alongside BFE, it reads the access logs produced by BFE, parses them into structured records of token usage, latency, status codes, and more, and writes them to Kafka or MySQL for report aggregation and observability analysis. See [Chapter 15 Observability Design](./chapter15-observability.md) for details.
 
 ---
 
@@ -331,7 +335,7 @@ For detailed deployment steps, see [Chapter 18: Installation and Deployment](../
 
 - As a unified access layer, the Rainway AI Gateway solves problems such as multi-provider integration, API-Key management, cost and quota control, high availability, and security auditing.
 - The system adopts a separated Control Plane and Data Plane architecture: the Control Plane manages policies, and the Data Plane forwards requests and enforces policies.
-- Core components include AI Gateway API, Dashboard, BFE, Conf Agent, and Service Controller.
+- Core components include AI Gateway API, Dashboard, BFE, Conf Agent, Service Controller, and Log Reader.
 - The configuration lifecycle covers six stages: creation, storage, export, pull, hot reload, and taking effect.
 - Multiple topologies are supported, from minimal deployment to multi-zone production deployment.
 

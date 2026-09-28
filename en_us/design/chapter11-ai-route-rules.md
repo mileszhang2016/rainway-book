@@ -144,7 +144,7 @@ Field descriptions:
 
 - `name`: rule name, unique within the same route table.
 - `cond`: BFE condition expression; the rule is used when this matches.
-- `targets`: list of forwarding targets, containing `cluster_name`, `model`, `weight`. An empty `model` means pass-through of the original model; the sum of all `weight` values within the same rule must equal 100.
+- `targets`: list of forwarding targets, containing `cluster_name`, `model`, `weight`. An empty `model` means pass-through of the original model; the sum of all `weight` values within the same rule must equal 100. The `model` specified by a rule is a target model override: at forwarding time it replaces the original model in the request body and goes through prefix stripping and the cluster's `ModelMapping` to produce the final target model sent upstream. The target model override and the API-Key model allowlist are both validated against this post-forwarding target model — the route rule first redirects the model, then the allowlist validates the redirected model — and the two compose (e.g., an allowlist that only permits `gpt-4` can be combined with a rule redirecting requests to `gpt-4o`; redirecting to a model outside the allowlist fails the check with a 400).
 - `fallbacks`: list of fallback targets, optional; tried in order.
 
 ### Go Model

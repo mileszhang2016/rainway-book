@@ -2,7 +2,7 @@
 
 ## Chapter Goals
 
-Through this chapter, readers will learn the role and positioning of the Provider in the Rainway AI Gateway, become proficient in creating and maintaining Providers via the Dashboard and OpenAPI, correctly configure the model endpoint, model list, Provider Keys, and backend instance pool, use the model discovery tool to automatically probe models, understand the differences among supported model protocols, master the method of batch-importing model pricing via model-list.yaml, and clarify the relationship between Provider and Cluster and the impact of changes.
+Through this chapter, readers will learn the role and positioning of the Provider in the Rainway AI Gateway, become proficient in creating and maintaining Providers via the Dashboard and OpenAPI, correctly configure the model endpoint, model list, Provider Keys, and backend instance pool, use the model discovery tool to automatically probe models, understand the differences among supported model protocols, master the method of batch-importing model pricing via model-list.yaml, and clarify the relationship between Provider and Cluster and the impact of changes, as well as how to configure the `protocol_paths` protocol path mapping for multi-protocol providers and its caveats.
 
 ## The Concept and Role of the Provider
 
@@ -15,7 +15,7 @@ After Provider and Cluster are separated, their responsibilities become clearer:
 
 This separation brings many benefits: when the same Provider is referenced by multiple Clusters, the instance pool and keys only need to be maintained in one place, avoiding duplicate configuration; the Cluster no longer stores API Key plaintext and only references Keys in the Provider by name, improving security; the Provider can be created, updated, and deleted independently, while Clusters obtain backend capability by reference, making their lifecycles more independent; when a new protocol is added, only the Provider's model_protocols needs to be extended, without causing the Cluster model list to continuously grow.
 
-The core fields of a Provider include: a globally unique `name`, an optional `description`, the model discovery endpoint `model_endpoint`, the supported model list `models`, the API Key list `keys`, the backend instance pool `instance_pool`, the supported protocols `model_protocols`, the time zone `time_zone`, and the time-of-day templates `tiers`. Among them, `instance_pool` is required and must contain at least one instance with weight greater than 0, and `model_protocols` is required and must contain at least one protocol.
+The core fields of a Provider include: a globally unique `name`, an optional `description`, the model discovery endpoint `model_endpoint`, the supported model list `models`, the API Key list `keys`, the backend instance pool `instance_pool`, the supported protocols `model_protocols`, the optional protocol path mapping `protocol_paths`, the time zone `time_zone`, and the time-of-day templates `tiers`. Among them, `models` is required and must contain at least one element; `instance_pool` is required and must contain at least one instance with weight greater than 0; and `model_protocols` is required and must contain at least one protocol.
 
 The default value of `time_zone` is `Asia/Shanghai`, used to determine which tier the current time belongs to. In the initial phase, `tiers` only supports `name=peak`, and each tier contains several `time_ranges` with a left-closed, right-open semantics. The time zone and tiers can be maintained separately via `PUT /v1/providers/{provider_name}/pricing-tiers`, without being passed when the Provider is created.
 
@@ -124,6 +124,52 @@ A Provider can support multiple protocols at the same time; for example, an aggr
 
 `model_protocols` affects the forwarding behavior of the BFE Data Plane. For authentication header injection, `openai` uses `Authorization: Bearer` and `anthropic` uses `x-api-key`; Claude requests also require injecting `anthropic-version`. Usage parsing handles different response formats by protocol style—for example, the OpenAI-style `usage` field and the Claude-style `usage` field have different structures. Protocol matching validation checks whether the request's protocol style is in the `model_protocols` of the Provider corresponding to the target Cluster; if not, the request is rejected directly. When the Control Plane generates the BFE configuration, it passes `provider.model_protocols` through to `AIConf.ModelProtocols` for the Data Plane to use.
 
+## Protocol Path Configuration (protocol_paths)
+
+Different providers use different upstream path prefixes, and different protocols of the same provider often live under different prefixes: Bailian DashScope exposes OpenAI compatibility at `/compatible-mode/v1` and Anthropic compatibility at `/apps/anthropic`; Volcano Ark pay-as-you-go uses `/api/v3` and `/api/compatible`; Kimi Code membership (api.kimi.com) uses `/coding/v1` and `/coding`. Without `protocol_paths`, BFE forwards the upstream path unchanged and clients must send requests using the provider's native paths; with it, clients can uniformly access all providers through OpenAI endpoint paths (for the openai protocol, with or without the `/v1` prefix; for the anthropic protocol, through the standard entry `/v1/...`), and BFE rewrites the path during forwarding.
+
+`protocol_paths` is a mapping of "protocol -> upstream base path", whose value is the path part of the protocol's official SDK `base_url`: `openai` includes the `/v1` tail (e.g., `/compatible-mode/v1`), while `anthropic` does not (e.g., `/apps/anthropic`, since the Anthropic SDK appends `/v1/messages` itself). When configuring, you can copy the base_url column directly from the provider's official documentation. Reference values for common providers:
+
+| Provider | protocol_paths |
+|----------|----------------|
+| Bailian DashScope | `{"openai": "/compatible-mode/v1", "anthropic": "/apps/anthropic"}` |
+| Kimi Open Platform (api.moonshot.cn) | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| Kimi Code Membership (api.kimi.com) | `{"openai": "/coding/v1", "anthropic": "/coding"}` |
+| DeepSeek | `{"openai": "/v1", "anthropic": "/anthropic"}` |
+| Volcano Ark · Pay-as-you-go | `{"openai": "/api/v3", "anthropic": "/api/compatible"}` |
+| Volcano Ark · Coding Plan | `{"openai": "/api/coding/v3", "anthropic": "/api/coding"}` |
+
+Configuration constraints:
+
+- The key must be `openai` or `anthropic` already declared in the Provider's `model_protocols`; paths cannot be configured for undeclared protocols.
+- The value must start with `/`, must not end with `/`, must not contain `..`/`?`/`#`, and must be no longer than 128 characters.
+- Omitting the field means it is disabled and request paths are forwarded unchanged.
+- PATCH updates follow the partial-update convention: omitting the field keeps the current value; explicitly passing `null` clears it (restoring pass-through).
+
+Forwarding behavior (see `rewriteUpstreamPath` in `bfe/bfe_server/ai_path_rewrite.go`):
+
+- openai protocol: client entries with or without the `/v1` prefix can both be rewritten. An optional `/v1` prefix is stripped first, and the path is rewritten only when it hits the `bfe_basic` shared endpoint table (`openAIEndpointModes` in `bfe/bfe_basic/openai_endpoint.go`, 13 endpoints): both `/v1/chat/completions` and `/chat/completions` are rewritten to `{openai value}/chat/completions`, and `/v1` or `/v1/` is rewritten to the `{openai value}` itself. Custom paths that miss the endpoint table are forwarded unchanged, remaining compatible with existing clients.
+- anthropic protocol: only the standard entry `/v1/...` is rewritten (`/v1/messages` -> `{anthropic value}/v1/messages`); non-standard entries are forwarded unchanged. When no path is configured for the protocol, no rewrite occurs.
+
+Caveats:
+
+- **Billing-domain mismatch**: on some providers the path carries billing semantics (Volcano `/api/v3` pay-as-you-go vs `/api/coding` subscription). A subscription Key mistakenly configured with a pay-as-you-go prefix will be billed incorrectly, so verify the Key type matches the path before configuring.
+- **Model discovery endpoint is not linked**: `model_endpoint` is not derived from `protocol_paths`. For example, Anthropic-protocol model discovery on Bailian requires manually setting `model_endpoint.uri` to `/apps/anthropic/v1/models`.
+- **Release ordering**: `protocol_paths` depends on the BFE Data Plane supporting the `AIConf.ProtocolPaths` rewrite; the configuration has no effect on older BFE versions.
+
+Configuration example (Bailian):
+
+```json
+{
+    "name": "bailian",
+    "model_protocols": ["openai", "anthropic"],
+    "protocol_paths": {
+        "openai": "/compatible-mode/v1",
+        "anthropic": "/apps/anthropic"
+    }
+}
+```
+
 ## Model Pricing Import
 
 Model pricing is used for cost accounting and quota deduction and is stored in the `/model-prices` resource. To facilitate batch maintenance, the system supports importing the entire table via a `model-list.yaml` file. The API is:
@@ -183,12 +229,14 @@ Two more billing modes (modes) are supported:
 
 | mode | Billing Method |
 |------|---------------|
-| `responses` | Billed like chat, i.e., token billing with `input_cost_per_token` / `output_cost_per_token` and related fields (the `/v1/responses` path is recognized as this mode) |
+| `responses` | Billed like chat, i.e., token billing with `input_cost_per_token` / `output_cost_per_token` and related fields (the `/v1/responses` endpoint and provider-native path forms of `/responses` are recognized as this mode) |
 | `video_generation` | Cost = `VideoCount × output_cost_per_video` (the `/v1/video/generations` path is recognized as this mode) |
 
 For `video_generation` mode, BFE pre-reads the `n` field of the request body as a fallback for the generation count during the authentication phase: if the field is missing or invalid, it is billed as 1 to avoid under-billing; `video_count` in the response `usage` takes precedence as the final count. Correspondingly, usage statistics include the `image_input_tokens` and `video_count` fields, which map to the access log fields `ai_image_input_tokens` (786) and `ai_video_count` (787) respectively (bfe-access-pb v0.3.5).
 
-Implementation references: `ModelPrice` and the price field constants in `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`, `DetectModeFromPath` in `bfe/bfe_basic/request_ai_basic.go`, and `calcVideoGenerationCost` / `calcResponsesCost` in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`. See `bfe/docs/zh_cn/sys_design/rmb_quota.md` for the complete billing semantics.
+Implementation references: `ModelPrice` and the price field constants in `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`, `DetectModeFromPath` in `bfe/bfe_basic/request_ai_basic.go`, `openAIEndpointModes` in `bfe/bfe_basic/openai_endpoint.go` (the shared OpenAI endpoint table, 13 endpoints), and `calcVideoGenerationCost` / `calcResponsesCost` in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`. See `bfe/docs/zh_cn/sys_design/rmb_quota.md` for the complete billing semantics.
+
+Mode detection and the upstream path rewrite share the same endpoint table, so the two can never disagree on what an OpenAI endpoint is: `DetectModeFromPath` first strips the optional `/v1` prefix (the recognition result is the same whether or not the standard entry carries `/v1`), and reduces a provider-native prefix ending in a `/v1` segment (the OpenAI SDK base_url form, e.g. Bailian's `/compatible-mode/v1/responses`) to the same endpoint before the lookup. Requests sent via the provider's native path are therefore recognized with the correct mode and billed correctly; paths that miss the endpoint table fall back to the default chat mode.
 
 ## The Relationship Between Provider and Cluster
 
@@ -246,6 +294,10 @@ Check whether the Cluster's `llm_config.models` is a subset of the Provider's `m
 ### 6. Model prices not taking effect
 
 Check whether a `(provider, model, mode)` record exists in `/model-prices`; whether the `model-list.yaml` import succeeded, paying attention to the `errors` list; whether `price_currency` is `RMB`; and whether the price fields in prices and tier_prices are non-negative.
+
+### 7. protocol_paths is configured but requests are not rewritten (upstream 404)
+
+First confirm that the request path hits the shared OpenAI endpoint table: for the openai protocol, entries with or without the `/v1` prefix can both be rewritten, but a custom path that misses the endpoint table (`bfe_basic/openai_endpoint.go`) after the optional `/v1` prefix is stripped will be forwarded unchanged, which is expected. For the anthropic protocol, only the standard entry `/v1/...` is rewritten; non-standard entries pass through. Then confirm that the request protocol is declared in `model_protocols` and has a corresponding `protocol_paths` entry; that the BFE version supports `AIConf.ProtocolPaths` (a key whitelist is validated at load time, and invalid configurations are rejected with the offending cluster identified); and, if a fallback occurred, that pass-through after switching to a backup cluster without `protocol_paths` is expected behavior.
 
 ## Configuration Examples
 
@@ -318,7 +370,7 @@ A Cluster does not declare `instance_pool`, `model_endpoint`, or `provider_type`
 
 The Provider is the core resource in the Control Plane of the Rainway AI Gateway for describing downstream model providers. After the responsibilities of Provider and Cluster are separated, the Cluster focuses on forwarding policies while the Provider focuses on access information, improving configuration reusability, security, and maintainability.
 
-Key points of this chapter: the data model and field meanings of the Provider; the flows for creating and updating Providers via the Dashboard and OpenAPI; the configuration methods and constraints of the model endpoint, model list, and Provider Keys; using the stateless model discovery tool `/providers/tools/discover-models`; the impact of the `openai` and `anthropic` protocols on authentication headers, version headers, usage parsing, and protocol matching; the process and caveats of batch-importing model pricing via `model-list.yaml`; the price fields for image input tokens and per-video billing, and the `responses` and `video_generation` billing modes; the strong reference relationship between Provider and Cluster and the synchronization and conflict handling during changes; and troubleshooting ideas for common issues plus configuration examples.
+Key points of this chapter: the data model and field meanings of the Provider; the flows for creating and updating Providers via the Dashboard and OpenAPI; the configuration methods and constraints of the model endpoint, model list, and Provider Keys; using the stateless model discovery tool `/providers/tools/discover-models`; the configuration methods, constraints, and forwarding behavior of the `protocol_paths` protocol path mapping; the impact of the `openai` and `anthropic` protocols on authentication headers, version headers, usage parsing, and protocol matching; the process and caveats of batch-importing model pricing via `model-list.yaml`; the price fields for image input tokens and per-video billing, and the `responses` and `video_generation` billing modes; the strong reference relationship between Provider and Cluster and the synchronization and conflict handling during changes; and troubleshooting ideas for common issues plus configuration examples.
 
 Properly planning the separation of Provider and Cluster is an important prerequisite for subsequent route rules, API-Key quotas, and rate limiting policies to take effect. It is recommended that in production you first maintain Providers and model prices in a unified way, and then create Clusters for different business lines as needed. Regularly comparing the provider lists returned by `/providers` and `/model-prices/actions/get-providers` helps promptly detect and backfill cases where price records drift from actual Providers, ensuring accurate cost accounting.
 
