@@ -30,6 +30,9 @@
 **Condition（条件表达式）**
 ：BFE 提供的表达式语言，AI 路由规则通过 `Cond` 字段描述命中条件，如 `req_body_json_in("model", "gpt-4", false)`。
 
+**操作日志（Operation Log）**
+：平台写操作的只读审计记录，由配置变更自动产生，包含操作人、动作、资源、结果与变更摘要（before/after JSON，敏感字段脱敏）。
+
 ## D
 
 **Dashboard（控制台）**
@@ -43,10 +46,16 @@
 **Entity Type（组织类型）**
 ：Entity 的层级分类定义，通过 `level` 字段区分层级高低，数值越小层级越高。
 
+**EPP（Endpoint Picker）**
+：独立于 BFE 的后端调度器，为 EPP 模式 Cluster 接管后端实例选择（负载均衡），通过实例组（主备）部署并被登记到 EPP 实例池。
+
 ## F
 
 **Fallback（降级）**
 ：AI 路由规则中 `fallbacks` 指定的备用目标。当首选 `targets` 全部失败时，按顺序尝试 fallback 目标。
+
+**分段计价**
+：在服务商侧定义忙时（`peak`）时间段（含 IANA 时区），配合模型定价中的分时段价格实现按时段差异化计费。
 
 ## G
 
@@ -59,7 +68,12 @@
 ：AI Gateway API 提供的内部接口，主要供 Conf Agent 与 BFE 拉取配置、完成版本同步。
 
 **Instance Pool（实例池）**
-：在 Provider 中定义的后端 AI 服务真实地址、端口与权重集合，供 Cluster 引用。
+：在 Provider 中定义的后端 AI 服务真实地址、端口与权重集合，供 Cluster 引用。控制台支持 IP 模式与服务商域名模式两种接入方式。
+
+## J
+
+**均衡模式**
+：Cluster 的后端负载均衡模式：`WRR`（BFE 本地加权轮询，默认）或 `EPP`（由 EPP 调度器接管后端选择）；EPP 模式集群无有效分配时降级为 WRR。
 
 ## K
 
@@ -71,11 +85,14 @@
 **Model Mapping（模型映射）**
 ：Cluster 中将用户请求的模型名映射为后端实际使用的模型名的机制。
 
+**模型重定向（Model Redirect）**
+：Cluster 大模型配置中将客户端请求的模型名映射为转发到后端的模型名；模型访问控制与限流的「适用模型」均按重定向后的目标模型判定。
+
 **Model Price（模型定价）**
 ：维护模型在不同 Provider 与时段下的价格，用于 RMB 配额成本核算。
 
 **Model Protocol（模型协议）**
-：Provider 支持的上游协议类型，如 `openai`、`anthropic` 等，用于请求体与响应体的协议适配。
+：Provider 支持的上游协议类型，如 `openai`、`anthropic`、`gemini` 等，用于请求体与响应体的协议适配与认证头风格选择。
 
 ## O
 
@@ -91,7 +108,10 @@
 ：BFE 中的顶层资源隔离单位，AI 网关模式下主要用于产品线识别与配置上下文加载。
 
 **protocol_paths（协议路径映射）**
-：Provider 上的可选字段，声明各模型协议（`openai`/`anthropic`）对应的上游 base path；BFE 据此将标准入口 `/v1/...` 改写为 provider 原生前缀，未配置则原样透传。
+：Provider 上的可选字段，声明各模型协议（`openai`/`anthropic`）对应的上游 base path；BFE 据此将标准入口 `/v1/...` 改写为 provider 原生前缀，未配置则原样透传（`gemini` 协议不支持路径改写）。
+
+**配额不足时放行**
+：配额计划的可选开关；开启后配额余额扣减到 0 仍放行请求（继续统计用量），适合试运行阶段；关闭时余额不足即拒绝。
 
 ## Q
 
@@ -123,10 +143,13 @@
 **Sub Cluster（子集群）**
 ：Cluster 生成 BFE 配置时自动创建的子集群，绑定到 Cluster 对应的实例池。
 
+**数据报表（Report）**
+：控制台运营数据可视化模块，提供总览指标卡、时序图表、维度排行、占比分布与日志明细查询；数据后端支持 MySQL（轻量形态）与 Doris（标准形态）。
+
 ## T
 
 **Tier（时段层级）**
-：模型定价中按时间维度划分的价格层级，如 `peak`（高峰）、`off-peak`（空闲），用于分时段计费。
+：模型定价中按时间维度划分的价格层级，初期仅支持 `peak`（忙时）；忙时时间段定义在服务商资源中维护（分段计价配置）。
 
 **Token**
 ：由 `/auth/tokens` 创建的程序访问凭证，分为 `System`（完整管理权限）与 `Support`（只读导出权限）两种 Scope。
@@ -150,8 +173,11 @@
 **加权随机（Weighted Random）**
 ：AI 路由规则在 `targets` 之间按权重随机选择目标 Cluster 的算法。
 
+**转发后目标模型**
+：请求模型经路由「指定模型」覆盖、集群「裁剪前缀」、集群「模型重定向」依次解析后的最终模型名（与后端实际收到的模型一致）；模型访问控制与 TPM/RPM 规则的「适用模型」均按该模型名匹配，而非请求体原始模型名。
+
 ## 参考
 
-- `ai-gateway-web/docs/zh-cn/12-appendix.md`
+- `ai-gateway-web/docs/zh-cn/14-appendix.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/README.md`
 - `bfe/docs/zh_cn/sys_design/ai_error_codes.md`

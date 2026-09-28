@@ -189,13 +189,13 @@ type ProtocolAdapter interface {
 }
 ```
 
-内置适配器在 `registry.go` 的 `init()` 中编译期注册（`Register(openai.New())`、`Register(anthropic.New())`），对外提供三个函数：
+内置适配器在 `registry.go` 的 `init()` 中编译期注册（`Register(openai.New())`、`Register(anthropic.New())`、`Register(gemini.New())`），对外提供三个函数：
 
 - `Get(protocol)`：按协议名取适配器，未知或空协议名回退 openai 适配器，保持历史兜底行为；
 - `Supports(protocols, p)`：判断协议是否在 cluster 的 `ModelProtocols` 列表中，空列表默认仅 openai（向后兼容）；
 - `ValidateProtocols(protocols)`：校验列表中的协议名是否都为注册表已知，含未知协议名返回 error，空列表合法。
 
-协议选择是**按请求**进行的：`doSingleAIForward()` 根据请求的 `AiBasicInfo.AuthStyle` 取对应适配器，cluster 可以配置 `["openai", "anthropic"]` 同时支持多种协议。
+协议选择是**按请求**进行的：`doSingleAIForward()` 根据请求的 `AiBasicInfo.AuthStyle` 取对应适配器，cluster 可以配置 `["openai", "anthropic", "gemini"]` 同时支持多种协议。
 
 需要特别强调的概念边界是 **model_protocol（协议知识维度）≠ provider（用户自定义实体）**：provider 是 cluster 级的上游实体（名称、key 池、价格表、地址），由控制面 AI Gateway API 管理；model_protocol 描述的是认证头如何注入、补充什么版本头、usage 字段长什么样等协议知识。OpenAI 兼容生态中的 Groq、DeepSeek、OpenRouter 等品牌都走 `openai` 协议，接入这些 provider 无需新建适配器，只需在 cluster 配置 `model_protocols: ["openai"]` 即可，零代码改动。
 

@@ -30,6 +30,9 @@
 **Condition (Conditional Expression)**
 : The expression language provided by BFE. AI routing rules describe matching conditions via the `Cond` field, e.g., `req_body_json_in("model", "gpt-4", false)`.
 
+**Operation Log**
+: A read-only audit record of platform write operations, automatically produced by configuration changes, containing the operator, action, resource, result, and a change summary (before/after JSON with sensitive fields masked).
+
 ## D
 
 **Dashboard**
@@ -43,10 +46,16 @@
 **Entity Type (Organization Type)**
 : The hierarchical classification definition of an Entity, distinguishing levels via the `level` field; the smaller the value, the higher the level.
 
+**EPP (Endpoint Picker)**
+: A backend scheduler independent of BFE that takes over backend instance selection (load balancing) for Clusters in EPP mode; it is deployed in instance groups (primary/backup) and registered in the EPP instance pool.
+
 ## F
 
 **Fallback (Degradation)**
 : The backup target specified by `fallbacks` in an AI routing rule. When all preferred `targets` fail, fallback targets are tried in order.
+
+**Tiered Pricing**
+: Defines peak (`peak`) time windows (with an IANA time zone) on the Provider side, and works with tier prices in Model Pricing to enable time-differentiated billing.
 
 ## G
 
@@ -59,7 +68,12 @@
 : The internal interfaces provided by AI Gateway API, mainly used by Conf Agent and BFE to pull configurations and complete version synchronization.
 
 **Instance Pool**
-: The set of real backend AI service addresses, ports, and weights defined within a Provider, referenced by Clusters.
+: The set of real backend AI service addresses, ports, and weights defined within a Provider, referenced by Clusters. The Dashboard supports two access modes: IP mode and provider domain mode.
+
+## J
+
+**Balance Mode**
+: The backend load balancing mode of a Cluster: `WRR` (BFE local weighted round robin, the default) or `EPP` (backend selection taken over by the EPP scheduler); EPP-mode Clusters without a valid assignment degrade to WRR.
 
 ## K
 
@@ -71,11 +85,14 @@
 **Model Mapping**
 : The mechanism in a Cluster that maps the model name in a user's request to the model name actually used by the backend.
 
+**Model Redirect**
+: In a Cluster's LLM configuration, maps the model name in the client's request to the model name forwarded to the backend; both model access control and the "applicable models" of TPM/RPM rules are evaluated against the redirected target model.
+
 **Model Price**
 : Maintains the price of a model under different Providers and time periods, used for RMB quota cost accounting.
 
 **Model Protocol**
-: The upstream protocol types supported by a Provider, such as `openai`, `anthropic`, etc., used for request/response body protocol adaptation.
+: The upstream protocol types supported by a Provider, such as `openai`, `anthropic`, `gemini`, etc., used for request/response body protocol adaptation and authentication header style selection.
 
 ## O
 
@@ -91,7 +108,10 @@
 : The top-level resource isolation unit in BFE; in AI Gateway mode it is mainly used for product line identification and configuration context loading.
 
 **protocol_paths (Protocol Path Mapping)**
-: An optional field on a Provider declaring the upstream base path for each model protocol (`openai`/`anthropic`); BFE rewrites the standard entry `/v1/...` to the provider's native prefix based on it, and forwards unchanged when it is unconfigured.
+: An optional field on a Provider declaring the upstream base path for each model protocol (`openai`/`anthropic`); BFE rewrites the standard entry `/v1/...` to the provider's native prefix based on it, and forwards unchanged when it is unconfigured (the `gemini` protocol does not support path rewriting).
+
+**Allow When Quota Exhausted**
+: An optional switch on a quota plan; when enabled, requests are still allowed after the quota balance reaches 0 (usage continues to be tracked), which suits the trial-run phase; when disabled, insufficient balance causes rejection.
 
 ## Q
 
@@ -123,10 +143,13 @@
 **Sub Cluster**
 : A sub-cluster automatically created when a Cluster generates BFE configuration, bound to the instance pool corresponding to the Cluster.
 
+**Data Report**
+: The console's operational data visualization module, providing overview metric cards, time-series charts, dimension rankings, distribution pies, and log detail queries; the data backend supports MySQL (lightweight form) and Doris (standard form).
+
 ## T
 
 **Tier (Time Period Level)**
-: The price level divided by time dimension in model pricing, such as `peak` and `off-peak`, used for time-based billing.
+: The price level divided by time dimension in model pricing; only the `peak` (busy hours) tier is supported initially. The busy-hours windows are maintained in the Provider resource (tiered pricing configuration).
 
 **Token**
 : A programmatic access credential created via `/auth/tokens`, with two Scopes: `System` (full management permissions) and `Support` (read-only export permissions).
@@ -150,8 +173,11 @@
 **Weighted Random**
 : The algorithm by which an AI routing rule randomly selects a target Cluster among `targets` according to weights.
 
+**Resolved Target Model**
+: The final model name after the requested model is resolved in sequence through the route rule's "specified model" override, the Cluster's "strip/match prefix", and the Cluster's "model redirect" (consistent with the model name the backend actually receives); model access control and the "applicable models" of TPM/RPM rules are matched against this model name rather than the original model name in the request body.
+
 ## References
 
-- `ai-gateway-web/docs/zh-cn/12-appendix.md`
+- `ai-gateway-web/docs/zh-cn/14-appendix.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/README.md`
 - `bfe/docs/zh_cn/sys_design/ai_error_codes.md`

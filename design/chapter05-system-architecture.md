@@ -100,7 +100,7 @@ OpenAI、DeepSeek、Anthropic、Google Gemini 等模型服务商的 API 协议�
 「模型服务商」对应 OpenAPI 的 `/providers` 资源，回答“下游是谁、能访问哪些模型、如何认证、后端在哪里”的问题。它持有：
 
 - 后端实例池（`instance_pool`）：真实 AI 服务端点；
-- 模型协议（`model_protocols`）：如 `openai`、`anthropic`；
+- 模型协议（`model_protocols`）：如 `openai`、`anthropic`、`gemini`；
 - 模型列表（`models`）与模型发现端点；
 - 服务鉴权 Key 明文（`keys`）。
 

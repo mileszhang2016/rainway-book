@@ -5,13 +5,13 @@
 Through this chapter, the reader will master:
 
 - The prerequisites and deployment form for using EPP intelligent scheduling;
-- How to configure the EPP instance pool (`/epp-pool`) and EPP-mode Clusters (`balance_mode=EPP` + `epp_config`);
-- How to view and manually override Cluster→instance-group assignments (`/epp-assignments`);
+- How to configure the EPP instance pool on the Dashboard "EPP Scheduling" page and create EPP-mode Clusters (`balance_mode=EPP` + `epp_config`);
+- How to view and manually override Cluster→instance-group assignments (EPP Scheduling Assignments tab);
 - Operating procedures for daily scenarios such as draining a backend, taking EPP instances online/offline, EPP failover, full-overload fallback, and disabling EPP scheduling;
 - The observability metrics and alerting points of the EPP path;
 - A quick reference of the validation rules for `epp_config` and the instance pool.
 
-For the working principles and design semantics of EPP scheduling, see [Chapter 16 EPP Scheduling Design](../design/chapter16-epp-scheduling-design.md).
+For the working principles and design semantics of EPP scheduling, see [Chapter 16 EPP Scheduling Design](../design/chapter16-epp-scheduling-design.md). The console operations in this chapter are based on Dashboard v0.0.10; the authoritative user manual is `ai-gateway-web/docs/zh-cn/05-epp-schedule.md`.
 
 ---
 
@@ -19,11 +19,11 @@ For the working principles and design semantics of EPP scheduling, see [Chapter 
 
 Before using EPP intelligent scheduling, confirm that the following components are installed and running with the deployment:
 
-- **ai-gateway-epp (EPP component)**: deployed by instance group, with 1–2 instances per group: 2 instances per group in production (primary/standby for each other), and single-instance groups allowed in test environments (primary only, no standby). Groups with more than 2 instances are rejected with 422 during `/epp-pool` validation. Instances run with command-line parameters; the key parameters are as follows:
+- **ai-gateway-epp (EPP component)**: deployed by instance group, with 1–2 instances per group: 2 instances per group in production (primary/standby for each other), and single-instance groups allowed in test environments (primary only, no standby). Groups with more than 2 instances are rejected with 422 during instance pool validation. Instances run with command-line parameters; the key parameters are as follows:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `-instance-id` | hostname | Instance id; must match the instance id registered in `/epp-pool`; with K8s StatefulSet deployment the default is exactly the Pod name |
+| `-instance-id` | hostname | Instance id; must match the instance id registered in the instance pool; with K8s StatefulSet deployment the default is exactly the Pod name |
 | `-api-addr` | `http://127.0.0.1:8181/inner-api/v1` | Base address of the AI Gateway API InnerAPI |
 | `-api-token` | Environment variable `AI_GATEWAY_EPP_TOKEN` | InnerAPI authentication token |
 | `-poll-interval` | `5s` | InnerAPI polling interval |
@@ -44,7 +44,7 @@ The linkage is shown in the figure below:
 
 ```mermaid
 flowchart LR
-    OP[Operator] -->|/epp-pool instance pool<br/>/clusters EPP mode| API[AI Gateway API]
+    OP[Operator<br/>Dashboard EPP scheduling page] --> API[AI Gateway API]
     API -->|server_data_conf<br/>BalanceMode=EPP + EPPAddr| CA[Conf Agent]
     CA --> BFE[BFE]
     API -->|epp_data scheduling config + assignment<br/>cluster_table backend list| EPP[ai-gateway-epp primary/standby]
@@ -55,9 +55,68 @@ flowchart LR
 
 ---
 
-## Configuring the EPP Instance Pool
+## Console Entry: Resource Management → EPP Scheduling
 
-The EPP instance pool is a singleton resource providing two operations: `GET` (detail) and `PATCH` (full replacement). The authoritative source of groups and instance lists is the deployment pipeline, which reconciles by calling `PATCH` after scaling or machine replacement.
+The entry for EPP scheduling in the Dashboard is **Resource Management → EPP Scheduling**. The page has two tabs:
+
+- **EPP Instance Pool**: registers the deployment instances of the EPP schedulers themselves (organized by group, primary/standby within a group);
+- **EPP Scheduling Assignments**: view/override the assignment relationship between "EPP-mode Clusters ↔ instance groups".
+
+The following two sections describe the operations of the two tabs respectively.
+
+---
+
+## Configuring the EPP Instance Pool (EPP Instance Pool Tab)
+
+### View Mode
+
+The top of the tab shows statistics: **Pool Name** (e.g. `EPP.pool`, provided by the server-side configuration), **Instance Groups**, and **Total Instances**.
+
+The main body is a tree table, one row per instance group:
+
+| Column | Description |
+|--------|-------------|
+| Instance Group | Group name |
+| Instance Count | Number of instances in the group, displayed as `N / 2` (e.g. `1 / 2`, `2 / 2`) |
+| Instance List | Summary showing `instanceID(host:port)` in gray small text |
+
+Click the arrow at the row head to expand a group; an embedded table shows the **Instance ID / Host / Port** of each instance.
+
+### Edit Mode
+
+Click "Edit" in the upper-right corner to enter inline editing. "Save" submits in full — note that it has **full-replacement** semantics: groups and instances not listed will be deleted; "Cancel" reverts all changes made this time.
+
+| Action | Description |
+|--------|-------------|
+| Edit group name | Inline input; the group name is non-empty and **unique within the pool** |
+| + Add group | Adds an empty group below the table (at least 1 instance must be added before it can be saved) |
+| Delete group | Requires confirming "Delete the instance group and all its instances"; at least 1 group must be kept (the button is disabled when only 1 group remains) |
+| + Add instance | Adds an instance row in the expanded area, with the port defaulting to `9002`; the button is disabled when the group already has ≥ 2 instances, with a gray hint on the right: "At most 2 per group (primary + standby)" |
+| Delete | Removes an instance row from the group |
+
+**Validation rules** (the console and OpenAPI share the same server-side validation):
+
+| Rule | Description |
+|------|-------------|
+| Group | At least 1 group; group names non-empty and unique within the pool; 1–2 instances per group (empty groups and groups with 3+ instances rejected) |
+| Instance ID | Non-empty and **globally unique within the pool**; corresponds to the EPP startup parameter `-instance-id` (with K8s StatefulSet deployment it takes the Pod name, e.g. `epp-0`) |
+| Host | A valid hostname or IPv4 / IPv6 address |
+| Port | Integer 1-65535 |
+| Address uniqueness | The `host:port` combination is globally unique within the pool |
+
+> **Deployment form**: production groups usually have **2 instances (primary/standby)**; test environments allow single-instance groups (primary only, no standby).
+
+### Automatic Repair After Save
+
+Saving the instance pool is a full replacement. If the **primary instance of an existing assignment has been removed from the pool**, the system automatically repairs the dangling assignment:
+
+- When the group still exists, reselect the primary among the remaining instances of the same group;
+- When the group no longer exists, rerun the assigner over the entire instance pool to reselect the group;
+- When the pool has no assignable candidate group, clear the assignment (the Cluster enters the "unassigned" state; see the next section).
+
+### Appendix: OpenAPI Equivalent Operations
+
+The instance pool is a singleton resource providing two operations, `GET` (detail) and `PATCH` (full replacement), which correspond one-to-one to the tab's view and save. The authoritative source of groups and instance lists is the deployment pipeline; after scaling or machine replacement, the deployment pipeline reconciles by calling `PATCH`.
 
 The following example registers one group `g1` with two instances `epp-0` and `epp-1` (host is the instance IP, `port` is EPP's ext_proc gRPC port):
 
@@ -83,19 +142,13 @@ View the current instance pool:
 curl -X GET "https://control-plane.example.com/open-api/v1/epp-pool"
 ```
 
-Validation rules:
-
-- `groups` must have at least 1 element; group names are non-empty and unique within the pool; empty groups are rejected;
-- Instance `id` is non-empty and globally unique within the pool (EPP matches this value with `-instance-id`);
-- `host` is a Hostname or IP (IPv6 literals without brackets), `port` is a valid port;
-- `(host, port)` combinations are globally unique within the pool;
-- 1–2 instances per group (2 instances per group in production as primary/standby; single-instance groups allowed in test); groups with more than 2 instances are rejected with 422.
-
 ---
 
 ## Creating an EPP-Mode Cluster
 
-Specify `balance_mode=EPP` and carry `epp_config` when creating a Cluster:
+The load-balancing mode of a Cluster is set in the "Balancing Mode Configuration" card at step 4 of the cluster wizard (the `WRR` / `EPP` switch and the `epp_config` parameters). For the console operation flow, see [Chapter 21 Cluster and Route Configuration](./chapter21-cluster-and-route-config.md) and the "Balancing Mode Configuration" section of `ai-gateway-web/docs/zh-cn/04-ai-business-cluster.md`. After selecting `EPP`, fill in the scheduling profile, cache affinity, prefix cache affinity, session affinity, KV cache utilization cap, and flow-control configuration as needed.
+
+Equivalently, specify `balance_mode=EPP` and carry `epp_config` when creating a Cluster via OpenAPI:
 
 ```bash
 curl -X POST "https://control-plane.example.com/open-api/v1/clusters" \
@@ -147,7 +200,44 @@ Notes:
 
 ---
 
-## Viewing and Overriding Assignments
+## Viewing and Overriding Assignments (EPP Scheduling Assignments Tab)
+
+The "Cluster ↔ instance group" assignments are **generated automatically by the assigner**: when a Cluster switches into EPP mode, an instance group and primary instance are selected automatically; after the instance pool changes, dangling assignments are repaired automatically. This tab provides the **query view** and the **manual override** (operations intervention entry).
+
+### Statistics and Assignment View
+
+The top of the tab shows statistics: **Assigned Clusters** / **Unassigned Clusters** (red alert when the count is greater than 0) / **Idle Groups**.
+
+The assignment view table:
+
+| Column | Description |
+|--------|-------------|
+| Cluster Name | Supports search and sorting |
+| Instance Group | The assigned group name; shows `-` when unassigned |
+| Primary Instance | Primary instance ID; shows `-` when unassigned or degraded |
+| Standby Instance | Instances of the same group other than the primary (expanded in real time on query); single-instance groups show "None" |
+| Status | `Normal` / `Degraded` (the primary instance has been removed from the pool or the group no longer exists) |
+| Actions | "Edit" opens the manual override drawer |
+
+### Unassigned Clusters / Idle Groups
+
+- **Unassigned Clusters** (red card): EPP-mode Clusters without a valid assignment, prompting "Service degraded to WRR". When these Clusters are exported, they are **degraded to WRR** forwarding — an abnormal state to handle promptly.
+- **Idle Groups**: groups in the instance pool that bear no Cluster assignment (e.g. a newly scaled-out group before its assignment is completed).
+
+> It is **valid** for instances to serve as primary/standby for each other across multiple Clusters — assignments are per-Cluster, with no one-to-one constraint between groups and Clusters.
+
+### Manual Override
+
+Click "Edit" in the row to open the drawer:
+
+| Field | Description |
+|-------|-------------|
+| Instance Group | Dropdown; options come from the groups in the current instance pool |
+| Primary Instance ID | Dropdown selecting an instance within that group |
+
+After confirmation, only that Cluster's assignment is overridden: the primary is the selected instance, and the standby is automatically the other instance of the same group. After the override, the server_data_conf version bumps immediately, and BFE switches to the new primary/standby addresses at its next pull.
+
+### Appendix: OpenAPI Equivalent Operations
 
 View the assignment full view:
 
@@ -189,7 +279,16 @@ curl -X PUT "https://control-plane.example.com/open-api/v1/epp-assignments/llm-c
 }'
 ```
 
-`group_name` must exist in the current instance pool, and `primary_instance_id` must exist in that group's instance list. After the override, the server_data_conf version bumps immediately, and BFE switches to the new primary/standby addresses at its next pull.
+`group_name` must exist in the current instance pool, and `primary_instance_id` must exist in that group's instance list.
+
+---
+
+## Notes
+
+- Manual override requirements: the instance group exists in the instance pool; the primary instance exists in that group and has a different address from the standby.
+- After a Cluster is switched from `EPP` back to `WRR`, the assignment records are **retained dormant** and continue to take effect when switching back to `EPP`.
+- Prerequisite for EPP mode to take effect: EPP schedulers are deployed and instances are registered in the instance pool. Unassigned Clusters degrade to WRR; inspect the unassigned alert on the "EPP Scheduling Assignments" tab regularly.
+- The instance pool "Save" has **full-replacement** semantics: groups and instances not listed will be deleted. Verify the entire table before submitting.
 
 ---
 
@@ -209,7 +308,7 @@ Path: `ProviderInstancePoolSyncer` syncs the instance pool → cluster_table exp
 
 ### Taking EPP Instances Online/Offline
 
-Modify the `/epp-pool` instance list (`PATCH` full replacement):
+Enter edit mode on the "EPP Instance Pool" tab, adjust groups and instances, and save (**full-replacement** semantics: groups and instances not listed will be deleted — verify the entire table); equivalently, replace the instance list in full via `PATCH /epp-pool`:
 
 - **Offline an instance**: remove it from the `instances` of its group. If it is the primary of some Cluster, the assigner repairs automatically — reselect the primary among remaining instances of the same group (no group change); if the group no longer exists, reassign across groups; when the pool has no assignable candidate group, clear the assignment (the Cluster enters the unassigned state, export degrades to WRR + error log).
 - **Online an instance**: append an instance entry to the group (production groups keep 2 instances). After the new instance starts, it matches its role in the assignment full view by `-instance-id`: when assigned standby it loads configuration and stands by warm; when assigned primary it takes over scheduling immediately.
@@ -223,7 +322,7 @@ No manual intervention is needed when an EPP instance fails:
 2. The standby instance's Cell is in standby state and refuses scheduling requests (`cell is not serving`); BFE's handling of this error is to keep trying the next address of the same Cluster; eventually the EPP path fails and BFE **silently falls back to local WRR**, and the request still returns 200.
 3. After the primary recovers, failback happens only when the cooldown (`Cooldown`, default 45 seconds) expires and the health check passes consecutively `SuccessThreshold` (default 2) times, preventing flapping.
 
-Note: the standby does not automatically take over scheduling — assignments are configuration-driven, and no rebalance interface is provided. The correct action after failover is to let BFE fail back to the primary instance, or to manually override the primary to a healthy instance via `PUT /epp-assignments/{cluster}` (after the override, BFE switches when it pulls the new `EPPAddr`).
+Note: the standby does not automatically take over scheduling — assignments are configuration-driven, and no rebalance interface is provided in this release. The correct action after failover is to let BFE fail back to the primary instance, or to manually override the primary to a healthy instance via the "EPP Scheduling Assignments" tab (`PUT /epp-assignments/{cluster}`) (after the override, BFE switches as soon as it pulls the new `EPPAddr`).
 
 The failover sequence is as follows:
 
@@ -253,7 +352,7 @@ When the KV cache utilization of all backends exceeds `kv_cache_utilization_max`
 
 ### Disabling EPP Scheduling
 
-Change the Cluster's `balance_mode` back to `WRR`; there is no need to clear `epp_config` (retained dormant, can be switched back at any time):
+Change the Cluster's `balance_mode` back to `WRR` (switch in the "Balancing Mode Configuration" card of the cluster wizard on the console, or modify via OpenAPI); there is no need to clear `epp_config` (retained dormant, can be switched back at any time):
 
 ```bash
 curl -X PUT "https://control-plane.example.com/open-api/v1/clusters/llm-cluster-a" \
@@ -269,9 +368,10 @@ Export semantics: `BalanceMode=WRR` with empty `EPPAddr`; epp_config and assignm
 
 | Observation point | Location | Key metrics/logs | Alerting suggestions |
 |-------------------|----------|------------------|----------------------|
-| Degraded export | AI Gateway API error logs | When an EPP-mode Cluster has no valid assignment, an error-level log is output (including Cluster name and reason), and the export degrades that Cluster to `BalanceMode=WRR` | Alert on any error log; pair with `unassigned_clusters` inspection |
+| Unassigned alert | Dashboard "EPP Scheduling Assignments" tab | The "Unassigned Clusters" statistic at the top shows a red alert when greater than 0 | Inspect the unassigned Cluster cards regularly; handle them as soon as they appear |
+| Degraded export | AI Gateway API error logs | When an EPP-mode Cluster has no valid assignment, an error-level log is output (including Cluster name and reason), and the export degrades that Cluster to `BalanceMode=WRR` | Alert on any error log; pair with unassigned Cluster inspection |
 | BFE EPP calls | BFE monitoring port `/monitor/epp_metrics` | `epp_calls_total{cluster,result}` (result ∈ ok/no_pool/unknown_pool/draining/transport), `epp_fallback_local_total{cluster}`, `epp_failover_total{cluster}`, `epp_failback_total{cluster}`, `epp_active_addr_index{cluster}` | A surge of `epp_calls_total{result!="ok"}`, failover counter growth, or sustained growth of `epp_fallback_local_total` all indicate EPP path anomalies |
-| EPP instances | EPP `/metrics` (default `:9090`) | `ai_epp_assignment_no_match` (this instance has no role in the assignment), `ai_epp_poller_failures_total` / `ai_epp_poller_backoff_state` (polling failures and backoff), `ai_epp_engine_reloads_total` (engine hot reloads), `ai_epp_cell_state` (Cell role and state) | `assignment_no_match=1` means `-instance-id` is inconsistent with `/epp-pool`; check the deployment; persistently non-zero poller failures mean the Control Plane is unreachable |
+| EPP instances | EPP `/metrics` (default `:9090`) | `ai_epp_assignment_no_match` (this instance has no role in the assignment), `ai_epp_poller_failures_total` / `ai_epp_poller_backoff_state` (polling failures and backoff), `ai_epp_engine_reloads_total` (engine hot reloads), `ai_epp_cell_state` (Cell role and state) | `assignment_no_match=1` means `-instance-id` is inconsistent with the instance pool registration; check the deployment; persistently non-zero poller failures mean the Control Plane is unreachable |
 | Request correlation | EPP logs (demux) | EPP logs carry an `x-request-id`: demux reads it from the headers of the first ext_proc message (passing through the value injected by the gateway) and, when absent, generates a UUID and writes it back into the headers; the llm-d engine logs use the same request ID | When troubleshooting, correlate the BFE → EPP → llm-d engine logs of a single request by `x-request-id` |
 
 To determine whether a request actually went through EPP scheduling (rather than the fallback WRR): BFE's silent fallback for EPP failures also returns 200, so the criterion should be whether `epp_calls_total{result="ok"}` grows, not the response code alone.
@@ -280,13 +380,14 @@ To determine whether a request actually went through EPP scheduling (rather than
 
 ## Validation Rules Quick Reference
 
-**`/epp-pool` (instance pool)**
+**Instance Pool (Dashboard "EPP Instance Pool" tab / `PATCH /epp-pool`)**
 
-- Group names non-empty and unique within the pool; empty groups rejected;
+- At least 1 group; group names non-empty and unique within the pool; empty groups rejected;
+- 1–2 instances per group (production: 2 instances per group as primary/standby; test: single-instance groups allowed); more than 2 instances per group returns 422;
 - Instance ids non-empty and globally unique within the pool;
-- `host` is a Hostname or IP, `port` is a valid port;
-- `(host, port)` globally unique within the pool;
-- 1–2 instances per group (production: 2 instances per group as primary/standby; test: single-instance groups allowed); more than 2 instances per group returns 422.
+- `host` is a valid hostname or IPv4 / IPv6 address, `port` is an integer 1-65535;
+- `(host, port)` combinations globally unique within the pool;
+- Saving has full-replacement semantics: groups and instances not listed will be deleted.
 
 **`/clusters` (balance_mode and epp_config)**
 
@@ -300,26 +401,30 @@ To determine whether a request actually went through EPP scheduling (rather than
 - `flow_control.max_requests` `>0` or `-1` (unlimited by default);
 - `flow_control.queue_ttl` / `no_endpoint_queue_ttl` are integers ≥0 (seconds); `0` means explicitly disabled.
 
-**`/epp-assignments` (manual override)**
+**Manual Override ("EPP Scheduling Assignments" tab / `PUT /epp-assignments/{cluster}`)**
 
-- `group_name` must exist in the current instance pool;
-- `primary_instance_id` must exist in that group's instance list and be a different address from the standby.
+- The instance group must exist in the current instance pool;
+- The primary instance must exist in that group's instance list and have a different address from the standby.
 
 ---
 
 ## Chapter Summary
 
-- The EPP instance pool is registered via `/epp-pool` (singleton + full replacement); instance ids match EPP's `-instance-id`; the EPP component runs with parameters such as `-api-addr`, `-poll-interval`, and `-grpc-tls-cert`.
-- Creating an EPP-mode Cluster means carrying `balance_mode=EPP` and `epp_config` in `POST /clusters`; the system assigns the instance group automatically, and `/epp-assignments` provides the full view and the manual override entry.
-- Draining a backend = setting the Provider instance `weight=0`; removal takes effect within seconds in the cluster_table export and EPP discovery; taking EPP instances online/offline = modifying `/epp-pool`, with dangling assignments repaired automatically.
+- The entry of EPP scheduling is Dashboard "Resource Management → EPP Scheduling", with two tabs "EPP Instance Pool" and "EPP Scheduling Assignments"; saving the instance pool has full-replacement semantics; instance ids match EPP's `-instance-id`; the EPP component runs with parameters such as `-api-addr`, `-poll-interval`, and `-grpc-tls-cert`.
+- The "EPP Instance Pool" tab provides tree-table viewing and inline editing: 1–2 instances per group (primary/standby), validating unique group names and globally unique instance ids and `host:port`; saving automatically repairs dangling assignments (reselect primary in the same group / rerun the assigner to reselect the group / clear the assignment).
+- The "EPP Scheduling Assignments" tab shows the "Cluster ↔ instance group" assignments generated automatically by the assigner: statistics at the top for assigned / unassigned (red alert) / idle groups; the table shows primary/standby instances and status, and supports manual override; unassigned Clusters degrade to WRR on export.
+- Creating an EPP-mode Cluster means selecting `EPP` in the "Balancing Mode Configuration" card of the cluster wizard and filling in `epp_config` (OpenAPI: `POST /clusters` carrying `balance_mode=EPP`); the system assigns the instance group automatically.
+- Draining a backend = setting the Provider instance `weight=0`; removal takes effect within seconds in the cluster_table export and EPP discovery; taking EPP instances online/offline = editing and saving on the "EPP Instance Pool" tab, with dangling assignments repaired automatically.
 - EPP instance failures are switched with hysteresis by BFE `EPPCheck`; the standby does not automatically take over scheduling, and fallback traffic is carried by BFE's local WRR; on full overload EPP has no candidate and BFE falls back, business uninterrupted.
-- Disabling EPP scheduling only requires `balance_mode=WRR`; epp_config and assignments remain dormant and can be switched back.
-- Observability covers three layers: AI Gateway API error logs (degraded export), BFE `/monitor/epp_metrics` (`epp_calls_total` / `epp_fallback_local_total`), and EPP `/metrics` (`ai_epp_assignment_no_match`, etc.); EPP logs carry an `x-request-id` so the BFE → EPP → llm-d engine logs of a request can be correlated by request ID.
+- Disabling EPP scheduling only requires switching back to `WRR`; epp_config and assignments remain dormant and can be switched back.
+- Observability covers three layers: the Dashboard unassigned alert, AI Gateway API error logs (degraded export), BFE `/monitor/epp_metrics` (`epp_calls_total` / `epp_fallback_local_total`), and EPP `/metrics` (`ai_epp_assignment_no_match`, etc.); EPP logs carry an `x-request-id` so the BFE → EPP → llm-d engine logs of a request can be correlated by request ID.
 
 ---
 
 ## References
 
+- `ai-gateway-web/docs/zh-cn/05-epp-schedule.md` (EPP scheduling console user manual — the authoritative basis for the console operations in this chapter)
+- `ai-gateway-web/docs/zh-cn/04-ai-business-cluster.md` ("Balancing Mode Configuration" section)
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/epp-pool.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/epp-assignments.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/clusters.md`
@@ -331,3 +436,4 @@ To determine whether a request actually went through EPP scheduling (rather than
 - `ai-gateway-epp/docs/zh_cn/modifications/2026-09-14-local-config-file/design.md`
 - `integration-test/test-cases/测试设计文档/scenario-SC28-EPP调度端到端/场景说明.md`
 - [Chapter 16 EPP Scheduling Design](../design/chapter16-epp-scheduling-design.md)
+- [Chapter 21 Cluster and Route Configuration](./chapter21-cluster-and-route-config.md)

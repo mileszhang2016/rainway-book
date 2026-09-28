@@ -2,7 +2,7 @@
 
 ## 本章目标
 
-通过本章学习，读者将掌握 Provider 在壬远 AI 网关中的定位与作用，熟练使用 Dashboard 与 OpenAPI 创建和维护 Provider，正确配置模型端点、模型列表、Provider Keys 与后端实例池，使用模型发现工具自动探测模型，理解支持的模型协议差异，掌握通过 model-list.yaml 批量导入模型定价的方法，并厘清 Provider 与 Cluster 的关联关系及变更影响，以及为多协议 provider 配置 `protocol_paths` 协议路径映射的方法与注意事项。
+通过本章学习，读者将掌握 Provider 在壬远 AI 网关中的定位与作用，熟练使用 Dashboard 与 OpenAPI 创建和维护 Provider，正确配置模型端点、模型列表、Provider Keys 与后端实例池（IP 模式与服务商域名模式），使用模型发现工具自动探测模型，理解 `openai`、`anthropic`、`gemini` 三种模型协议的差异，掌握服务商列表常用操作（查询模型价格、详情、分段计价配置、删除）与忙时时间段（peak tier）的配置方法，掌握通过 model-list.yaml 批量导入模型定价的方法，并厘清 Provider 与 Cluster 的关联关系及变更影响，以及为多协议 provider 配置 `protocol_paths` 协议路径映射的方法与注意事项。
 
 ## Provider 的概念与作用
 
@@ -23,15 +23,70 @@ Provider 的核心字段包括：全局唯一的 `name`、可选的 `description
 
 ### 通过 Dashboard 创建
 
-Dashboard 是面向运维人员的可视化控制台，创建 Provider 的常规流程如下：
+Dashboard 是面向运维人员的可视化控制台。登录后进入 **资源管理 → 模型服务商**，点击 **创建服务商**，右侧弹出抽屉表单，分为 5 个 Card 分区：基本信息、实例池、模型服务配置、协议路径映射、服务鉴权 Keys。点击操作列 **编辑** 打开同一抽屉：名称字段灰色禁用（服务商名称创建后不可修改），已配置的 Key 值留空表示保持原值不变。
 
-1. 登录 Dashboard，进入 **Provider 管理** 页面，点击 **新建 Provider**。
-2. 填写基本信息：`name` 要求全局唯一，建议使用小写字母与连字符，如 `deepseek`、`openai-official`；`description` 可选，用于团队识别用途。
-3. 配置 **实例池**：填写后端地址 `addr`、端口 `port` 与权重 `weight`。同一 Provider 内 `(addr, port)` 不能重复，且至少有一个实例的 `weight > 0`。
-4. 配置 **模型端点**：默认协议为 `https`，默认 URI 为 `/v1/models`。大多数 OpenAI 兼容平台无需修改；Claude 官方接口通常也使用 `/v1/models`。
-5. 选择 **模型协议**：首期支持 `openai` 与 `anthropic`，聚合平台可同时勾选多种协议。
-6. 添加 **Provider Keys**：每个 Key 需要一个名称 `name` 和实际密钥值 `key`。名称在 Provider 内唯一，后续 Cluster 通过该名称引用 Key。
-7. 保存并提交，系统校验字段合法性，成功后返回包含 `create_time` 与 `update_time` 的完整 Provider 记录。若校验失败，Dashboard 会提示具体字段错误，例如实例池重复、协议不在枚举范围内、Key 名称不合法或 `models` 元素重复等。
+首次接入的最小配置如下：
+
+| 分区 | 必填项 |
+|------|--------|
+| 基本信息 | 服务商名称 |
+| 实例池 | IP 或服务商域名 + 端口 + 权重（单实例填 100） |
+| 模型服务配置 | 模型协议（至少一种）、模型列表接口路径、模型列表（必填，至少 1 个模型；点「获取」拉取、输入后回车添加，或「批量添加」粘贴多个名称；须提交表单才持久化） |
+| 服务鉴权 Keys | 公有云等需鉴权的服务商通常必填 |
+
+**基本信息**：
+
+| 字段 | 必填 | 校验规则 |
+|------|------|----------|
+| 名称 | 是 | 1-64 字符；仅允许字母、数字、点（`.`）、下划线（`_`）、中划线（`-`）；不能以点、下划线、中划线开头或结尾；不能包含空白字符；创建时不能与已有服务商重名。唯一标识，创建后不可修改 |
+| 描述 | 否 | 不超过 256 字符；不能包含控制字符 |
+
+**实例池**：支持 **IP 模式** 与 **服务商域名模式** 二选一。
+
+IP 模式（默认）适用于自建机房 / 私有化部署（vLLM / Xinference / Ollama 等），可「+ 创建」多行实例：
+
+| 字段 | 必填 | 默认值 | 校验规则 |
+|------|------|--------|----------|
+| IP 地址 | 是 | 空 | 合法 IPv4 / IPv6；实例间 IP 不能重复 |
+| 端口 | 是 | `80` | 1-65535 |
+| 权重 | 是 | 首行 `100`，新增行 `0` | 0-100；所有实例权重之和须等于 100 |
+
+服务商域名模式适用于对接公有云模型服务商：只填一个域名（如 `api.deepseek.com`），端口随协议默认（https→443，http→80），权重固定 100。不支持多地址，不能与 IP 模式混用。
+
+**模型服务配置**：
+
+| 字段 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| 模型协议 | 是 | 空 | 多选；支持 `openai`（OpenAI 兼容）、`anthropic`（Claude Messages API）、`gemini`（Google Gemini API）；至少选一种 |
+| 模型列表接口 | 否 | `https://{实例地址}/v1/models`（`gemini` 协议默认 `/v1beta/models`） | 由协议 + 实例地址（只读，来自实例池）+ URI 路径组成；路径须以 `/` 开头。对应 Provider 资源的 `model_endpoint`（`schema` 即所选协议，`addr` 取自实例池） |
+| 模型列表 | 是 | 空 | 标签多选，至少 1 个模型，详见下文「模型列表的维护」 |
+
+系统根据所选模型协议自动决定调用模型发现接口时的认证头风格（`openai` 使用 `Authorization: Bearer`，`anthropic` 使用 `x-api-key`，`gemini` 使用 `x-goog-api-key`）。**不再支持**在模型列表接口中自定义 `Authorization` Header。
+
+**模型列表的维护**：模型列表为必填项（至少 1 个模型），标签左侧有红色必填星号。校验规则：提交时若列表为空，提示「模型列表为必填项，请至少添加 1 个模型」；模型名不能为空字符串；同一服务商内模型名不能重复。常用操作如下：
+
+| 操作 | 说明 |
+|------|------|
+| 「获取」 | 调用 `POST /v1/providers/tools/discover-models` 无状态发现接口，用当前表单的协议、实例池、模型列表路径与首个 Key 拉取上游模型，并**覆盖**回填到下拉框 |
+| 「批量添加」 | 打开文本框，按行或用逗号 / 中文逗号 / 分号 / 空白分隔粘贴多个模型名；确认后**合并**进现有列表（去重、跳过已有项），不覆盖 |
+| 下拉框输入 | 输入模型名后按回车添加；若剪贴板文本可拆出 2 个及以上模型名，粘贴后会自动拆成多个 Tag，单个名称仍按回车添加 |
+| 置灰条件 | 未选择模型协议，或实例池无有效地址时「获取」按钮禁用 |
+| 提交 | 「获取」或「批量添加」成功后**不会**自动保存，须点击抽屉底部「提交」才写入 Provider 资源 |
+
+> **常见坑**：点「获取」无反应或失败，先检查实例地址、端口、协议与 Key 是否正确，以及 BFE / API Server 能否访问该后端。
+
+**协议路径映射**：与 Provider 资源的 `protocol_paths` 字段一一对应，用于为已勾选的多协议分别指定上游基路径；配置约束与转发行为详见下文「协议路径配置（protocol_paths）」。`gemini` 协议不支持路径改写。
+
+**服务鉴权 Keys**：当后端模型服务需要鉴权时配置。Key 明文仅保存在 Provider 资源中，Cluster 通过 Key **名称** 引用。
+
+| 字段 | 必填 | 校验规则 |
+|------|------|----------|
+| Key 名称 | 条件必填（行内任一字段填写后本行必填） | 1-128 字符；同一服务商内不能重复；供 Cluster 侧下拉选择 |
+| Key 值 | 条件必填 | 1-512 字符；编辑时留空表示不修改 |
+
+支持「+ 添加 Key」增加行、「删除」移除行；空行不参与校验，提交时自动过滤；编辑模式下已配置的 Key 会提示「已配置 Key，如需修改请输入新 Key；留空则保持不变」。
+
+保存时系统校验字段合法性，成功后返回包含 `create_time` 与 `update_time` 的完整 Provider 记录。若校验失败，Dashboard 会提示具体字段错误，例如实例池地址重复、协议不在枚举范围内、Key 名称不合法或 `models` 元素重复等。
 
 ### 通过 OpenAPI 创建
 
@@ -63,11 +118,50 @@ Content-Type: application/json
 
 若请求合法，接口返回 `ErrNum=200`，并在 `Data` 中携带完整记录。若 `model_endpoint`、`keys`、`time_zone` 未传，系统会按文档默认值填充。后续可通过 `PATCH /v1/providers/{provider_name}` 对部分字段进行更新。
 
+## 服务商列表与常用操作
+
+进入 **资源管理 → 模型服务商**，展示当前已创建的服务商列表。列表一次拉取全量数据，名称 / 描述 / 协议 / 模型的搜索与排序均在浏览器端完成。
+
+| 列名 | 说明 |
+|------|------|
+| 名称 | 服务商唯一标识，支持按名称搜索和排序 |
+| 描述 | 服务商说明 |
+| 协议 | 支持的模型访问协议，如 `openai`、`anthropic`、`gemini`；多协议以逗号展示 |
+| 模型 | 已配置模型列表；最多展示 2 个 Tag，超出显示 `+N`，悬停 Tooltip 查看完整列表 |
+| 操作 | 详情、查询模型价格、分段计价配置、编辑、删除 |
+
+列表上方有「创建服务商」按钮。
+
+### 查询模型价格
+
+点击「查询模型价格」，跳转到 **资源管理 → 模型定价** 页面并按该服务商名称（`provider` 字段）筛选列表；若无定价记录，提示「未找到提供商 {provider} 的模型定价」。服务商名称须与定价表中的 `provider` 一致，便于费用核算与该跳转正确归集，定价字段的维护方式见「模型定价导入」与 [第十三章 模型定价与成本核算设计](../design/chapter13-model-pricing.md)。
+
+### 查看详情
+
+点击「详情」打开只读抽屉，展示基本信息（含创建时间、更新时间）、实例池、模型服务配置（模型协议、模型列表接口、模型列表）、协议路径映射、服务鉴权 Keys（Key 值脱敏），以及分段计价配置摘要（时区、忙时时间段表；未配置时显示「未配置」）。
+
+### 分段计价配置
+
+点击操作列「分段计价配置」，打开独立抽屉，用于配置该服务商的**忙时（peak）**时间段，供模型定价中的分时段价格匹配使用。该配置对应 Provider 资源的 `time_zone` 与 `tiers` 字段（见「Provider 的概念与作用」），但提交时调用 `PUT /v1/providers/{name}/pricing-tiers` 单独保存，不影响服务商其他字段。
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| 服务商名称 | — | 只读 |
+| 时区 | 是 | IANA 时区名，如 `Asia/Shanghai`；须通过合法性校验 |
+| 计价时段 | — | 只读展示「忙时」标签；初期仅支持 `peak` |
+| 时间段 | 是 | 表格配置适用星期与起止时间；支持快捷「全选 / 工作日 / 周末」；至少保留 1 行；同一 tier 内多段为「或」关系 |
+
+时间规则：起止时间格式 `HH:MM`，结束时间须大于开始时间，跨午夜请拆成两段；适用时段为空表示每天；星期取值 0=周日 … 6=周六；同一 tier 内多个时间段按「或」匹配，判定语义为 `start <= 当前时刻 < end`（左闭右开）。配置好后，还需在模型定价页为同一 `provider` 维护 `peak` 分时段价格项，未命中忙时的请求回退使用默认价格。
+
+### 删除服务商
+
+点击「删除」后确认。若该服务商仍被业务 Cluster 引用，删除失败并提示「删除失败，该服务商可能仍被集群引用」，需先在相关集群中更换「所属服务商」或删除集群后再删。注意：`model-prices` 中存在同名 `provider` **不会**阻止删除服务商。
+
 ## 配置模型端点、模型列表、Provider Keys
 
 ### 模型端点
 
-`model_endpoint` 用于调用第三方平台的模型列表接口，包含 `schema` 与 `uri` 两个字段。`schema` 默认值为 `https`，可选 `http`；`uri` 默认值为 `/v1/models`，非空且必须以 `/` 开头。该端点主要供模型发现工具使用，不直接影响 BFE 转发目标地址。系统不再允许在 `model_endpoint` 中配置 `headers.Authorization`；调用模型发现接口时，认证头风格由 `model_protocols` 自动决定：`openai` 使用 `Authorization: Bearer {apikey}`，`anthropic` 使用 `x-api-key: {apikey}`。
+`model_endpoint` 用于调用第三方平台的模型列表接口，包含 `schema` 与 `uri` 两个字段。`schema` 默认值为 `https`，可选 `http`；`uri` 默认值为 `/v1/models`（`gemini` 协议为 `/v1beta/models`），非空且必须以 `/` 开头。该端点主要供模型发现工具使用，不直接影响 BFE 转发目标地址。系统不再允许在 `model_endpoint` 中配置 `headers.Authorization`；调用模型发现接口时，认证头风格由 `model_protocols` 自动决定：`openai` 使用 `Authorization: Bearer {apikey}`，`anthropic` 使用 `x-api-key: {apikey}`，`gemini` 使用 `x-goog-api-key: {apikey}`。
 
 ### 模型列表
 
@@ -109,20 +203,21 @@ POST /v1/providers/tools/discover-models
 }
 ```
 
-执行时，若 `uri` 为空则默认使用 `/v1/models`；系统根据 `model_protocol` 生成对应认证头，调用 `{schema}://{addr}:{port}{uri}`，并使用对应协议解析器提取模型名列表。返回结果为一个字符串数组，可直接复制到 Provider 的 `models` 字段中。该接口为无状态工具，不直接修改 Provider；若需回填，需再调用 `PATCH /v1/providers/{provider_name}` 将 `models` 写入。
+执行时，若 `uri` 为空则默认使用 `/v1/models`（`gemini` 协议为 `/v1beta/models`）；系统根据 `model_protocol` 生成对应认证头（`openai` 为 `Authorization: Bearer`，`anthropic` 为 `x-api-key`，`gemini` 为 `x-goog-api-key`），调用 `{schema}://{addr}:{port}{uri}`，并使用对应协议解析器提取模型名列表。返回结果为一个字符串数组，可直接复制到 Provider 的 `models` 字段中。该接口为无状态工具，不直接修改 Provider；若需回填，需再调用 `PATCH /v1/providers/{provider_name}` 将 `models` 写入。Dashboard 创建抽屉中的「获取」按钮即封装了该接口，用当前表单上下文（协议、实例池、模型列表路径与首个 Key）拉取并回填。
 
 ## 支持的模型协议
 
-Provider 通过 `model_protocols` 字段声明支持的模型访问协议。首期枚举值包括：
+Provider 通过 `model_protocols` 字段声明支持的模型访问协议。当前枚举值包括：
 
-| 枚举值 | 说明 |
-|--------|------|
-| `openai` | OpenAI 兼容协议，包括大多数国产兼容平台 |
-| `anthropic` | Anthropic Claude Messages API |
+| 枚举值 | 说明 | 模型发现认证头 | 模型列表接口默认路径 |
+|--------|------|----------------|----------------------|
+| `openai` | OpenAI 兼容协议，包括大多数国产兼容平台 | `Authorization: Bearer {apikey}` | `/v1/models` |
+| `anthropic` | Anthropic Claude Messages API | `x-api-key: {apikey}` | `/v1/models` |
+| `gemini` | Google Gemini API | `x-goog-api-key: {apikey}` | `/v1beta/models` |
 
-一个 Provider 可同时支持多种协议，例如聚合平台可配置 `["openai", "anthropic"]`，但至少包含一个协议。
+一个 Provider 可同时支持多种协议，例如聚合平台可配置 `["openai", "anthropic"]`，但至少包含一种协议。`gemini` 协议有两点特殊之处：其一，模型发现接口的默认路径为 `/v1beta/models`；其二，`protocol_paths` 不支持对 `gemini` 做路径改写（其原生路径即标准路径，透传已可用），详见下文「协议路径配置（protocol_paths）」。
 
-`model_protocols` 会影响 BFE 数据面的转发行为。认证头注入方面，`openai` 使用 `Authorization: Bearer`，`anthropic` 使用 `x-api-key`；Claude 请求还需要额外注入 `anthropic-version`。Usage 解析会按协议风格处理不同响应格式，例如 OpenAI 风格的 `usage` 字段与 Claude 风格的 `usage` 字段结构不同。协议匹配校验会检查请求协议风格是否在目标 Cluster 对应 Provider 的 `model_protocols` 中，若不匹配则直接拒绝。控制面生成 BFE 配置时，会将 `provider.model_protocols` 透传到 `AIConf.ModelProtocols`，供数据面使用。
+`model_protocols` 会影响 BFE 数据面的转发行为。认证头注入方面，`openai` 使用 `Authorization: Bearer`，`anthropic` 使用 `x-api-key`，`gemini` 使用 `x-goog-api-key`；Claude 请求还需要额外注入 `anthropic-version`。Usage 解析会按协议风格处理不同响应格式，例如 OpenAI 风格的 `usage` 字段与 Claude 风格的 `usage` 字段结构不同。协议匹配校验会检查请求协议风格是否在目标 Cluster 对应 Provider 的 `model_protocols` 中，若不匹配则直接拒绝。控制面生成 BFE 配置时，会将 `provider.model_protocols` 透传到 `AIConf.ModelProtocols`，供数据面使用。
 
 ## 协议路径配置（protocol_paths）
 
@@ -141,7 +236,7 @@ Provider 通过 `model_protocols` 字段声明支持的模型访问协议。首�
 
 配置约束：
 
-- key 必须是该 provider `model_protocols` 已声明的 `openai` 或 `anthropic`，未声明的协议不允许配置路径；
+- key 必须是该 provider `model_protocols` 已声明的 `openai` 或 `anthropic`，未声明的协议不允许配置路径；`gemini` 不支持路径改写，不能作为 key；
 - value 必须 `/` 开头、不以 `/` 结尾、不含 `..`/`?`/`#`、长度不超过 128；
 - 缺省（不配置）表示关闭，请求路径原样转发；
 - PATCH 更新遵循部分更新约定：不显式携带则保持原值，显式传 `null` 清空（恢复透传）。
@@ -150,6 +245,7 @@ Provider 通过 `model_protocols` 字段声明支持的模型访问协议。首�
 
 - openai 协议：客户端入口带不带 `/v1` 前缀均可改写。先剥离可选的 `/v1` 前缀，命中 `bfe_basic` 共享端点表（`bfe/bfe_basic/openai_endpoint.go` 中的 `openAIEndpointModes`，13 个端点）才改写：`/v1/chat/completions` 与 `/chat/completions` 均改写为 `{openai 值}/chat/completions`，`/v1` 或 `/v1/` 改写为 `{openai 值}` 本身；未命中端点表的自定义路径原样透传，兼容存量客户端。
 - anthropic 协议：仅标准入口 `/v1/...` 被改写（`/v1/messages` → `{anthropic 值}/v1/messages`），非标准入口原样透传；未配置对应协议路径时不改写。
+- gemini 协议：永不改写。`ProtocolPaths` 仅 `openai`/`anthropic` 两个合法 key，gemini 原生路径（如 `/v1beta/models/gemini-2.5-flash:generateContent`）始终透传。
 
 注意事项：
 
@@ -273,7 +369,7 @@ BFE 最终接收到的配置由控制面自动合并生成：`AIConf.Keys` 通�
 
 ### 1. 创建 Provider 时报“instance_pool 不合法”
 
-检查是否至少填写了一个实例；`(addr, port)` 是否重复；是否至少有一个实例的 `weight > 0`。
+检查是否至少填写了一个实例；IP 模式下实例间 IP 是否重复；端口是否在 1-65535 范围内；权重是否在 0-100 之间，且所有实例权重之和等于 100（服务商域名模式权重固定 100，不受此约束）；是否至少有一个实例的 `weight > 0`。
 
 ### 2. 更新 Provider 的 Keys 或 Models 时返回 409
 
@@ -285,7 +381,7 @@ BFE 最终接收到的配置由控制面自动合并生成：`AIConf.Keys` 通�
 
 ### 4. 模型发现返回空列表或报错
 
-检查 `model_protocol` 是否与实际平台匹配；`addr`、`port`、`uri` 是否正确；`apikey` 是否有效。对于 Claude 平台，确认 `model_protocol` 选择 `anthropic`。
+检查 `model_protocol` 是否与实际平台匹配；`addr`、`port`、`uri` 是否正确；`apikey` 是否有效。对于 Claude 平台，确认 `model_protocol` 选择 `anthropic`；对于 Google Gemini 平台，选择 `gemini`（模型发现默认路径 `/v1beta/models`，认证头 `x-goog-api-key`）。若点「获取」无反应，先检查实例地址、端口、协议与 Key 是否正确，以及 BFE / API Server 能否访问该后端。
 
 ### 5. Cluster 引用 Provider 后转发失败
 
@@ -342,6 +438,20 @@ curl -X POST https://control-plane.example.com/v1/providers/tools/discover-model
   }'
 ```
 
+`gemini` 协议示例（`uri` 留空时默认 `/v1beta/models`，认证头自动使用 `x-goog-api-key`）：
+
+```bash
+curl -X POST https://control-plane.example.com/v1/providers/tools/discover-models \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_protocol": "gemini",
+    "schema": "https",
+    "addr": "generativelanguage.googleapis.com",
+    "port": 443,
+    "apikey": "AIzaSyaaaaaaaaaaaa"
+  }'
+```
+
 ### Cluster TOML 语义示意
 
 ```toml
@@ -370,12 +480,14 @@ Cluster 不声明 `instance_pool`、`model_endpoint` 或 `provider_type`，这�
 
 Provider 是壬远 AI 网关控制面中描述下游模型提供方的核心资源。Provider 与 Cluster 职责分离后，Cluster 专注转发策略，Provider 专注接入信息，提升了配置复用性、安全性与可维护性。
 
-本章重点包括：Provider 的数据模型与字段含义；通过 Dashboard 与 OpenAPI 创建、更新 Provider 的流程；模型端点、模型列表、Provider Keys 的配置方法与约束；`/providers/tools/discover-models` 无状态模型发现工具的使用；`protocol_paths` 协议路径映射的配置方法、约束与转发行为；`openai` 与 `anthropic` 协议对认证头、版本头、Usage 解析与协议匹配的影响；通过 `model-list.yaml` 批量导入模型定价的流程与注意事项；图片输入 token 与视频按个计费等价格字段及 `responses`、`video_generation` 计费模式；Provider 与 Cluster 的强引用关系以及变更时的同步与冲突处理；常见问题的排查思路与配置示例。
+本章重点包括：Provider 的数据模型与字段含义；通过 Dashboard 与 OpenAPI 创建、更新 Provider 的流程（Dashboard 抽屉的基本信息、实例池、模型服务配置、协议路径映射、服务鉴权 Keys 五个分区）；实例池 IP 模式与服务商域名模式的差异与权重约束；模型端点、模型列表、Provider Keys 的配置方法与约束；`/providers/tools/discover-models` 无状态模型发现工具的使用；服务商列表常用操作，包括查询模型价格、查看详情、分段计价配置（忙时时间段、IANA 时区、左闭右开匹配）与删除；`protocol_paths` 协议路径映射的配置方法、约束与转发行为；`openai`、`anthropic` 与 `gemini` 协议对认证头、版本头、Usage 解析与协议匹配的影响；通过 `model-list.yaml` 批量导入模型定价的流程与注意事项；图片输入 token 与视频按个计费等价格字段及 `responses`、`video_generation` 计费模式；Provider 与 Cluster 的强引用关系以及变更时的同步与冲突处理；常见问题的排查思路与配置示例。
 
 合理规划 Provider 与 Cluster 的拆分，是后续路由规则、API-Key 配额、限流策略生效的重要前提。建议在生产环境中先统一维护 Provider 与模型价格，再按需创建不同业务线的 Cluster。定期对比 `/providers` 与 `/model-prices/actions/get-providers` 返回的 provider 列表，可及时发现并补录价格记录与实际 Provider 脱节的问题，确保成本核算准确。
 
 ## 参考文档
 
+- `ai-gateway-web/docs/zh-cn/03-model-provider.md`（Dashboard 模型服务商用户手册，本章控制台内容的权威依据）
+- `ai-gateway-web/docs/zh-cn/06-model-prices.md`（Dashboard 模型定价用户手册）
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/providers.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/model-prices.md`
 - `ai-gateway-api/design-docs/sys-design/details/provider与cluster概念分离.md`

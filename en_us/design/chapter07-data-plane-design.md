@@ -193,13 +193,13 @@ type ProtocolAdapter interface {
 }
 ```
 
-Built-in adapters are registered at compile time in the `init()` of `registry.go` (`Register(openai.New())`, `Register(anthropic.New())`). Three functions are exposed:
+Built-in adapters are registered at compile time in the `init()` of `registry.go` (`Register(openai.New())`, `Register(anthropic.New())`, `Register(gemini.New())`). Three functions are exposed:
 
 - `Get(protocol)`: returns the adapter for a protocol name; unknown or empty names fall back to the openai adapter, preserving the historical fallback behavior;
 - `Supports(protocols, p)`: reports whether a protocol is in a cluster's `ModelProtocols` list; an empty list defaults to openai only (backward compatible);
 - `ValidateProtocols(protocols)`: verifies that every name is known to the registry, returning an error for unknown names; an empty list is valid.
 
-Protocol selection is **per request**: `doSingleAIForward()` picks the adapter matching the request's `AiBasicInfo.AuthStyle`, and a cluster may declare multiple protocols such as `["openai", "anthropic"]`.
+Protocol selection is **per request**: `doSingleAIForward()` picks the adapter matching the request's `AiBasicInfo.AuthStyle`, and a cluster may declare multiple protocols such as `["openai", "anthropic", "gemini"]`.
 
 One conceptual boundary deserves emphasis: **model_protocol (protocol knowledge) ≠ provider (user-defined entity)**. A provider is a cluster-level upstream entity (name, key pool, price table, address) managed by the Control Plane AI Gateway API; a model_protocol describes protocol knowledge such as how credentials are injected, which version headers are added, and what usage fields look like. Brands in the OpenAI-compatible ecosystem such as Groq, DeepSeek, and OpenRouter all use the `openai` protocol: onboarding them requires no new adapter at all, only `model_protocols: ["openai"]` in the cluster configuration — a zero-code change.
 

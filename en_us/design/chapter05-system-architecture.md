@@ -101,7 +101,7 @@ The "BFE cluster" corresponds to BFE's Server Data configuration. It registers t
 The "model provider" corresponds to the `/providers` resource of the OpenAPI, and answers the questions "who is downstream, which models can be accessed, how to authenticate, and where the backend is". It holds:
 
 - Backend instance pool (`instance_pool`): the real AI service endpoints;
-- Model protocols (`model_protocols`): e.g. `openai`, `anthropic`;
+- Model protocols (`model_protocols`): e.g. `openai`, `anthropic`, `gemini`;
 - Model list (`models`) and the model discovery endpoint;
 - Plaintext service authentication keys (`keys`).
 
