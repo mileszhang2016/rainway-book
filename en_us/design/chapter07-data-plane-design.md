@@ -6,7 +6,7 @@ This chapter focuses on BFE (Beyond Front End), the Data Plane component of the 
 
 - The role BFE plays in the Rainway AI Gateway and its relationship with the Control Plane (AI Gateway API);
 - The request processing lifecycle of BFE, especially the independent forwarding path in AI Gateway mode;
-- The execution order and collaboration of the four AI-related modules `mod_ai_route`, `mod_ai_token_auth`, `mod_ai_rate_limit`, and `mod_body_process`;
+- The execution order and collaboration of the AI-related modules `mod_ai_token_auth`, `mod_ai_cache`, `mod_ai_route`, `mod_ai_intent`, `mod_ai_rate_limit`, `mod_ai_context`, `mod_traffic_mirror`, and `mod_body_process`;
 - The responsibilities, adapter interface, and protocol registration mechanism of the protocol adapter layer `bfe_model_protocol`;
 - The callback mechanism and module registration of the BFE module framework `bfe_module`;
 - The loading, validation, and hot reload mechanisms of AI-related configuration files;
@@ -31,7 +31,7 @@ The Data Plane requires high concurrency, low latency, observability, and hot up
 
 After startup, BFE listens for HTTP/HTTPS/HTTP2/WebSocket connections. Each request that enters BFE goes through stages in sequence: connection acceptance, protocol parsing, tenant identification, module callbacks, backend forwarding, and response sending. In AI Gateway mode, BFE enters the independent `ServeHTTPForAI()` forwarding path.
 
-The connection acceptance stage is handled by listeners in `bfe_server/`, responsible for TLS handshakes, session management, and protocol negotiation. HTTP request parsing is handled by protocol implementations such as `bfe_http/` and `bfe_http2/`, which produce `bfe_basic.Request` objects. BFE then enters the module callback stage, invoking the registered modules' callback functions in a fixed order. AI-related modules mainly intervene at the `HandleFoundProduct` and `HandleAfterAITargetModel` stages, while the response stage is handled by `HandleReadResponse` and `HandleRequestFinish`.
+The connection acceptance stage is handled by listeners in `bfe_server/`, responsible for TLS handshakes, session management, and protocol negotiation. HTTP request parsing is handled by protocol implementations such as `bfe_http/` and `bfe_http2/`, which produce `bfe_basic.Request` objects. BFE then enters the module callback stage, invoking the registered modules' callback functions in a fixed order. AI-related modules mainly intervene at the `HandleFoundProduct`, `HandleAfterAITargetModel`, and `HandleForward` stages, while the response stage is handled by `HandleReadResponse` and `HandleRequestFinish`.
 
 ### Dispatching Between the Traditional Path and the AI Gateway Path
 
@@ -78,6 +78,8 @@ When `ai_gateway_enabled = false`, requests follow BFE's original `ServeHTTP()` 
 ┌───────────────────────────────────────────┐
 │  HandleFoundProduct                       │
 │  mod_ai_token_auth                        │
+│  mod_ai_cache                             │
+│    hit → BfeHandlerFinish short-circuit   │
 │  mod_ai_route                             │
 └──────────────┬────────────────────────────┘
                │
@@ -106,16 +108,23 @@ When `ai_gateway_enabled = false`, requests follow BFE's original `ServeHTTP()` 
 │  HandleAfterAITargetModel                 │
 │  mod_ai_token_auth (target model check)   │
 │  mod_ai_rate_limit                        │
+│  mod_ai_context (context compression)     │
+│  HandleForward                            │
+│  mod_traffic_mirror (async mirroring)     │
 │  Degrade in fallbacks order on failure    │
 └──────────────┬────────────────────────────┘
                │
                ▼
 ┌───────────────────────────────────────────┐
 │  HandleReadResponse / send response       │
+│  mod_ai_cache (write-back on miss)        │
+│  mod_ai_token_auth (usage parsing)        │
+│  mod_ai_context (compression annotation)  │
+│  mod_body_process                         │
 └───────────────────────────────────────────┘
 ```
 
-As shown in the diagram, the AI Gateway path completes authentication and routing lookup at the `HandleFoundProduct` stage; inside the `ServeHTTPForAI()` forwarding loop, the `HandleAfterAITargetModel` callback performs the target model check and rate limiting per cluster attempt, and target selection, model override, and fallback degradation all happen within `ServeHTTPForAI()`.
+As shown in the diagram, the AI Gateway path completes authentication, cache lookup, and routing lookup in sequence at the `HandleFoundProduct` stage: a cache hit short-circuits and returns the cached response, and only on a miss does route rule evaluation continue; inside the `ServeHTTPForAI()` forwarding loop, each cluster attempt fires the `HandleAfterAITargetModel` callback (target model check, rate limiting, context compression) and the `HandleForward` callback (traffic mirroring) in turn, and target selection, model override, and fallback degradation all happen within `ServeHTTPForAI()`; the response stage completes cache write-back, usage parsing, compression annotation, and SSE usage extraction in `HandleReadResponse`, and quota settlement is finally completed by `HandleRequestFinish` (skipped on cache hit).
 
 ## Execution Order and Collaboration of AI-Related Modules
 
@@ -128,10 +137,31 @@ var moduleList = []bfe_module.BfeModule{
     // mod_ai_token_auth
     mod_ai_token_auth.NewModuleAITokenAuth(),
 
+    // mod_ai_cache
+    // Requirement: after mod_ai_token_auth (never serve cached content to
+    // unauthenticated requests) and before mod_ai_route — a cache hit
+    // short-circuits at HandleFoundProduct, skipping route rule evaluation
+    // and req_ai_intent_in lazy resolution entirely
+    mod_ai_cache.NewModuleAiCache(),
+
     // mod_ai_route
-    // Requirement: must come after mod_ai_token_auth (needs ClientApiKey)
-    // and before mod_body_process
+    // Requirement: after mod_ai_token_auth (needs ClientApiKey) and after
+    // mod_ai_cache (hit requests have already finished)
     mod_ai_route.NewModuleAiRoute(),
+
+    // mod_ai_intent
+    // No ordering requirement: intent classification is lazily resolved;
+    // Init only injects the resolver and confidence threshold into
+    // bfe_basic, triggered by req_ai_intent_in during route rule evaluation
+    mod_ai_intent.NewModuleAiIntent(),
+
+    // mod_traffic_mirror
+    // Requirement: after mod_ai_route / mod_ai_token_auth (HandleForward
+    // fires after all HandleFoundProduct / HandleAfterLocation callbacks,
+    // and mirror rules consume resolved AI context such as model/API-Key),
+    // and before mod_access_pb3 (mirror log fields must be written before
+    // the access log). Registers HandleForward only
+    mod_traffic_mirror.NewModuleTrafficMirror(),
 
     // mod_body_process
     mod_body_process.NewModuleBodyProcess(),
@@ -139,19 +169,30 @@ var moduleList = []bfe_module.BfeModule{
     // Depends on token computation
     mod_ai_rate_limit.NewModuleAiRateLimit(),
 
+    // mod_ai_context
+    // Requirement: after mod_ai_route (HandleAfterAITargetModel needs the
+    // resolved TargetModel to compute the token budget) and after
+    // mod_ai_rate_limit (rate limiting judges the uncompressed request
+    // context), and before mod_access_pb3 (compression state fields must be
+    // written before the access log)
+    mod_ai_context.NewModuleAiContext(),
+
     // ...
 }
 ```
 
-This order determines the execution order of the modules in the `HandleFoundProduct` callback: `mod_ai_token_auth` → `mod_ai_route`. The model whitelist check and rate limiting do not run at `HandleFoundProduct`; they are registered at the forwarding-stage `HandleAfterAITargetModel` callback point (fired after the target model is resolved and before forwarding, once per cluster attempt), where `mod_ai_token_auth` runs before `mod_ai_rate_limit` so that the whitelist check always precedes rate limiting. These modules share state through `AiBasicInfo` and `Request.Context`, such as `ClientApiKey`, `ClientModel`, `TargetModel`, `AiRouteResult`, and so on.
+This order determines the execution order of the modules in the `HandleFoundProduct` callback: `mod_ai_token_auth` → `mod_ai_cache` → `mod_ai_route`. The model whitelist check and rate limiting do not run at `HandleFoundProduct`; they are registered at the forwarding-stage `HandleAfterAITargetModel` callback point (fired after the target model is resolved and before forwarding, once per cluster attempt), where `mod_ai_token_auth` runs before `mod_ai_rate_limit` so that the whitelist check always precedes rate limiting. These modules share state through `AiBasicInfo` and `Request.Context`, such as `ClientApiKey`, `ClientKeyId`, `ClientModel`, `TargetModel`, `AiCacheStatus`, `AiIntent`, `AiRouteResult`, and so on.
 
 The constraints on the execution order are determined by data dependencies:
 
-- `mod_ai_token_auth` runs first, identifying the caller's identity and setting `ClientApiKey`;
-- `mod_ai_route` follows immediately, relying on `ClientApiKey` to complete the routing lookup and produce `AiRouteResult`;
-- the target model check of `mod_ai_token_auth` and `mod_ai_rate_limit` execute at the `HandleAfterAITargetModel` stage, by which time routing is complete and `AiBasicInfo.TargetModel` has been resolved after the route target model override, prefix stripping, and cluster `ModelMapping`; both perform the whitelist check and TPM/RPM/concurrency rate limiting against that target model.
+- `mod_ai_token_auth` runs first, identifying the caller's identity and setting `ClientApiKey` and `ClientKeyId`;
+- `mod_ai_cache` follows immediately, providing cache lookup for authenticated requests; a hit short-circuits and returns, while a miss saves the miss context and continues;
+- `mod_ai_route` executes after `mod_ai_cache`, relying on `ClientApiKey` to complete the routing lookup and produce `AiRouteResult`; when the cache hits, the request has already finished and this module no longer executes;
+- `mod_ai_intent` registers no request callbacks; it only injects the intent resolver at `Init()`, and classification is triggered when route rule evaluation encounters `req_ai_intent_in`;
+- `mod_traffic_mirror` registers only `HandleForward`, mirroring asynchronously per cluster attempt inside the forwarding loop without affecting the main-path forwarding;
+- the target model check of `mod_ai_token_auth`, `mod_ai_rate_limit`, and `mod_ai_context` execute at the `HandleAfterAITargetModel` stage, by which time routing is complete and `AiBasicInfo.TargetModel` has been resolved after the route target model override, prefix stripping, and cluster `ModelMapping`; the three perform the whitelist check, TPM/RPM/concurrency rate limiting, and context compression against that target model.
 
-`mod_body_process` mainly executes at the `HandleReadResponse` stage, parsing token usage from streaming responses; its results are used by `mod_ai_token_auth` at the `HandleRequestFinish` stage for the final quota deduction. Any change to this order would break the dependency chain, causing abnormal routing, rate limiting, or quota deduction behavior. Therefore, the registration positions and comments in `bfe_modules/bfe_modules.go` must be maintained in sync.
+`mod_body_process` mainly executes at the `HandleReadResponse` stage, parsing token usage from streaming responses; its results are used by `mod_ai_token_auth` at the `HandleRequestFinish` stage for the final quota deduction; `mod_ai_cache` (write-back on miss) and `mod_ai_context` (compression annotation) at the same stage only perform response-side processing and do not affect quota data. Any change to this order would break the dependency chain, causing abnormal routing, cache, rate limiting, or quota deduction behavior. Therefore, the registration positions and comments in `bfe_modules/bfe_modules.go` must be maintained in sync.
 
 ### Protocol Adapter Layer (bfe_model_protocol)
 
@@ -228,25 +269,36 @@ To keep the dependency graph acyclic, `bfe_model_protocol` may only import `bfe_
                              │
               ┌──────────────┼──────────────┐
               ▼              ▼              ▼
-    ┌─────────────────┐ ┌─────────────┐ ┌─────────────────┐
-    │ mod_ai_token_auth│ │ mod_ai_route │ │ mod_ai_rate_limit│
-    │ API-Key auth     │ │ Route lookup │ │ Rate limiting   │
-    └────────┬────────┘ └──────┬──────┘ └────────┬────────┘
-             │                 │                 │
-             ▼                 ▼                 ▼
+    ┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐
+    │ mod_ai_token_auth │ │   mod_ai_cache    │ │   mod_ai_route    │
+    │ API-Key auth      │ │ Cache lookup/     │ │  Route lookup     │
+    │                   │ │ write-back        │ │                   │
+    └────────┬──────────┘ └────────┬──────────┘ └────────┬──────────┘
+             │                     │                     │
+             ▼                     ▼                     ▼
     ┌─────────────────────────────────────────────────────┐
     │          AiBasicInfo / Request.Context              │
-    │  - ClientApiKey                                     │
+    │  - ClientApiKey / ClientKeyId                       │
     │  - ClientModel / TargetModel                        │
+    │  - AiCacheStatus (cache hit status)                 │
+    │  - AiIntent (lazily resolved intent result)         │
     │  - QuotaPlan / TokenUsage                           │
     │  - AiRouteResult (targets / fallbacks)              │
     └────────────────────────┬────────────────────────────┘
                              │
                              ▼
-                 ┌───────────────────────┐
-                 │ ReverseProxy.ServeHTTPForAI │
-                 └───────────────────────┘
+             ┌───────────────────────────────┐
+             │   ReverseProxy.ServeHTTPForAI │
+             │  HandleAfterAITargetModel:    │
+             │   mod_ai_token_auth (check)   │
+             │   mod_ai_rate_limit           │
+             │   mod_ai_context (compress)   │
+             │  HandleForward:               │
+             │   mod_traffic_mirror          │
+             └───────────────────────────────┘
 ```
+
+`mod_ai_intent` registers no request callbacks; it provides the intent result through `AiIntent` on `AiBasicInfo` only when rule evaluation references `req_ai_intent_in`, so it is not listed separately in the diagram above.
 
 ### mod_ai_route: The AI Routing Module
 
@@ -300,6 +352,48 @@ The module is registered at the `HandleAfterAITargetModel` callback point (after
 
 The loading and ordering of `mod_body_process` is critical to RMB quota deduction. If the quota deduction logic is modified, you must ensure that the streaming response scenario still works correctly when `mod_body_process` is loaded.
 
+### mod_ai_cache: The AI Cache Module
+
+`mod_ai_cache` provides two-level caching for AI requests: exact-match and semantic. The module is registered at the `HandleFoundProduct` callback point, between `mod_ai_token_auth` and `mod_ai_route`: once authentication completes, the cache is looked up immediately; on a hit the request returns the cached response directly (`BfeHandlerFinish` short-circuit) and routing lookup no longer executes — the intent lazy resolution triggered by `req_ai_intent_in` is skipped as well; on a miss, the miss context is saved and forwarding continues, and the cache is written back at the `HandleReadResponse` stage. Hit requests skip quota settlement: `mod_ai_token_auth` skips subsequent deduction based on `AiBasicInfo.AiCacheHit`.
+
+The cache key format is `{CacheKeyPrefix}:{key_id|unknown}:{first 16 bytes of sha256(question) in hex}`. The tenant identifier comes from `AiBasicInfo.ClientKeyId`; unauthenticated requests fall back to the `unknown` key space, so different tenants cannot see each other's entries. The request header `x-bfe-skip-ai-cache: on` makes the request skip the cache entirely (neither read nor write); a hit response carries the `X-Bfe-Ai-Cache: hit` response header.
+
+The rule file `mod_ai_cache_rule.data` organizes the rule list by product line. Main fields:
+
+| Field | Description |
+|------|------|
+| `cond` | Match condition; referencing `req_ai_intent_in` logs a WARN at load time but is still accepted (the cache runs before routing, so intent conditions only take effect on the miss path) |
+| `cacheKeyStrategy` | Key strategy: `lastQuestion` (default, the last user question) / `allQuestions` (concatenation of all user questions) / `disabled` |
+| `cacheTTL` | Cache expiration in seconds; defaults to the module configuration `DefaultCacheTTL` (3600) |
+| `cacheKeyFrom` / `cacheValueFrom` | GJSON extraction path overrides, defaulting to `messages.@reverse.0.content` / `choices.0.message.content` |
+| `responseTemplate` / `streamResponseTemplate` | Hit response templates, where `%s` is the placeholder for cached content |
+| `maxBodyBytes` / `maxValueBytes` | Size limits for the request body and the cached value (1MB each by default) |
+| `enableSemanticCache` | Rule-level semantic cache switch (default false; ignored under the `disabled` strategy) |
+
+The module configuration `mod_ai_cache.conf` provides `ProductRulePath`, `CacheKeyPrefix` (default `ai_cache`), and `DefaultCacheTTL` in the `[basic]` section, while the `[redis]` section configures the cache storage. The semantic cache is configured pairwise by `[embedding]` (an OpenAI-compatible `POST /v1/embeddings` service, `timeoutMs` default 500) and `[vector]` (the Chroma vector database, `collection` default `ai_cache_semantic`, `timeoutMs` default 300); when either is missing or initialization fails, the whole setup degrades to pure exact-match caching. The top-level `Semantic` block of the rule file configures `topK` (1-10, default 1), `threshold` (0-2, default 0.15), and `thresholdRelation` (`lt|lte|gt|gte`, default `lt`). The semantic hit response header is `X-Bfe-Ai-Cache: hit_semantic`, and billing skipping is identical to an exact hit. On write-back, Redis is written synchronously via SETEX while the vector database is upserted asynchronously; the whole path is fail-open — requests are forwarded normally even when Redis is down.
+
+### mod_ai_intent: The AI Intent Module
+
+`mod_ai_intent` provides intent classification for semantic routing using a lazy-resolution design: the module `Init()` only injects the resolver and confidence threshold into `bfe_basic` via `bfe_basic.SetAiIntentResolver`, registering no request callbacks; resolution is not triggered until rule evaluation first references `req_ai_intent_in` (typically during route rule evaluation in `mod_ai_route`). Route rule evaluation without intent conditions carries zero overhead.
+
+The question set file `intent_questions.data` consists of `Version`, a global `MinConfidence` (default 0.6), and a `Questions` array; questions are of two types, `choice` (`Criteria` option mapping) and `score` (`Levels` ordered tiers), and may carry a question-level `MinConfidence` that overrides the global threshold. An empty `Questions` array is a legal soft switch: intent classification is disabled, all `req_ai_intent_in` conditions fail to match, and traffic falls back to the default route. The file supports hot reload and is a no-op when the version is unchanged.
+
+Classification calls the decision service's System One protocol (`POST /v1/systemone`, timeout default 300ms); the classified text is truncated to `MaxStateChars` (default 2000 characters). Clients can also declare intent directly via the explicit intent header `X-AI-Intent: <question>=<option>` (multiple questions separated by semicolons), which takes priority over model classification and produces no classification call on this path. Results are cached in an in-process LRU cache (default 10000 entries, 1800 seconds); consecutive decision service failures trip a circuit breaker (default failure threshold 5, probe interval 5000ms). When the decision service is unavailable, the confidence is below the threshold, or the question is not configured, `req_ai_intent_in` never matches; referencing a nonexistent question name is treated fail-safe and never hits.
+
+### mod_ai_context: The AI Context Compression Module
+
+`mod_ai_context` compresses the request context against the token budget of the target model before forwarding. The module registers two callback points: `HandleAfterAITargetModel` (after the target model is resolved and before forwarding, fired per cluster attempt) performs the compression, and `HandleReadResponse` injects an annotation header into compressed responses. `AiBasicInfo.ContextCompressStatus` is the idempotency guard: although the callback fires on every fallback attempt, compression runs only once — key rotation and degradation never recompress.
+
+Budget = context window − output reserve: the window is heuristically determined by the target model name (gemini 1M, claude 200k, codex 400k, default 128k tokens); when `reserveTokens` is 0 it automatically takes `clamp(window×15%, 256, 16000)`; rules may override `maxContextTokens` and `reserveTokens`. Compression triggers only when the estimated token count exceeds `budget × triggerRatio` (default 0.7). The degradation pipeline runs in order: L1 tool-result truncation (default 2000 characters) → keep only the latest 2 inline images → L2 thinking-block deletion (`thinkingPolicy=trim-all-but-last|keep`); the `conservative` mode stops here, while `balanced`/`aggressive` continue into P2 rule-based rewriting (`rewrite.strength=lite|full`), whose output passes a fidelity gate (protected-token survival rate no lower than `protectedSurvivalRate`, default 0.95) — if not met, the rewrite product is discarded and the result falls back to the trim output; finally `repairMessages` corrects tool-call pairing, rolling back to the original text when invalid. Any exception fails open and passes the original text. Compression only rewrites the forwarding `OutRequest`; the original request is untouched, and access logs and billing are still computed against the original request; compressed responses carry the annotation header `x-ai-context-compression: tokens=%d->%d; mode=%s`. The compression state has 8 values: `skip_no_rule`, `skip_protocol`, `skip_body_incomplete`, `skip_parse_err`, `skip_under_threshold`, `trim`, `rewrite`, `repair_rollback`. The module conf is only bootstrap configuration (`ProductRulePath`); all business tuning lives in the top-level `Defaults` block of the rule file and hot reloads with it.
+
+### mod_traffic_mirror: The Traffic Mirroring Module
+
+`mod_traffic_mirror` asynchronously mirrors AI requests matching the rules to shadow clusters, for gray-release comparison and shadow testing of new versions. The module registers only the `HandleForward` callback (before forwarding, fired per cluster attempt); matching, snapshotting, and submission all run asynchronously and never block the main path. The `CtxMirrored` once marker in `Request.Context` ensures that when an AI fallback retry re-enters `HandleForward`, the request is not mirrored again.
+
+Mirror rule fields include: `cond` (a special case in this module — empty means matching all requests), `percentage` (0-100 sampling), `removeHeaders` (sensitive header stripping), `setHeaders` (injected headers), `bodyRewrites` (phase 1 supports only `path="model"` to rewrite the model field), and `pathRewrite`. Mirrored requests carry the `X-Bfe-Mirror: true` marker header by default. Mirror backend selection uses `bfe_balance.BalanceGslb.PickBackend()` — a side-effect-free selection entry point provided by bfe_balance (it neither reads nor modifies the request and has no session-affinity or retry side effects); `bfe_server` registers the balance table process-wide via `SetGlobalBalTable` at startup.
+
+Module conf keys include timeouts (`ConnectTimeoutMs` default 2000, `TTFBTimeoutMs` default 30000, `TotalTimeoutMs` default 600000), size limits (`MaxMirrorBodyBytes` default 2MB, `MaxResponseBodyBytes` default 16MB), concurrency and queueing (`MaxConcurrent` default 1024, `QueueCapacity` default 4096), and circuit breaking (`CircuitBreakerFailThreshold` default 50, `CircuitBreakerCooldownSec` default 30). Mirror results (usage/error/finish_reason parsing) are written only to the module's private Prometheus registry, not to the access log; the access log records only `mirror_hit` (842) and `mirror_cluster` (843) synchronously.
+
 ## Module Framework and Callback Mechanism (bfe_module)
 
 BFE's module framework is defined in the `bfe_module/` directory. Its core abstractions are the `BfeModule` interface and the `BfeCallbacks` callback manager. Each module registers its own handler functions to specified callback points through the `Init()` method, and BFE invokes these callbacks in order during request processing.
@@ -311,11 +405,14 @@ Commonly used callback points include:
 | Callback Point | Trigger Timing | AI-Related Modules |
 |----------------|----------------|--------------------|
 | `HandleBeforeLocation` | Before tenant identification | mod_trust_clientip, mod_logid, etc. |
-| `HandleFoundProduct` | After tenant identification | mod_ai_token_auth, mod_ai_route |
+| `HandleFoundProduct` | After tenant identification | mod_ai_token_auth, mod_ai_cache (cache lookup, short-circuit on hit), mod_ai_route |
 | `HandleAfterLocation` | After location/routing is determined | mod_body_process, etc. |
-| `HandleAfterAITargetModel` | After the target model is resolved and before forwarding, fired per cluster attempt | mod_ai_token_auth (target model check), mod_ai_rate_limit |
-| `HandleReadResponse` | When reading the backend response | mod_body_process |
-| `HandleRequestFinish` | When request processing completes | mod_ai_token_auth (quota deduction) |
+| `HandleAfterAITargetModel` | After the target model is resolved and before forwarding, fired per cluster attempt | mod_ai_token_auth (target model check), mod_ai_rate_limit, mod_ai_context (context compression) |
+| `HandleForward` | Before forwarding, fired per cluster attempt | mod_traffic_mirror (traffic mirroring) |
+| `HandleReadResponse` | When reading the backend response | mod_ai_cache (write-back on miss), mod_ai_token_auth (usage parsing), mod_ai_context (compression annotation), mod_body_process |
+| `HandleRequestFinish` | When request processing completes | mod_ai_token_auth (quota deduction, skipped on cache hit) |
+
+The AI gateway access log (`mod_access_pb3`) synchronously records fields in the pipeline above — cache hit status (`ai_cache_status`, `ai_cache_key`), semantic cache (`ai_cache_semantic`, `ai_cache_similarity`), context compression (`ai_context_compress_status`, `ai_context_tokens_before/after`, `ai_context_compress_mode`), intent classification (seven `ai_intent_*` fields), and traffic mirroring (`mirror_hit`, `mirror_cluster`) — for report and troubleshooting consumption; field numbers and the complete field table are in [Chapter 15: Observability Design](./chapter15-observability.md).
 
 ### Callback Return Values
 
@@ -327,7 +424,7 @@ Module callback functions return an `int` status and an optional `*bfe_http.Resp
 - `BfeHandlerClose`: close the connection directly;
 - `BfeHandlerRedirect`: return a redirect response.
 
-AI-related modules usually return `BfeHandlerGoOn` at the `HandleFoundProduct` stage, writing state into the context; if authentication fails or rate limiting is triggered, they return `BfeHandlerFinish` or `BfeHandlerResponse`. Consumers at the `HandleAfterAITargetModel` stage follow the same convention: a target model check failure returns 400, and a rate limit hit returns 429.
+AI-related modules usually return `BfeHandlerGoOn` at the `HandleFoundProduct` stage, writing state into the context; if authentication fails or rate limiting is triggered, they return `BfeHandlerFinish` or `BfeHandlerResponse`; `mod_ai_cache` likewise ends the request with `BfeHandlerFinish` and returns the cached response on a cache hit. Consumers at the `HandleAfterAITargetModel` stage follow the same convention: a target model check failure returns 400, and a rate limit hit returns 429.
 
 ### Module Registration
 
@@ -587,8 +684,9 @@ This chapter introduced the design of BFE, the Data Plane component of the Rainw
 
 - BFE is responsible for actually forwarding AI requests and works with the Control Plane AI Gateway API through configuration distribution.
 - In AI Gateway mode, requests enter the independent `ServeHTTPForAI()` path, reusing the original callback and forwarding infrastructure.
-- `mod_ai_token_auth` and `mod_ai_route` execute in a fixed order at the `HandleFoundProduct` stage; the target model whitelist check and `mod_ai_rate_limit` are registered at the `HandleAfterAITargetModel` callback point (fired per cluster attempt), sharing state through `AiBasicInfo` and `Request.Context`.
-- `mod_body_process` parses token usage from SSE responses at the `HandleReadResponse` stage, for `mod_ai_token_auth` to perform the final quota deduction.
+- `mod_ai_token_auth`, `mod_ai_cache`, and `mod_ai_route` execute in a fixed order at the `HandleFoundProduct` stage — a cache hit short-circuits immediately (routing and intent lazy resolution are skipped, and quota settlement is skipped); the target model whitelist check, `mod_ai_rate_limit`, and `mod_ai_context` are registered at the `HandleAfterAITargetModel` callback point (fired per cluster attempt), sharing state through `AiBasicInfo` and `Request.Context`.
+- `mod_ai_intent` provides intent classification through lazy resolution and registers no request callbacks; `mod_traffic_mirror` registers only `HandleForward`, and asynchronous mirroring does not block the main path.
+- `mod_body_process` parses token usage from SSE responses at the `HandleReadResponse` stage for `mod_ai_token_auth` to perform the final quota deduction; `mod_ai_cache` write-back and `mod_ai_context` compression annotation at the same stage only affect the response side.
 - The `bfe_model_protocol` protocol adapter layer converges protocol knowledge scattered across `bfe_basic`, `mod_ai_token_auth`, `mod_body_process`, and `bfe_server` into per-protocol adapters; `AIConf.ModelProtocols` is validated against the registry at startup and hot reload, and unknown protocol names fail the load.
 - BFE's `bfe_module` framework organizes modules through callback points and return values; the registration order in `bfe_modules/bfe_modules.go` directly affects behavioral correctness.
 - Configuration loading adopts a two-layer INI + JSON structure, supports hot reload through the web interface, and new configurations atomically replace the old ones after validation completes.
@@ -601,7 +699,11 @@ This chapter introduced the design of BFE, the Data Plane component of the Rainw
 - `bfe/docs/zh_cn/modules/mod_ai_route/mod_ai_route.md`
 - `bfe/docs/zh_cn/modules/mod_ai_token_auth/mod_ai_token_auth.md`
 - `bfe/docs/zh_cn/modules/mod_ai_rate_limit/mod_ai_rate_limit.md`
+- `bfe/docs/zh_cn/modules/mod_ai_cache/mod_ai_cache.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route_bfe_changes.md`
 - `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
 - `bfe/docs/zh_cn/sys_design/ai_protocol_paths.md`
+- `bfe/docs/zh_cn/sys_design/ai_cache.md`
+- `bfe/docs/zh_cn/sys_design/mod_ai_intent.md`
+- `bfe/docs/zh_cn/sys_design/traffic_mirror.md`

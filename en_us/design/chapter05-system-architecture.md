@@ -85,6 +85,7 @@ Before using the Rainway AI Gateway, you need to understand the following key co
 |---|---|---|
 | BFE cluster | BFECluster | Registers Data Plane BFE engine addresses; the Control Plane uses it to know who to deliver configurations to (Server Data, maintained by deployment seed data, no OpenAPI management endpoint) |
 | Model provider | Provider | Describes a model service provider, including protocol type, backend instance pool, model list, and authentication keys |
+| K8s Pool | K8s Pool | A backend instance pool synced to the Control Plane by the K8s discovery component; a Provider can reference a pool by name instead of maintaining the instance list manually |
 | AI business cluster | Cluster | The backend cluster to which traffic is actually forwarded; declares its upstream capability by referencing a Provider |
 | Organization | Entity | Represents organizational structures such as departments, teams, or projects; the mount point for quota, rate limit, model access control, and routing rules |
 | API credential | API-Key | The credential used by business systems when calling the Data Plane forwarding entry; can be attached to an Entity to inherit policies |
@@ -106,6 +107,10 @@ The "model provider" corresponds to the `/providers` resource of the OpenAPI, an
 - Plaintext service authentication keys (`keys`).
 
 Multiple Clusters can reference the same Provider, enabling reuse of instance pools and keys.
+
+### K8s Pool
+
+The "K8s Pool" corresponds to the pool data maintained by the InnerAPI `/inner-api/v1/k8s_pools`. A discovery component deployed in a Kubernetes environment (Service Controller) discovers service instances and syncs them to the Control Plane. A Provider references a K8s Pool by `instance_source=k8s_pool` and the pool name; the instance list is automatically synced and refreshed by the Control Plane, so backend addresses require no manual maintenance. For the detailed design, see [Chapter 10: Provider and Cluster Design](./chapter10-provider-and-cluster.md).
 
 ### AI Business Cluster (Cluster)
 
@@ -197,7 +202,7 @@ Service Controller is used to discover backend services in Kubernetes environmen
 
 ### Log Reader (Data Plane Log Collection)
 
-Log Reader is the Data Plane log collection component (repository `rainway-ai-gateway/log-reader`). Deployed alongside BFE, it reads the access logs produced by BFE, parses them into structured records of token usage, latency, status codes, and more, and writes them to Kafka or MySQL for report aggregation and observability analysis. See [Chapter 15 Observability Design](./chapter15-observability.md) for details.
+Log Reader is the Data Plane log collection component (repository `rainway-ai-gateway/log-reader`). Deployed alongside BFE, it reads the access logs produced by BFE (the `bfe-access-pb` protocol), parses the registered fields into structured records of token usage, latency, status codes, and more, and writes them — according to the field registration results — to MySQL (the `mod_log_mysql` plugin, 99 columns) or Kafka (the `mod_kafka` plugin, JSON form) for report aggregation and observability analysis. See [Chapter 15 Observability Design](./chapter15-observability.md) for details.
 
 ---
 

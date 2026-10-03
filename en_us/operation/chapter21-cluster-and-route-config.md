@@ -381,16 +381,20 @@ Fields of `epp_config` (corresponding to the wizard's "Balance Mode Configuratio
 
 | Field | Meaning | Default |
 |------|------|--------|
-| `scheduling_profile` | Scheduling profile: `latency-first` / `balanced` / `throughput-first` | `balanced` |
-| `cache_affinity` | Cache affinity: `low` / `medium` / `high`; explicitly sets the KV cache affinity strength, overriding the default weight of the scheduling profile | Unset (follows the scheduling profile) |
+| `load_profile` | Load profile: `queue-first` (queue first) / `balanced` / `kv-first` (KV cache first) | `balanced` |
+| `affinity` | Affinity strength: `off` / `low` / `medium` / `high`, mapped to prefix/session affinity scorer weights 0 / 0.3 / 0.6 / 1.0; when `off`, affinity scorers are not injected | `medium` |
 | `prefix_cache_affinity` | Prefix cache affinity: requests with the same prompt prefix are best-effort converged onto the same backend (soft affinity; a hit is not guaranteed) | `true` |
 | `session_affinity_enabled` | Session affinity: requests of the same session are best-effort routed to the same backend; when the bound endpoint is removed, they automatically migrate and re-attach | `false` |
 | `session_affinity_header` | Source header of the session id (e.g. `x-session-id`); required when session affinity is enabled | Empty |
 | `kv_cache_utilization_max` | KV cache utilization limit; endpoints whose utilization exceeds this value are filtered out; value in `(0,1]` | `0.9` |
+| `waiting_queue_max` | Waiting queue length admission threshold `≥0`; the corresponding filter condition is enabled when greater than 0 | `0` (disabled) |
+| `running_requests_max` | Running requests admission threshold `≥0`; the corresponding filter condition is enabled when greater than 0 | `0` (disabled) |
+| `fallback_on_empty` | Whether to fall back and admit when all endpoints are filtered | `false` |
+| `metrics_staleness_threshold_ms` | Bad-backend eviction threshold (milliseconds, `>0`): backends whose metric scraping fails consecutively and whose data is stale beyond this value are evicted | `200` |
 | `flow_control.max_requests` | Global concurrency limit; unset or `-1` means unlimited | Unlimited |
 | `flow_control.queue_ttl` | Queuing budget in seconds when the pool has endpoints; expired requests are rejected with a retryable backpressure error; `0` disables it | `60` |
 | `flow_control.no_endpoint_queue_ttl` | Queuing budget in seconds when the pool has no endpoints (cold-start scale-out) | Follows `queue_ttl` |
-| `flow_control.enable_eviction` | Demand-driven eviction: when high-priority requests are blocked by saturation, low-priority in-flight requests are terminated to reclaim capacity | `false` |
+| `flow_control.enable_eviction` | Demand-driven eviction: only `false` is accepted (writing `true` returns 422) | `false` |
 
 EPP cluster configuration example:
 
@@ -398,19 +402,25 @@ EPP cluster configuration example:
 {
     "name": "cluster-epp-gpu",
     "description": "EPP 调度集群示例",
+    "basic": {
+        "protocol": "http"
+    },
     "balance_mode": "EPP",
     "epp_config": {
-        "scheduling_profile": "balanced",
-        "cache_affinity": "medium",
+        "load_profile": "balanced",
+        "affinity": "medium",
         "prefix_cache_affinity": true,
         "session_affinity_enabled": true,
         "session_affinity_header": "x-session-id",
         "kv_cache_utilization_max": 0.9,
+        "waiting_queue_max": 32,
+        "running_requests_max": 256,
+        "fallback_on_empty": false,
+        "metrics_staleness_threshold_ms": 200,
         "flow_control": {
             "max_requests": -1,
             "queue_ttl": 60,
-            "no_endpoint_queue_ttl": 60,
-            "enable_eviction": false
+            "no_endpoint_queue_ttl": 60
         }
     },
     "llm_config": {

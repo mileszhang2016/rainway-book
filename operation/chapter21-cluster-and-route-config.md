@@ -381,16 +381,20 @@ AI 场景通常无需会话保持，保持默认关闭即可。
 
 | 字段 | 含义 | 默认值 |
 |------|------|--------|
-| `scheduling_profile` | 调度策略档位：`latency-first`（延迟优先）/ `balanced`（平衡）/ `throughput-first`（吞吐优先） | `balanced` |
-| `cache_affinity` | 缓存亲和性：`low` / `medium` / `high`，显式指定 KV cache 亲和强度，覆盖调度策略的默认权重 | 缺省（跟随调度策略） |
+| `load_profile` | 负载画像：`queue-first`（队列优先）/ `balanced`（均衡）/ `kv-first`（KV cache 优先） | `balanced` |
+| `affinity` | 亲和强度：`off` / `low` / `medium` / `high`，映射为前缀/会话亲和 scorer 权重 0 / 0.3 / 0.6 / 1.0；取 `off` 时不注入亲和 scorer | `medium` |
 | `prefix_cache_affinity` | 前缀缓存亲和：相同 prompt 前缀的请求尽力收敛到同一后端（软亲和，不保证命中） | `true` |
 | `session_affinity_enabled` | 会话亲和：同一会话的请求尽力路由到同一后端；绑定端点摘除后自动迁移重粘 | `false` |
 | `session_affinity_header` | session id 来源 Header（如 `x-session-id`），启用会话亲和时必填 | 空 |
 | `kv_cache_utilization_max` | KV 缓存利用率上限，利用率超过该值的端点被过滤，取值 `(0,1]` | `0.9` |
+| `waiting_queue_max` | 等待队列长度准入阈值 `≥0`，大于 0 时启用对应过滤条件 | `0`（不启用） |
+| `running_requests_max` | 在跑请求数准入阈值 `≥0`，大于 0 时启用对应过滤条件 | `0`（不启用） |
+| `fallback_on_empty` | 全部端点被过滤时是否回退放行 | `false` |
+| `metrics_staleness_threshold_ms` | 坏后端剔除阈值（毫秒 `>0`）：指标抓取连续失败、数据过期超过该值的后端被剔除 | `200` |
 | `flow_control.max_requests` | 全局并发上限；缺省或 `-1` 表示不限 | 不限 |
 | `flow_control.queue_ttl` | 池有端点时的排队预算（秒），超期以可重试背压错误拒绝；`0` 为禁用 | `60` |
 | `flow_control.no_endpoint_queue_ttl` | 池无端点（冷启动扩容）时的排队预算（秒） | 跟随 `queue_ttl` |
-| `flow_control.enable_eviction` | 需求驱动驱逐：高优先级请求被饱和阻塞时终止低优先级在飞请求，回收容量 | `false` |
+| `flow_control.enable_eviction` | 需求驱动驱逐：仅接受 `false`（写入 `true` 返回 422） | `false` |
 
 EPP 集群配置示例：
 
@@ -398,19 +402,25 @@ EPP 集群配置示例：
 {
     "name": "cluster-epp-gpu",
     "description": "EPP 调度集群示例",
+    "basic": {
+        "protocol": "http"
+    },
     "balance_mode": "EPP",
     "epp_config": {
-        "scheduling_profile": "balanced",
-        "cache_affinity": "medium",
+        "load_profile": "balanced",
+        "affinity": "medium",
         "prefix_cache_affinity": true,
         "session_affinity_enabled": true,
         "session_affinity_header": "x-session-id",
         "kv_cache_utilization_max": 0.9,
+        "waiting_queue_max": 32,
+        "running_requests_max": 256,
+        "fallback_on_empty": false,
+        "metrics_staleness_threshold_ms": 200,
         "flow_control": {
             "max_requests": -1,
             "queue_ttl": 60,
-            "no_endpoint_queue_ttl": 60,
-            "enable_eviction": false
+            "no_endpoint_queue_ttl": 60
         }
     },
     "llm_config": {

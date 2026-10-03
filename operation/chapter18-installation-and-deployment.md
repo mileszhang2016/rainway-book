@@ -23,7 +23,7 @@
 - **Service Controller**：Kubernetes 服务发现组件，可选部署。
 - **Log Reader**：访问日志采集组件，随 BFE 部署在数据面，将 BFE 访问日志输出到 Kafka 或 MySQL，供报表与可观测链路消费。对应仓库为 `rainway-ai-gateway/log-reader`。
 
-此外，报表标准形态（Doris + Grafana）依赖一组可选的外部组件：Kafka 承接 log-reader 输出的日志消息，Doris 存储明细与聚合数据，Grafana 展示监控大盘。这组可观测组件不属于 AI 网关本体，其存储层与展示层的一键部署脚本由 `rainway-ai-gateway/ai-gateway-observability` 仓库提供，部署步骤见下文「报表标准形态部署（Doris + Grafana）」。
+此外，报表标准形态（Doris / ClickHouse / StarRocks 三选一，展示层可叠加 Grafana）依赖一组可选的外部组件：Kafka 承接 log-reader 输出的日志消息，数仓存储明细与聚合数据，Grafana 展示监控大盘（可选）。这组可观测组件不属于 AI 网关本体，其存储层与展示层的一键部署脚本由 `rainway-ai-gateway/ai-gateway-observability` 仓库提供，部署步骤见下文「报表标准形态部署」。
 
 ```mermaid
 flowchart LR
@@ -210,7 +210,7 @@ SQLite 适用于功能验证与开发调试，不建议用于生产高并发场�
 
 ## 报表轻量形态部署（可选）
 
-若需要在控制台查看用量报表而不引入 Kafka/Doris/Grafana，可启用报表轻量形态：访问日志由 log-reader `mod_log_mysql` 插件直写 MySQL，AI Gateway API 提供 `/report/*` 查询与内置聚合 JOB，控制台直接展示。标准形态（Doris + Grafana）无需本步骤，其部署方式见下文「报表标准形态部署（Doris + Grafana）」，完成后仅需在 `[Report]` 中配置 `Backend = "doris"`。
+若需要在控制台查看用量报表而不引入 Kafka 与数仓组件，可启用报表轻量形态：访问日志由 log-reader `mod_log_mysql` 插件直写 MySQL，AI Gateway API 提供 `/report/*` 查询与内置聚合 JOB，控制台直接展示。标准形态（Doris / ClickHouse / StarRocks，展示层可叠加 Grafana）无需本步骤，其部署方式见下文「报表标准形态部署」，完成后仅需在 `[Report]` 中配置对应的 `Backend`。
 
 部署遵循 schema-first 顺序：
 
@@ -235,7 +235,7 @@ SQLite 适用于功能验证与开发调试，不建议用于生产高并发场�
    Passwd = "******"
 
    [Report]
-   Backend = "mysql"        # mysql | doris；缺省则报表模块不装配，/report/* 返回 404
+   Backend = "mysql"        # mysql | doris | clickhouse | starrocks；缺省则报表模块不装配，/report/* 返回 404
    Datasource = "report_db"
    EnableAggregateJob = true
    AggregateIntervalSec = 60
@@ -249,7 +249,7 @@ SQLite 适用于功能验证与开发调试，不建议用于生产高并发场�
 
 - **单集群单形态**：同一集群不要同时启用 `mod_kafka`（→ Doris）与 `mod_log_mysql`（→ MySQL），两条链路各自的数据缺口窗口会导致两套报表口径不一致。
 - **分区先于数据**：MySQL 无动态分区，分区管理 JOB 先于数据到达建好分区（缺分区写入直接报错）；JOB 每 6h 巡检并在启动时立即补建一次。
-- **容量建议**：MySQL 形态面向日均百万级以下日志量，超量请使用 Doris 标准形态。
+- **容量建议**：MySQL 形态面向日均百万级以下日志量，超量请使用标准形态（Doris / ClickHouse / StarRocks）。
 - MySQL 后端不提供 P50/P90/P99 分位数延迟，控制台对应卡片自动降级隐藏。
 
 ## 报表标准形态部署（Doris + Grafana）
@@ -271,11 +271,11 @@ BFE（数据面）──访问日志──▶ log-reader (mod_kafka) ──JSON�
 
 | 组件 | 版本 | 说明 |
 |---|---|---|
-| Doris | 4.0+ | FE 已启动且 query_port（默认 9030）可访问 |
+| Doris | 3.0+ | FE 已启动且 query_port（默认 9030）可访问（ai-gateway-observability 实测基线 3.0.8，原子换名等语法以该版本为准） |
 | Kafka | 2.8+ | Broker 可访问，`bfe_ai_log` Topic 已创建（按实际规模调整分区数与保留策略） |
 | Grafana | — | 已安装，且已知其安装根目录（含 `bin/` 与 `conf/provisioning/`） |
 | mysql 客户端 | 任意 | 用于连接 Doris FE 执行部署 SQL |
-| log-reader | v1.4.0 | 随 BFE 部署，启用 `mod_kafka` 插件 |
+| log-reader | v1.5.0 | 随 BFE 部署，启用 `mod_kafka` 插件 |
 
 ### 步骤 1：部署 Doris 侧对象
 
@@ -322,20 +322,23 @@ bash setup.sh ./setup_test.conf
 2. **配置 AI Gateway API**：在 `ai_gateway_api.toml` 中新增指向 Doris FE 的报表数据源与 `[Report]` 段：
 
    ```toml
-   [Databases.report_db]
-   Driver = "mysql"         # 经 MySQL 协议连接 Doris FE
+   [Databases.doris_db]
+   Driver = "mysql"              # 经 MySQL 协议连接 Doris FE
    DBName = "bfe_observability"
    Addr = "127.0.0.1:9030"
+   Net = "tcp"                   # 必须显式设置：Net 为空时 FormatDSN 丢弃地址段，回退 127.0.0.1:3306
    User = "report_read"
    Passwd = "******"
+   AllowNativePasswords = true   # 必须显式开启：Doris FE 为 mysql_native_password 认证
+   InterpolateParams = true      # 建议显式开启，走文本协议
 
    [Report]
-   Backend = "doris"        # 缺省则报表模块不装配，/report/* 返回 404
-   Datasource = "report_db"
-   Database = ""            # 表名所属 schema 覆盖（可选）
+   Backend = "doris"             # 缺省则报表模块不装配，/report/* 返回 404
+   Datasource = "doris_db"
+   Database = ""                 # 表名所属 schema 覆盖（可选）
    ```
 
-   Doris 形态的分钟聚合由 Doris INSERT JOB `bfe_ai_metrics_1m_job` 完成，`EnableAggregateJob` / `EnablePartitionMgmt` 等 MySQL 形态专用的聚合与分区管理项仅对 `Backend = "mysql"` 生效。
+   Doris 形态的分钟聚合由 Doris INSERT JOB `bfe_ai_metrics_1m_job` 完成，`EnableAggregateJob` / `EnablePartitionMgmt` 等 MySQL 形态专用的聚合与分区管理项仅对 `Backend = "mysql"` 生效。ClickHouse、StarRocks 形态的连接配置见下文对应部署小节的步骤 3，四形态注释样例亦可直接参考 `ai-gateway-api/conf/ai_gateway_api.toml` 的报表配置块。
 
 ### 步骤 4：验证
 
@@ -354,6 +357,173 @@ mysql -h127.0.0.1 -P9030 -uroot -e "USE bfe_observability; SHOW TABLES;"
 
 - **单集群单形态**：同一集群不要同时启用 `mod_kafka`（→ Doris）与 `mod_log_mysql`（→ MySQL），两条链路各自的数据缺口窗口会导致两套报表口径不一致。
 - **聚合表设计参考**：仓库示例中的聚合表 `bfe_ai_metrics_1m` 仅用于演示链路打通；生产环境可按查询场景拆分多张聚合表、调整为 5/15 分钟粒度，详见 `doris/docs/user/HOWTO.md` 的提示。
+
+## 报表标准形态部署（ClickHouse）
+
+ClickHouse 落库形态：BFE 访问日志经 log-reader `mod_kafka` 插件写入 Kafka，ClickHouse 侧由 Kafka 引擎表订阅 Topic、消费物化视图把 JSON 消息打平写入明细表，再由聚合物化视图按分钟桶聚合到聚合表；控制台报表页经 `[Report].Backend = "clickhouse"` 查询同一份数据。存储层一键部署脚本由 `rainway-ai-gateway/ai-gateway-observability` 仓库提供，数据链路如下：
+
+```text
+BFE（数据面）──访问日志──▶ log-reader (mod_kafka) ──JSON──▶ Kafka
+                                                                │
+                                                                ▼
+                              Kafka 引擎表 bfe_ai_log_kafka ──消费 MV──▶ bfe_ai_request_log（明细表，MergeTree，TTL 7 天）
+                                                                                            │
+                                                                                            ▼
+                                              聚合 MV（toStartOfMinute 分钟桶，秒级延迟）──▶ bfe_ai_metrics_1m（聚合表，SummingMergeTree）
+```
+
+### 前提条件
+
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| ClickHouse | 26.10+ | 集群已启动，支持 JSON 类型（开发基线 26.10）；native TCP 端口可访问（默认 9000） |
+| Kafka | 2.8+ | Broker 可访问，`bfe_ai_log` Topic 已创建（按实际规模调整分区数与保留策略） |
+| clickhouse-client | 与集群版本匹配 | 本机执行部署 SQL |
+| log-reader | v1.5.0 | 随 BFE 部署，启用 `mod_kafka` 插件 |
+
+### 步骤 1：部署 ClickHouse 侧对象
+
+```bash
+cd ai-gateway-observability/clickhouse
+
+# 生产环境（数据库 bfe_observability）：先编辑 setup.conf 填入 ClickHouse 与 Kafka 连接信息
+vim setup.conf
+bash setup.sh
+
+# 测试环境（数据库 bfe_observability_test，Topic 使用 bfe_ai_log_test）
+bash setup.sh ./setup_test.conf
+```
+
+`clickhouse/setup.sh` 分六步创建数据库与五类对象：数据库（默认 `bfe_observability`）、明细表 `bfe_ai_request_log`（MergeTree，`ORDER BY (hostid, log_time, ai_apikey_id, ai_requested_model)`、`PARTITION BY toDate(log_time)`、`TTL 7 天`；`logid` 为 UInt64，BFE 请求唯一标识超出 Int64 上限）、Kafka 引擎暂存表 `bfe_ai_log_kafka`（`JSONEachRow` 格式，独立消费组 `clickhouse_bfe_ai_log`）、消费 MV `bfe_ai_log_load_mv`（JSON 打平 + UTC 墙钟换算）、聚合表 `bfe_ai_metrics_1m`（SummingMergeTree，40 维 + 24 指标，`ORDER BY` 为全部维度列，`TTL 7 天`）、聚合 MV `bfe_ai_metrics_1m_mv`（`toStartOfMinute` 分钟桶，秒级延迟）。数据库名、Kafka 地址、Topic、消费组等均在 `setup.conf` / `setup_test.conf` 中参数化。部署失败需要清空重试时使用 `clickhouse/cleanup.sh`。
+
+### 步骤 2：配置 AI Gateway API
+
+```toml
+[Databases.clickhouse_db]
+Driver = "clickhouse"        # clickhouse-go/v2 stdlib 驱动，native TCP 协议
+DBName = "bfe_observability"
+Addr = "127.0.0.1:9000"      # ClickHouse native TCP 端口 9000，非 HTTP 端口 8123
+User = "report_read"
+Passwd = "******"
+
+[Report]
+Backend = "clickhouse"
+Datasource = "clickhouse_db"
+Database = ""                # 表名所属 schema 覆盖（可选）
+```
+
+分钟聚合由 ClickHouse 聚合物化视图维护，`EnableAggregateJob` / `EnablePartitionMgmt` 等 MySQL 形态专用项不生效。
+
+### 步骤 3：验证
+
+```bash
+# 表与 MV 齐全（库下应含明细表、Kafka 引擎表、两张 MV 与聚合表）
+clickhouse-client -q "SHOW TABLES FROM bfe_observability"
+
+# Kafka 消费进度（num_commits / num_messages_read 持续增长，lag 趋稳）
+clickhouse-client -q "SELECT database, table, consumer_id, num_commits, num_messages_read FROM system.kafka_consumers WHERE database = 'bfe_observability'"
+
+# 明细/聚合行数
+clickhouse-client -q "SELECT count() FROM bfe_observability.bfe_ai_request_log"
+clickhouse-client -q "SELECT count() FROM bfe_observability.bfe_ai_metrics_1m"
+```
+
+随后登录控制台打开数据报表页确认总览指标有数据。
+
+注意事项：
+
+- **聚合表查询纪律**：`bfe_ai_metrics_1m` 为 SummingMergeTree，查询必须 `GROUP BY <维度>` + `sum(<指标>)` 兜底，禁止 `SELECT *` 直读；查询模板见 `clickhouse/docs/design/TABLE_DESIGN.md`。
+- **消费语义**：Kafka 引擎表 + 消费 MV 链路为 at-least-once，重投消息由聚合侧 `sum` 兜底、明细侧按唯一键判重。
+- **本期无 ClickHouse 版 Grafana dashboard**：可视化走控制台报表页。
+
+## 报表标准形态部署（StarRocks）
+
+StarRocks 落库形态：数据链路与 Doris 形态同构（log-reader `mod_kafka` → Kafka → Routine Load → 明细表），分钟聚合由异步物化视图维护；控制台报表页经 `[Report].Backend = "starrocks"` 查询。存储层一键部署脚本由 `rainway-ai-gateway/ai-gateway-observability` 仓库提供：
+
+```text
+BFE（数据面）──访问日志──▶ log-reader (mod_kafka) ──JSON──▶ Kafka ──Routine Load──▶ StarRocks
+                                                                                  ├─ bfe_ai_request_log  （明细表，DUPLICATE KEY，动态分区保留 7 天）
+                                                                                  └─ bfe_ai_metrics_1m   （异步物化视图，每分钟刷新）
+```
+
+### 前提条件
+
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| StarRocks | 3.5+ | FE 已启动且 MySQL 协议端口（默认 9030）可访问 |
+| Kafka | 2.8+ | Broker 可访问，`bfe_ai_log` Topic 已创建（按实际规模调整分区数与保留策略） |
+| mysql 客户端 | 任意 | 用于连接 SR FE 执行部署 SQL，**必须带 `--skip-comments`**（SR FE 解析器拒绝"仅含注释"的语句，mysql 客户端默认把注释行作为独立语句发送会报 1064 语法错误） |
+| log-reader | v1.5.0 | 随 BFE 部署，启用 `mod_kafka` 插件 |
+
+### 步骤 1：部署 StarRocks 侧对象
+
+```bash
+cd ai-gateway-observability/starrocks
+
+# 生产环境（数据库 bfe_observability）：先编辑 setup.conf 填入 SR FE 与 Kafka 连接信息
+vim setup.conf
+bash setup.sh
+
+# 测试环境（数据库 bfe_observability_test，Topic 使用 bfe_ai_log_test）
+bash setup.sh ./setup_test.conf
+```
+
+`starrocks/setup.sh` 分四步创建：数据库（默认 `bfe_observability`）、明细表 `bfe_ai_request_log`（DUPLICATE KEY，102 列；5 个嵌套列 `req_headers` / `res_headers` / `ai_route_rule_hits` / `ai_cluster_key_names` / `ai_rate_limit_hits` 以 VARCHAR 承载 JSON 文本——SR 3.5 的 Routine Load 不支持嵌套结构导入，仅用于明细展示；动态分区 `start=-7` / `end=3`；`DISTRIBUTED BY HASH(ai_apikey_id) BUCKETS 32`；`logid` 为 BIGINT，超界取值会被拒绝写入）、物化视图 `bfe_ai_metrics_1m`（`REFRESH ASYNC EVERY (INTERVAL 1 MINUTE)`，显式首列 `ts_day` 作分区列并设 `partition_ttl=7 DAY`；MV 名即报表查询契约名，查询无感）、Routine Load `bfe_ai_log_load`（消费组 `starrocks_bfe_ai_log`，`kafka_default_offsets=OFFSET_BEGINNING`，`max_error_number=1000`）。部署失败需要清空重试时使用 `starrocks/cleanup.sh`。
+
+### 步骤 2：配置 AI Gateway API
+
+```toml
+[Databases.starrocks_db]
+Driver = "mysql"              # 经 MySQL 协议连接 SR FE
+DBName = "bfe_observability"
+Addr = "127.0.0.1:9030"       # SR FE query_port
+Net = "tcp"                   # 必须显式设置：Net 为空时 FormatDSN 丢弃地址段，回退 127.0.0.1:3306
+User = "report_read"
+Passwd = "******"
+AllowNativePasswords = true   # 必须显式开启：SR FE 为 mysql_native_password 认证
+InterpolateParams = true      # 必须显式开启：规避 SR FE COM_STMT 二进制行包缺陷（JSON 列与 NULL 列相邻时编码畸形），走文本协议
+
+[Report]
+Backend = "starrocks"
+Datasource = "starrocks_db"
+Database = ""                 # 表名所属 schema 覆盖（可选）
+```
+
+分钟聚合由异步物化视图维护，`EnableAggregateJob` / `EnablePartitionMgmt` 等 MySQL 形态专用项不生效。
+
+### 步骤 3：验证
+
+```bash
+# Routine Load 状态应为 RUNNING
+mysql --skip-comments -h127.0.0.1 -P9030 -uroot -Dbfe_observability -e "SHOW ROUTINE LOAD FOR bfe_ai_log_load\G"
+
+# 物化视图刷新状态（含刷新进度与错误）
+mysql --skip-comments -h127.0.0.1 -P9030 -uroot -Dbfe_observability -e "SHOW MATERIALIZED VIEWS\G"
+
+# 表清单
+mysql --skip-comments -h127.0.0.1 -P9030 -uroot -e "USE bfe_observability; SHOW TABLES"
+```
+
+随后登录控制台打开数据报表页确认总览指标有数据。
+
+注意事项：
+
+- **与 Doris 端口互斥**：StarRocks 与 Doris 的 FE 端口体系重叠（query_port 均默认 9030），二者不可同机部署，跨形态灰度比对需分配独立主机。
+- **基表加列需重建 MV**：SR 侧明细表加列后物化视图不会自动携带新列，需 DROP 后重建（重建自动全量回填）。
+- **本期无 StarRocks 版 Grafana dashboard**：可视化走控制台报表页。
+
+## 消费组隔离与多形态并行
+
+Doris、StarRocks、ClickHouse 三套链路的 Kafka 消费组分别为 `doris_bfe_ai_log` / `starrocks_bfe_ai_log` / `clickhouse_bfe_ai_log`，**必须各异**：同名消费组会互相覆盖位点，导致丢数据。同一 Kafka topic 可并行部署多套存储（例如 Doris + ClickHouse）做灰度比对，但生产环境仍按"单集群单落库形态"部署，同一集群不要同时启用多种落库链路。
+
+## 存量 Doris 部署升级（缓存/镜像/意图报表字段）
+
+适用：已按既有版本部署 Doris 标准形态、需要支持缓存/镜像/意图报表字段的存量环境；全新部署无需本步骤（`setup.sh` 使用的 SQL 已含新列）。详细步骤见 `ai-gateway-observability/doris/docs/user/HOWTO.md` 第 11 节，升级 SQL 位于 `doris/sqls/upgrade/`：
+
+1. **明细表在线 ALTER +13 列**：10 列缓存/镜像/意图字段 + `rate_limit_policy_id` / `rate_limit_type` / `rate_limit_rule_name` 3 列限流打平标量列，在线执行不阻塞读写；每个环境执行一次即可（Doris 3.0 不支持 `ADD COLUMN IF NOT EXISTS`，重复执行报 `Duplicate column` 属预期）。
+2. **Routine Load 停止并同名重建**：Routine Load 不支持在线修改 `COLUMNS`，需 `STOP ROUTINE LOAD FOR bfe_ai_log_load` 后按新映射同名重建；同名任务的消费进度保留、从上次提交位点续传，`kafka_default_offsets=OFFSET_BEGINNING` 保证任务创建前的消息不丢。
+3. **聚合表整表重建**：`bfe_ai_metrics_1m` 为 AGGREGATE KEY 模型，加维度只能整表重建——删除旧 INSERT JOB → 按新 schema（40 维 + 24 指标）建 `bfe_ai_metrics_1m_v2` → `ALTER TABLE bfe_ai_metrics_1m REPLACE WITH TABLE bfe_ai_metrics_1m_v2 PROPERTIES('swap'='true')` 原子换名（版本不支持时降级为 `RENAME` 两步换名）→ 用新版 SQL 重建 INSERT JOB → 验证五类报表查询正常后删除旧表。低峰窗口执行，先在测试环境演练。
+4. **`log_time` 时区口径**：Routine Load 改为按会话时区偏移动态扣除写 UTC 墙钟（`DATE_SUB(FROM_UNIXTIME(timestamp), INTERVAL TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) SECOND)`），INSERT JOB 分钟窗口同步改用 `UTC_TIMESTAMP()`；既有历史数据按非 UTC 口径写入、存在 +8h 偏移，需重新灌数或接受偏差。
 
 ## 配置文件说明与最小可运行配置
 
@@ -855,7 +1025,7 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 - 可通过 `make docker` 构建容器镜像，并采用 Kubernetes Deployment、Service 与 DaemonSet 进行集群化部署。
 - 多组件启动顺序为：数据库初始化 → AI Gateway API → BFE → Conf Agent，确保数据面能够及时获得控制面下发的最新配置。
 - BFE 镜像内置 tzdata；使用自定义镜像时需自行保证容器内时区数据完整。
-- 报表有两种部署形态：轻量形态由 log-reader `mod_log_mysql` 插件直写 MySQL；标准形态（Doris + Grafana）由 ai-gateway-observability 仓库的脚本一键部署 Doris 存储层与 Grafana 展示层，控制台经 `[Report].Backend = "doris"` 查询同一份数据。
+- 报表有轻量（log-reader `mod_log_mysql` 直写 MySQL，进程内聚合）与标准两种形态；标准形态在 Doris、ClickHouse、StarRocks 三种数仓中三选一（Doris 可叠加 Grafana Dashboard），由 ai-gateway-observability 仓库的脚本一键部署存储层，控制台经 `[Report].Backend` 查询同一份数据；存量 Doris 部署按 HOWTO 第 11 节在线升级缓存/镜像/意图字段。
 - 常见部署问题主要集中于数据库连接、静态资源挂载、Conf Agent 通信、TLS 配置关联检查、端口冲突与 Redis 连接失败。
 - 上线前应完成生产部署检查清单，重点检查密码安全、权限配置和回滚方案。
 
@@ -869,8 +1039,13 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 - `ai-gateway-api/Makefile`：构建、打包、Docker 镜像构建与推送目标。
 - `conf-agent/AGENTS.md`：Conf Agent 架构、构建方式与本地启动命令。
 - `conf-agent/docs/zh_cn/config/config.md`：Conf Agent 配置文件详细说明。
-- `ai-gateway-observability/README.md`：可观测性（Doris + Grafana）仓库概览与数据链路。
-- `ai-gateway-observability/doris/docs/user/HOWTO.md`：Doris 建库/建表/Routine Load/INSERT JOB 部署与验证步骤。
+- `ai-gateway-observability/README.md`：可观测性（Doris / ClickHouse / StarRocks 对接资产与 Grafana）仓库概览与数据链路。
+- `ai-gateway-observability/doris/docs/user/HOWTO.md`：Doris 建库/建表/Routine Load/INSERT JOB 部署与验证步骤（含第 11 节存量部署升级）。
+- `ai-gateway-observability/doris/docs/design/TABLE_DESIGN.md`：Doris 明细表与聚合表结构设计。
+- `ai-gateway-observability/clickhouse/docs/user/HOWTO.md`：ClickHouse 建库/明细表/Kafka 引擎表/消费 MV/聚合表/聚合 MV 部署与验证步骤。
+- `ai-gateway-observability/clickhouse/docs/design/TABLE_DESIGN.md`：ClickHouse 表结构设计与 SummingMergeTree 查询模板。
+- `ai-gateway-observability/starrocks/docs/user/HOWTO.md`：StarRocks 建库/明细表/异步物化视图/Routine Load 部署与验证步骤。
+- `ai-gateway-observability/starrocks/docs/design/TABLE_DESIGN.md`：StarRocks 表结构设计。
 - `ai-gateway-observability/grafana/docs/user/HOWTO.md`：Grafana 数据源与 Dashboard 一键配置步骤。
 - [BFE 安装部署官方文档](https://www.bfe-networks.net/en_us/installation/install/)：BFE 数据面独立部署指南。
 - [ai-gateway-demo 部署示例仓库](https://github.com/rainway-ai-gateway/ai-gateway-demo)：Kubernetes 与 Docker Compose 完整示例。

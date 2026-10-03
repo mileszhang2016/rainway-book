@@ -11,6 +11,7 @@ After reading this chapter, you will be able to:
 - Explain the applicable scenarios of the three pull modes: normal configuration tasks, multi-key JSON tasks, and extra-file tasks.
 - Master the implementation details of versioned directories, symlink switching, and old-version cleanup.
 - Identify the key paths and log messages involved in failure rollback.
+- Understand why a standard Reloader lets a new module be integrated through configuration alone, without any code changes.
 
 ## Conf Agent Directory Structure
 
@@ -29,7 +30,7 @@ The Conf Agent code lives under `conf-agent/` in the repository root. By functio
 | `xhttp/` | HTTP request decorators and error handling. |
 | `xlog/` | Structured log output. |
 
-A typical production configuration file can be found at `conf-agent/conf/conf-agent.toml`, which defines a `Reloader` for modules such as `server_data_conf`, `mod_ai_route`, and `mod_ai_token_auth`.
+A typical production configuration file can be found at `conf-agent/conf/conf-agent.toml`, which defines a `Reloader` for 11 modules such as `server_data_conf`, `cluster_conf`, and `tls_conf`, as well as `mod_ai_route`, `mod_ai_token_auth`, `mod_ai_rate_limit`, `mod_body_process`, `mod_ai_cache`, `mod_traffic_mirror`, `mod_ai_intent`, and `mod_ai_context`.
 
 ## Agent and Reloader Lifecycle
 
@@ -207,6 +208,31 @@ func calculateVersion(fileContent []byte) (string, error) {
 }
 ```
 
+### Standard Reloaders: The Four AI Data-Plane Modules
+
+The four Reloaders `mod_ai_cache`, `mod_traffic_mirror`, `mod_ai_intent`, and `mod_ai_context` in `conf-agent.toml` all take the standard `NormalFileTasks` form, completely consistent with the precedent of `mod_ai_route` — each Reloader contains a single normal file task plus the three fields `BFEReloadAPI`, `ReloadFile`, and `CopyFiles`:
+
+```toml
+# conf-agent/conf/conf-agent.toml
+[Reloaders.mod_ai_cache]
+BFEReloadAPI    = "/reload/mod_ai_cache"
+ReloadFile      = "ai_cache.data"
+CopyFiles       = ["ai_cache.data", "mod_ai_cache.conf"]
+[[Reloaders.mod_ai_cache.NormalFileTasks]]
+ConfAPI         = "/inner-api/v1/configs/ai-cache-rule"
+ConfFileName    = "ai_cache.data"
+```
+
+The correspondence between the other three Reloaders and the ConfAPI topic / BFE hot reload interface is as follows:
+
+| Reloader | Data File (`ReloadFile` / `CopyFiles`) | ConfAPI | BFE Hot Reload Interface |
+|----------|----------------------------------------|---------|--------------------------|
+| `mod_traffic_mirror` | `mirror_rule.data` | `/inner-api/v1/configs/traffic-mirror-rule` | `/reload/mod_traffic_mirror` |
+| `mod_ai_intent` | `intent_questions.data` | `/inner-api/v1/configs/mod-ai-intent` | `/reload/mod_ai_intent` |
+| `mod_ai_context` | `context_rule.data` | `/inner-api/v1/configs/ai-context-rule` | `/reload/mod_ai_context` |
+
+This example also illustrates the Reloader extension mechanism: `config.Init` parses each `[Reloaders.xxx]` section of the TOML into the `ConfigFile.Reloaders` map (`config/config_file.go`), where the section name becomes the Reloader name; `ConfDir` and `BFEReloadAPI` are derived by default from the section name (`BFEConfDir/xxx` and `/reload/xxx`) and take effect when left unset. The prober, file_store, and trigger operate only on the `ReloaderConfig` struct and have no awareness of the Reloader name. Therefore, integrating a new BFE module whose configuration shape is "one data file + one delivery API" only requires adding a `[Reloaders.xxx]` section in `conf-agent.toml`, with no Go code changes at all; only when the configuration shape exceeds a normal file task (such as TLS certificates, which require downloading extra files via JSON Path) does the prober's task type need to be extended.
+
 ### Multi-Key JSON Task: MultiKeyFileTask
 
 The multi-key JSON task (Multi-Key JSON File Task) is used in the "one API returns multiple sub-configurations" scenario, e.g. one `server_data_conf` endpoint returns `host_rule.data`, `route_rule.data`, and `cluster_conf.data` at the same time. The implementation is in `conf_reload/prober/task_multip_key.go`.
@@ -260,7 +286,7 @@ type FileStore struct {
 ```
 
 - `ConfDir`: the directory name BFE uses when reading configuration, e.g. `/home/work/bfe/conf/mod_ai_route`.
-- `CopyFiles`: files or directories that must be copied from the current `ConfDir` into each new version, used to retain static configuration that cannot be obtained via the API. For example, `mod_ai_route.conf` of `mod_ai_route` is usually written by hand by operators and is not delivered from the Control Plane, so it must be listed in `CopyFiles`.
+- `CopyFiles`: files or directories that must be copied from the current `ConfDir` into each new version, used to retain static configuration that cannot be obtained via the API. For example, module static files such as `mod_ai_route.conf` of `mod_ai_route` and `mod_ai_cache.conf` of `mod_ai_cache` are usually written by hand by operators and are not delivered from the Control Plane, so they must be listed in `CopyFiles`.
 - `VersionKeepCount`: the number of version directories to keep, at least 1. When set to 2, the disk typically holds both the current version and the previous one, facilitating emergency rollback.
 
 ### Writing to the Temporary Version Directory
@@ -418,7 +444,7 @@ func (trigger *Trigger) TriggerBFEReload(ctx context.Context, version string) er
 }
 ```
 
-Note the role of `ReloadFile`: some BFE modules (e.g. `mod_ai_route`) require `path` to point to a specific data file rather than a directory, so the configuration specifies the final file path via `ReloadFile = "ai_route.data"`.
+Note the role of `ReloadFile`: modules such as `mod_ai_route`, `mod_ai_cache`, `mod_traffic_mirror`, `mod_ai_intent`, and `mod_ai_context` require `path` to point to a specific data file rather than a directory, so the configuration specifies the final file path via `ReloadFile` (e.g. `ai_route.data`, `ai_cache.data`).
 
 ## Cleaning Up Old Versions and Failure Rollback
 
@@ -570,6 +596,7 @@ Conf Agent is the key component that enables the Rainway AI Gateway to "deliver 
 - **Configuration pulling**: normal tasks pull one-to-one; multi-key JSON tasks split multiple files out of one large JSON; extra-file tasks parse and download extra resources such as certificates via JSON Path.
 - **Versioned storage**: a `ConfDir_{version}` temporary directory is created each time and a `.conf-agent-version` marker is written; at switch time a symlink/junction atomically points to the new version.
 - **Hot-reload triggering**: `trigger` calls `/reload/{module}` on BFE's monitor port, passing the temporary-directory path in the URL.
+- **Standard Reloader extension**: the `[Reloaders.xxx]` section name drives the default derivation of `ConfDir` and `/reload/{name}`; prober, file_store, and trigger have zero awareness of the Reloader name; integrating a new BFE module whose configuration shape is "one data file + one delivery API" only requires adding a configuration section, with no Go code changes.
 - **Cleanup and rollback**: `VersionKeepCount` controls how many versions are kept; failures before the symlink switch do not affect the Data Plane, while a symlink-switch failure keeps BFE running the loaded version and records a log.
 - **Robustness and self-healing**: the `.conf-agent-version` marker is validated before switching the symlink, half-done directories are cleaned up on store failure, and unmarked empty directories are swept during cleanup; the reloader accumulates consecutive failures across the store and trigger stages, emits a summary ERROR `reload keeps failing` every 10 failures, and logs `reload recovered` upon recovery.
 

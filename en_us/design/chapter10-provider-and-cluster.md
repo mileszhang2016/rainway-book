@@ -9,6 +9,7 @@ In the Control Plane of Rainway AI Gateway, the model Provider and the forwardin
 - Understand how the Control Plane generates the `AIConf` required by the BFE Data Plane from Provider + Cluster.
 - Learn about key mechanisms such as model discovery, Key references and weights, Key Policy, and Key Affinity.
 - Understand the semantics, validation rules, and Data Plane execution of `protocol_paths` protocol path rewriting.
+- Understand the K8s pool provisioning mechanism and the Effective Instance Pool contract.
 - Write practical configurations that conform to the specification.
 
 ## Provider Design Goals and Data Model
@@ -19,7 +20,7 @@ A Provider answers the questions "who is the downstream, which models can be acc
 
 - **Identity and capability declaration**: A Provider holds metadata such as name, description, supported model list, model access protocols (`model_protocols`), and model discovery endpoint (`model_endpoint`).
 - **Authentication consolidation**: A Provider is the sole holder of API-Key plaintext; clusters reference it only by `name` and no longer expose key content.
-- **Backend instance consolidation**: A Provider maintains an `instance_pool`, allowing multiple clusters to reuse the same set of backend addresses.
+- **Backend instance consolidation**: A Provider maintains an `instance_pool` (or a pool supplied by the K8s discovery component), allowing multiple clusters to reuse the same set of backend addresses.
 - **Independent lifecycle**: A Provider can be created, updated, and deleted independently; before deletion, the Control Plane checks whether any cluster references it.
 
 ### Data Model
@@ -64,7 +65,10 @@ Key field descriptions:
 - `model_endpoint`: The model discovery endpoint, defaulting to `{schema: "https", uri: "/v1/models"}`.
 - `models`: The list of models supported by this provider; it can be maintained manually or backfilled by the model discovery interface.
 - `keys`: A list of API-Keys, each containing a `name` and the plaintext `key`. The `name` is used for cluster references.
-- `instance_pool`: The backend instance pool, containing at least one instance, and at least one instance must have `weight > 0`.
+- `instance_pool`: The backend instance pool. When the instance source is manual maintenance (the default), it must contain at least one instance, and at least one instance must have `weight > 0`; when the instance source is a K8s Pool, this field is not validated — see "K8s Pool Provisioning" below.
+- `instance_source`: The instance provisioning mode: `instance_pool` (manual maintenance, the default) or `k8s_pool` (maintained by the K8s discovery component).
+- `k8s_pool_name`: Required when `instance_source=k8s_pool`; references a K8s Pool by name.
+- `k8s_instance_pool`: A read-only mirror of the K8s Pool, synced by the Control Plane from the `k8s_pools` table; a request body carrying this field is rejected with 422.
 - `model_protocols`: The supported model access protocols; the current enum values are `openai`, `anthropic`, and `gemini`, with at least one required.
 - `protocol_paths`: Optional. A declarative mapping of protocol -> upstream base path, used to rewrite the standard entry `/v1/...` to the provider's native prefix; see "Protocol Path Rewriting" below.
 - `time_zone` / `tiers`: Used for peak/off-peak price matching; only the `peak` tier is supported initially.
@@ -174,7 +178,7 @@ In this architecture:
 
 - A Provider is the "capability provider"; a Cluster is the "forwarding policy."
 - A Cluster strongly references a Provider via `llm_config.provider`.
-- When the Control Plane creates a Cluster, it automatically generates instance pools and sub-clusters from the Provider's `instance_pool` and binds them to the cluster.
+- When the Control Plane creates a Cluster, it automatically generates instance pools and sub-clusters from the Provider's effective instance pool (`EffectiveInstancePool()`) and binds them to the cluster.
 - `model-prices` associates with a Provider by name only as a weak reference, which does not block deletion.
 
 ### Core Benefits
@@ -214,6 +218,47 @@ When deleting a cluster, the system first checks whether the cluster is referenc
 
 For both `PATCH /providers/{provider_name}` and `PATCH /clusters/{cluster_name}`, the request body must not contain the `name` field. The name is uniquely specified by the URI path parameter; if the request body carries `name`, the API returns `422 Unprocessable Entity`.
 
+## K8s Pool Provisioning
+
+In addition to the manually maintained `instance_pool`, a Provider's instance source can also be a K8s Pool: a discovery component deployed in a Kubernetes environment (Service Controller) continuously syncs the discovered instances to the Control Plane. By referencing a pool name, a Provider obtains a dynamic backend list whose instances grow and shrink automatically with K8s service changes, without manual maintenance.
+
+### Dual-Mode Instance Source
+
+The `providers` table expresses the dual-mode instance source with three fields:
+
+| Field | Type | Description |
+|------|------|------|
+| `instance_source` | `VARCHAR(32)`, default `instance_pool` | Instance provisioning mode: `instance_pool` means the instance list is maintained manually; `k8s_pool` means instances are supplied by the K8s discovery component |
+| `k8s_pool_name` | `VARCHAR(255)`, nullable | Required when `instance_source=k8s_pool`; the name of the referenced K8s Pool |
+| `k8s_instance_pool` | JSON, nullable | Read-only mirror of the K8s Pool, synced and written by the Control Plane from the `k8s_pools` table; an OpenAPI request body carrying this field is rejected with 422 |
+
+The naming rule for `k8s_pool_name` is 1-64 characters, allowing only letters, digits, and `_`, `-`, `.`, and it must not start or end with `.`, `-`, or `_`. The referenced pool does not need to exist in advance: a missing pool is equivalent to zero instances, and instances appear automatically once the discovery component performs its first sync.
+
+### Effective Instance Pool Contract
+
+`EffectiveInstancePool()` in `model/iprovider/provider.go` defines the Effective Instance Pool contract, which is the single entry point through which downstream code consumes an instance pool:
+
+```text
+EffectiveInstancePool(p) = p.instance_source == "k8s_pool" ? p.k8s_instance_pool : p.instance_pool
+```
+
+- Cluster instance snapshot creation, instance pool synchronization, and change detection all read the effective pool through this contract; they never touch the raw `instance_pool` / `k8s_instance_pool` fields directly.
+- When the merged `instance_source` being written resolves to `instance_pool`, the `k8s_instance_pool` mirror is forcibly cleared — under `instance_pool` mode the mirror is always empty.
+- A legitimate empty pool can only occur in `k8s_pool` mode: when the effective pool is empty, clusters referencing this provider are delivered with an empty entry, BFE accepts the load, and requests to that cluster return 500 (`BK_NO_BACKEND`), which must be paired with alerting. The non-empty validations under `instance_pool` mode (at least one instance, (addr, port) deduplication, at least one `weight > 0`) remain unchanged.
+
+### The k8s_pools Table and Maintenance Endpoints
+
+The `k8s_pools` table registers all K8s Pools (`name` unique, `instances` JSON, `created_at` / `updated_at`). Its sole writer is the K8s discovery component, which maintains it via the InnerAPI (authorized by `FeatureK8sPool`):
+
+| Endpoint | Description |
+|------|------|
+| `PUT /inner-api/v1/k8s_pools/{name}/instances` | Full-replacement of the instance list; the request body is a bare JSON array. Instance `addr` is required, `port` ranges 1-65535, `weight` ranges [0,100] and defaults to 100, and the (addr, port) combination must be unique within the pool; an empty array is valid and equivalent to zero instances |
+| `GET /inner-api/v1/k8s_pools` | Pool list, including `instance_count` / `last_sync_time` |
+| `GET /inner-api/v1/k8s_pools/{name}` | Query a single pool; returns 404 when the pool does not exist |
+| `DELETE /inner-api/v1/k8s_pools/{name}` | Deleting a pool has no reference protection; the mirrors of providers referencing this pool are cleared accordingly |
+
+After a successful write, the Control Plane completes the fan-out in a single transaction (`K8sPoolManager.ReplaceInstances` / `DeletePool` in `model/ik8s_pool/k8s_pool.go`): it refreshes the `k8s_instance_pool` mirrors of all providers referencing the pool and synchronously updates the derived instance pools of referencing clusters; empty pools also participate in the sync, i.e. clear semantics. If any step of the fan-out fails, the entire write is rolled back, keeping the pool record, the provider mirrors, and the cluster derived pools consistent.
+
 ## AIConf Generation
 
 The configuration structure consumed by the BFE Data Plane remains consistent with the pre-refactoring structure. The Control Plane merges the data of Providers and Clusters via `model/icluster_conf/exporter.go` to generate the final `AIConf`. The diagram below shows the generation process:
@@ -221,7 +266,7 @@ The configuration structure consumed by the BFE Data Plane remains consistent wi
 ```mermaid
 flowchart LR
     subgraph Provider
-        P1[instance_pool]
+        P1[Effective Instance Pool]
         P2[keys plaintext]
         P3[model_protocols]
         P4[models]
@@ -261,7 +306,7 @@ The generation sources of each field are as follows:
 
 | BFE Configuration Item | Source (New Model) |
 |------------------------|--------------------|
-| Instance pool / sub-cluster / cluster | Cluster + Provider.instance_pool |
+| Instance pool / sub-cluster / cluster | Cluster + Provider effective instance pool (`EffectiveInstancePool()`) |
 | `AIConf.Models` | `cluster.llm_config.models` |
 | `AIConf.ModelMappings` | `cluster.llm_config.model_mappings` |
 | `AIConf.Keys` | `provider.keys` (key plaintext) joined by name with `cluster.llm_config.keys` (weight) |
@@ -515,6 +560,7 @@ This chapter detailed the design of Provider and Cluster in Rainway AI Gateway.
 - **Decoupling benefits**: clearer responsibilities, less duplicate configuration, clusters no longer expose key plaintext, transparent to BFE, and weak references between model-prices and provider.
 - **AIConf generation**: The Control Plane joins the data of Providers and Clusters by name to generate the instance pools, sub-clusters, `AIConf.Keys`, `AIConf.ModelTable`, `AIConf.ModelProtocols`, and other fields required by BFE.
 - **Model discovery**: Probes the third-party model list via `/providers/tools/discover-models` and then backfills it into the Provider.
+- **K8s Pool provisioning**: `instance_source` dual mode (manual `instance_pool` / `k8s_pool` maintained by the K8s discovery component); `EffectiveInstancePool()` is the single consumption entry for downstream code; K8s Pools are written exclusively by the discovery component via the InnerAPI, and after each write a single transaction fans out to refresh the provider mirrors and the derived instance pools of referencing clusters.
 - **Key mechanisms**: A Cluster references the Provider's keys by `name` and sets weights; `key_policy` controls the selection policy and retry backoff; `key_affinity` provides Redis-based session-level Key affinity.
 
 Understanding the boundary between Provider and Cluster is the foundation for correctly configuring Rainway AI Gateway and achieving flexible scheduling across multiple model providers.
@@ -526,6 +572,7 @@ Understanding the boundary between Provider and Cluster is the foundation for co
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/clusters.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/cluster-table.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/ai-route.md`
+- `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/k8s-pools.md`
 - [Chapter 6: Control Plane Core Design: AI Gateway API](./chapter06-control-plane-design.md)
 - [Chapter 20: Provider Configuration](../operation/chapter20-provider-and-model-config.md)
 - [Chapter 21: Cluster Configuration](../operation/chapter21-cluster-and-route-config.md)

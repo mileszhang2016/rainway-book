@@ -8,7 +8,7 @@
 - `xreq.Endpoint` 统一抽象的结构、注册流程与鉴权挂载点；
 - Recovery、Logger、CORS、Product Probe、User Probe 五条中间件的作用与执行顺序；
 - OpenAPI v1 如何通过 `endpoints()` 合并函数聚合各业务子包的 Endpoint；
-- InnerAPI v1 如何导出 BFE 数据面所需的九类配置；
+- InnerAPI v1 如何导出 BFE 数据面所需的十三类配置；
 - 参数绑定、权限校验、统一响应格式在接口层的具体实现；
 - 一个 OpenAPI 接口与一个 InnerAPI 接口的完整 Action 示例。
 
@@ -32,6 +32,8 @@ ai-gateway-api/endpoints/
 │   └── user_probe.go         # 用户/Token 鉴权
 ├── openapi_v1/               # 管理面 OpenAPI（前缀 /open-api/v1）
 │   ├── endpoints.go          # 统一合并各子包 Endpoint
+│   ├── ai_cache/             # /ai-cache-rules、/ai-cache-semantic-settings
+│   ├── ai_context/           # /ai-context-rules、/ai-context-settings
 │   ├── api_key/              # /api-keys
 │   ├── auth/                 # /auth、/meta
 │   ├── certificate/          # /certificates
@@ -39,6 +41,7 @@ ai-gateway-api/endpoints/
 │   ├── entity/               # /entities
 │   ├── entity_type/          # /entity-types
 │   ├── global_route_rules/   # /global-route-rules
+│   ├── intent_config/        # /intent-config
 │   ├── model_price/          # /model-prices
 │   ├── operation_log/        # /operation-logs
 │   ├── product_cluster/      # /clusters
@@ -47,18 +50,24 @@ ai-gateway-api/endpoints/
 │   ├── route/                # /expression/verify
 │   ├── route_tables/         # /route-tables
 │   ├── subcluster/           # 当前未注册
-│   └── traffic/              # 当前未注册
+│   ├── traffic/              # 当前未注册
+│   └── traffic_mirror/       # /traffic-mirror-rules
 └── innerapi_v1/              # 数据面 InnerAPI（前缀 /inner-api/v1）
     ├── endpoints.go          # 统一注册导出接口
+    ├── ai_cache/             # /configs/ai-cache-rule
+    ├── ai_context/           # /configs/ai-context-rule
     ├── ai_route/
     ├── extra_file/
     ├── gslb_data/
+    ├── intent_config_export/ # /configs/mod-ai-intent
+    ├── k8s_pools/            # /k8s_pools/*（K8s 发现组件维护端点）
     ├── mod_api_key/
     ├── mod_body_process/
     ├── protocol/
     ├── quota_reset/            # /quota/trigger-reset
     ├── rate_limit_policy/
     ├── server_data/
+    ├── traffic_mirror/       # /configs/traffic-mirror-rule
     └── export_util/
 ```
 
@@ -415,6 +424,8 @@ var Endpoints = []*xreq.Endpoint{
 
 顶层 `endpoints()` 函数通过 `merge` 将这些切片拼接成一个大的 `[]*xreq.Endpoint`，再统一注册。当前 `product_pool`、`subcluster`、`traffic`、`bfe_cluster`、`domain` 等子包导出的切片为空，对应接口未实际注册，但代码结构被保留，便于后续按需启用。这种设计使得新增或下线一个业务模块时，只需要修改 `endpoints()` 中的合并列表，无需改动路由注册循环。
 
+`ai_cache`、`ai_context`、`traffic_mirror`、`intent_config` 四个子包分别导出规则集合接口 `/ai-cache-rules`、`/ai-context-rules`、`/traffic-mirror-rules` 与单例接口 `/intent-config`、`/ai-cache-semantic-settings`、`/ai-context-settings`，请求形态为集合整体 `GET`/`PUT` 或单例单行覆盖（两类资源形态见 [第六章 控制面核心设计](../design/chapter06-control-plane-design.md)）。
+
 ---
 
 ## InnerAPI v1 导出接口注册
@@ -450,7 +461,7 @@ func RegisterRouter(router *mux.Router) *mux.Router {
 }
 ```
 
-与 OpenAPI 不同，InnerAPI 子树只挂载 `McUserProbe`，不挂载 `McProductProbe`，因为数据面拉取配置时不需要再区分产品线上下文。当前 InnerAPI 共注册 10 个接口：9 类配置导出接口加 1 个配额触发重置接口：
+与 OpenAPI 不同，InnerAPI 子树只挂载 `McUserProbe`，不挂载 `McProductProbe`，因为数据面拉取配置时不需要再区分产品线上下文。当前 InnerAPI 注册的配置导出接口覆盖 13 类主题，外加 1 个配额触发重置接口与 4 个 K8s 实例池维护端点：
 
 | 接口路径 | 配置主题 | 说明 |
 |---|---|---|
@@ -463,7 +474,13 @@ func RegisterRouter(router *mux.Router) *mux.Router {
 | `/configs/mod-body-process` | `mod_body_process` | 请求体处理配置 |
 | `/configs/rate-limit-policy` | `mod_ai_rate_limit` | 限流策略配置 |
 | `/configs/ai-route` | `ai_route` | AI 路由配置 |
+| `/configs/ai-cache-rule` | `mod_ai_cache` | AI 缓存规则配置 |
+| `/configs/ai-context-rule` | `mod_ai_context` | 上下文压缩规则配置 |
+| `/configs/traffic-mirror-rule` | `mod_traffic_mirror` | 流量镜像规则配置 |
+| `/configs/mod-ai-intent` | `intent_config` | 意图配置 |
 | `/quota/trigger-reset` | 无 | 手动触发一次配额周期重置，返回 `{"status":"ok"}` |
+
+`ai_cache`、`ai_context`、`traffic_mirror`、`intent_config_export` 四个子包注册上表中的 AI 缓存、上下文压缩、流量镜像与意图配置导出端点；`k8s_pools` 子包注册 K8s 实例池维护端点（`PUT /k8s_pools/{name}/instances`、`GET /k8s_pools`、`GET/DELETE /k8s_pools/{name}`，鉴权 `FeatureK8sPool`），写入方唯一为 K8s 发现组件，详见 [第十章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)。
 
 所有 InnerAPI 导出接口都支持 `version` 查询参数，由 `export_util.NewExportFromReq` 解析后交给对应 Manager 的 `ConfigExport` 方法处理。当请求版本与当前版本一致时，返回 `Data: nil`，避免重复下发。
 
@@ -713,7 +730,7 @@ func exportActionProcess(req *http.Request) (interface{}, error) {
 - `xreq.Endpoint` 统一了路径、方法、Handler、鉴权与自定义注册方式，是接口层的核心抽象。业务 Action 通过 `xreq.Convert` 转换为 `Endpoint.Handler`。
 - Recovery、Logger、CORS 作为全局中间件对所有 API 生效；Product Probe 与 User Probe 作为路由子树中间件分别服务于 OpenAPI 与 InnerAPI，其中 User Probe 负责身份解析，Endpoint 的 `Authorizer` 负责细粒度权限校验。
 - OpenAPI v1 通过 `merge` 函数将各子包导出的 `[]*xreq.Endpoint` 合并后注册到 `/open-api/v1`。
-- InnerAPI v1 通过固定切片注册九类配置导出接口，所有导出接口均支持 `version` 增量同步，由 `export_util.NewExportFromReq` 与 `model/iversion_control` 共同实现；另注册 `POST /quota/trigger-reset` 用于手动触发配额周期重置。
+- InnerAPI v1 通过固定切片注册十三类配置导出接口，所有导出接口均支持 `version` 增量同步，由 `export_util.NewExportFromReq` 与 `model/iversion_control` 共同实现；另注册 `POST /quota/trigger-reset` 用于手动触发配额周期重置。
 - OpenAPI 提供 `GET /open-api/v1/operation-logs` 操作日志查询接口，鉴权为 `FeatureOperationLog + ActionReadAll`，响应 `{list, pagination}`。
 - 参数绑定由 `xreq.Bind*` 完成，支持 struct tag 校验与自定义 `Validator`；权限校验通过 `iauth.FA` 挂载到每个 Endpoint；统一响应由 `xreq.Result` 与 `xreq.Render` 完成，对外统一返回 `{ErrNum, Data, ErrMsg}`。
 

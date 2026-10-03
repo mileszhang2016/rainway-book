@@ -113,6 +113,10 @@ curl -X POST http://127.0.0.1:8421/reload/mod_ai_token_auth
 | `mod_body_process` | `mod_body_process` | `/reload/mod_body_process` |
 | `mod_ai_rate_limit` | `mod_ai_rate_limit` | `/reload/mod_ai_rate_limit` |
 | `ai_route` | `mod_ai_route` | `/reload/mod_ai_route` |
+| `ai_cache_rule` | `mod_ai_cache` | `/reload/mod_ai_cache` |
+| `traffic_mirror_rule` | `mod_traffic_mirror` | `/reload/mod_traffic_mirror` |
+| `intent_config` | `mod_ai_intent` | `/reload/mod_ai_intent` |
+| `ai_context_rule` | `mod_ai_context` | `/reload/mod_ai_context` |
 
 这些映射在 `conf-agent/conf/conf-agent.toml` 的 `[Reloaders.xxx]` 段中通过 `BFEReloadAPI` 字段显式配置：
 
@@ -245,6 +249,122 @@ ALTER TABLE entities ADD COLUMN description VARCHAR(255) NOT NULL DEFAULT '';
 ALTER TABLE providers ADD COLUMN protocol_paths JSON;
 ```
 
+升级到 v0.0.11 时，控制面库需要新建 7 张表（AI 缓存规则、语义缓存全局设置、上下文压缩规则与全局设置、意图配置、流量镜像规则、K8s 实例池），并为 `providers` 表补充实例供给相关列：
+
+```sql
+-- 控制面库（完整定义以 ai-gateway-api/db_ddl.sql 为准）
+CREATE TABLE `k8s_pools` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(255) NOT NULL,
+  `instances` JSON NOT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY `uk_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='K8s 实例池表';
+
+CREATE TABLE `ai_cache_rules` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(128) NOT NULL,
+  `cond` TEXT NOT NULL,
+  `cache_key_strategy` VARCHAR(32) NOT NULL DEFAULT 'lastQuestion',
+  `cache_ttl` INT NOT NULL DEFAULT 0,
+  `max_body_bytes` BIGINT NOT NULL DEFAULT 1048576,
+  `max_value_bytes` BIGINT NOT NULL DEFAULT 1048576,
+  `enable_semantic_cache` TINYINT(1) NOT NULL DEFAULT 0,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY `uk_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI缓存规则表';
+
+CREATE TABLE `ai_cache_semantic_settings` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `top_k` INT NOT NULL DEFAULT 1,
+  `threshold` DOUBLE NOT NULL DEFAULT 0.15,
+  `threshold_relation` VARCHAR(8) NOT NULL DEFAULT 'lt',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI缓存语义全局设置表（单行）';
+
+CREATE TABLE `ai_context_rules` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `cond` VARCHAR(1024) NOT NULL,
+  `mode` VARCHAR(16) NOT NULL,
+  `max_context_tokens` INT NOT NULL DEFAULT 0,
+  `reserve_tokens` INT NOT NULL DEFAULT 0,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI上下文压缩规则表';
+
+CREATE TABLE `ai_context_settings` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `trigger_ratio` DOUBLE NOT NULL DEFAULT 0.7,
+  `keep_latest_images` INT NOT NULL DEFAULT 2,
+  `tool_result_max_chars` INT NOT NULL DEFAULT 2000,
+  `thinking_policy` VARCHAR(32) NOT NULL DEFAULT 'trim-all-but-last',
+  `chars_per_token` INT NOT NULL DEFAULT 4,
+  `image_token_estimate` INT NOT NULL DEFAULT 1200,
+  `rewrite_strength` VARCHAR(8) NOT NULL DEFAULT 'lite',
+  `rewrite_protected_survival_rate` DOUBLE NOT NULL DEFAULT 0.95,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI上下文压缩全局设置表（单行）';
+
+CREATE TABLE `traffic_mirror_rules` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(128) NOT NULL,
+  `cond` TEXT,
+  `mirror_cluster` VARCHAR(128) NOT NULL,
+  `percentage` INT NOT NULL DEFAULT 100,
+  `remove_headers` TEXT,
+  `set_headers` TEXT,
+  `body_rewrites` TEXT,
+  `path_rewrite` VARCHAR(1024),
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY `uk_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流量镜像规则表';
+
+CREATE TABLE `intent_config` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `version` VARCHAR(32) NOT NULL,
+  `min_confidence` DECIMAL(4,3) NOT NULL DEFAULT 0.600,
+  `questions` TEXT NOT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI意图配置表（单行覆盖式存储）';
+
+ALTER TABLE providers
+  ADD COLUMN `instance_source` VARCHAR(32) NOT NULL DEFAULT 'instance_pool' AFTER `instance_pool`,
+  ADD COLUMN `k8s_pool_name` VARCHAR(255) NULL AFTER `instance_source`,
+  ADD COLUMN `k8s_instance_pool` JSON NULL AFTER `k8s_pool_name`;
+
+-- 已在一期建过 ai_cache_rules（无语义缓存列）的存量库补加二期列
+ALTER TABLE ai_cache_rules
+  ADD COLUMN `enable_semantic_cache` TINYINT(1) NOT NULL DEFAULT 0 AFTER `max_value_bytes`;
+```
+
+报表库（MySQL 形态）需要为明细表 `bfe_ai_request_log` 补充 10 列、为聚合表 `bfe_ai_metrics_1m` 补充 3 列（缓存命中、流量镜像、意图相关字段），现成语句见 `ai-gateway-api/db_ddl_report_mysql.sql` 文件头：
+
+```sql
+ALTER TABLE bfe_ai_request_log
+  ADD COLUMN ai_cache_status VARCHAR(16) NOT NULL DEFAULT '' AFTER ai_auth_hit_quota_plans,
+  ADD COLUMN mirror_hit TINYINT NOT NULL DEFAULT 0 AFTER ai_cache_status,
+  ADD COLUMN mirror_cluster VARCHAR(128) NOT NULL DEFAULT '' AFTER mirror_hit,
+  ADD COLUMN ai_intent_question VARCHAR(64) NOT NULL DEFAULT '' AFTER mirror_cluster,
+  ADD COLUMN ai_intent_answer VARCHAR(64) NOT NULL DEFAULT '' AFTER ai_intent_question,
+  ADD COLUMN ai_intent_confidence DOUBLE DEFAULT NULL AFTER ai_intent_answer,
+  ADD COLUMN ai_intent_source VARCHAR(32) NOT NULL DEFAULT '' AFTER ai_intent_confidence,
+  ADD COLUMN ai_intent_latency_us BIGINT DEFAULT NULL AFTER ai_intent_source,
+  ADD COLUMN ai_intent_cache_hit TINYINT DEFAULT NULL AFTER ai_intent_latency_us,
+  ADD COLUMN ai_intent_questions_version VARCHAR(32) NOT NULL DEFAULT '' AFTER ai_intent_cache_hit;
+
+ALTER TABLE bfe_ai_metrics_1m
+  ADD COLUMN ai_cache_status VARCHAR(16) NOT NULL DEFAULT '' AFTER ai_auth_reject_quota_plans_slot5,
+  ADD COLUMN mirror_hit TINYINT NOT NULL DEFAULT 0 AFTER ai_cache_status,
+  ADD COLUMN ai_intent_answer VARCHAR(64) NOT NULL DEFAULT '' AFTER mirror_hit;
+```
+
 升级前务必：
 
 - 对生产库做完整备份；
@@ -268,6 +388,36 @@ ConfTaskHeaders = {"Authorization" = "Token {Token}"}
 - `conf-agent.toml` 中的 `ConfTaskHeaders`、`ExtraFileTaskHeaders` 是否与 AI Gateway API 的鉴权方式一致；
 - 新增模块的 `Reloader` 是否已正确配置；
 - BFE 是否支持新模块的热加载接口。
+- 升级到 v0.0.11 时，`conf-agent.toml` 是否已包含 `mod_ai_cache`、`mod_traffic_mirror`、`mod_ai_intent`、`mod_ai_context` 四个 Reloader（Conf Agent v0.0.8 的默认配置文件已带，沿用旧配置文件的部署需人工比对补齐），否则对应模块的配置不会下发。
+
+### BFE 升级与 [AIKeyAffinity] 段
+
+AI Key 会话保持（Key Affinity，即 session→key 绑定与 key 惩罚状态）属于 BFE 核心转发逻辑，其 Redis 客户端由 bfe_server 自持（`bfe_server/bfe_server.go` 中的 `initAIKeyAffinityRedis`），配置入口是 `bfe.conf` 的 `[AIKeyAffinity]` 段（定义见 `bfe_config/bfe_conf/conf_ai_key_affinity.go`），不依赖任何模块的 Redis 配置。该段的键全集如下：
+
+| 键 | 含义 | 缺省值 |
+|----|------|--------|
+| `Disabled` | 是否关闭 AI Key 会话保持 | `true` |
+| `ServiceConf` | Redis bns 名或加权 bns 列表，经 `name_conf.data` 解析 | 无（启用时必填） |
+| `MaxIdle` | 连接池最大空闲连接数（须 >0） | `10` |
+| `MaxActive` | 连接池最大活动连接数（0 表示不限） | `20` |
+| `ConnectTimeoutMs` / `ReadTimeoutMs` / `WriteTimeoutMs` | 连接与读写超时，毫秒（须 >0） | `1000` |
+| `Password` | Redis 密码，未设置可忽略 | 无 |
+
+`Disabled` 为 `true`（缺省）时不创建客户端：即使 cluster 配置了 `SessionAffinity=true`，会话保持也不生效，且 BFE 不报错——fail-open 静默关闭。客户端创建失败同样只输出 WARN 日志并保持 nil（fail-open），不会阻断启动。
+
+**升级陷阱**：从 v1.8.8 升级时，若存量部署已启用 Key Affinity（cluster 配置 `SessionAffinity=true`），必须在升级前于 `bfe.conf` 补充 `[AIKeyAffinity]` 段（至少设置 `Disabled=false` 与 `ServiceConf`），否则升级后会话保持被静默关闭：无报错、无告警，session→key 绑定与 key 惩罚状态全部失效。参考配置：
+
+```toml
+[AIKeyAffinity]
+Disabled         = false
+ServiceConf      = "redis_bns"
+MaxIdle          = 10
+MaxActive        = 20
+ConnectTimeoutMs = 1000
+ReadTimeoutMs    = 1000
+WriteTimeoutMs   = 1000
+#Password         = ""
+```
 
 ### 组件版本配套
 
@@ -276,6 +426,13 @@ ConfTaskHeaders = {"Authorization" = "Token {Token}"}
 - AI Gateway API 升级为 v0.0.2；
 - Dashboard 升级为 v0.0.2；
 - Conf Agent 保持 v0.0.1 或更新版本。
+
+再以升级到 v0.0.11 为例，配套要求为：
+
+- AI Gateway API 升级为 v0.0.11；
+- Dashboard 保持 v0.0.10；
+- Conf Agent 升级为 v0.0.8，并确认 `mod_ai_cache`、`mod_traffic_mirror`、`mod_ai_intent`、`mod_ai_context` 四个 Reloader 已配置；
+- BFE 升级为 v1.8.9，并按上一节说明评估 `bfe.conf` 是否需要补充 `[AIKeyAffinity]` 段。
 
 建议的升级顺序为：
 
@@ -348,13 +505,15 @@ ls -l mod_ai_token_auth
 - BFE 通过监控端口的 `/reload/{module}` 接口完成热加载，各模块对应独立的热加载路径；`TLSConfReload` 会把 client CA/CRL 基目录随 `?path=` 版本目录重定位，保证版本目录自包含校验可通过。
 - 生效版本可通过 Conf Agent 日志、软链接指向或配置文件中的 `version` 字段查看；连续 reload 失败时每 10 次输出的 `reload keeps failing` 汇总 ERROR（含 stage 字段）是识别 reload 循环卡死的信号。
 - 版本回滚可利用 Conf Agent 保留的历史版本目录手动切换软链接并重新加载，无需重启 BFE。
-- 升级时需按顺序执行数据库迁移、AI Gateway API 替换、Dashboard 升级与 Conf Agent 配置检查，并注意鉴权头与配置字段的兼容性。
+- 升级时需按顺序执行数据库迁移、AI Gateway API 替换、Dashboard 升级与 Conf Agent 配置检查，并注意鉴权头、数据库 DDL 与配置字段（如 BFE `bfe.conf` 的 `[AIKeyAffinity]` 段、Conf Agent 新模块的 `Reloader`）的兼容性。
 
 ---
 
 ## 参考文档
 
 - `ai-gateway-api/docs/zh_cn/upgrade.md`
+- `ai-gateway-api/db_ddl.sql`
+- `ai-gateway-api/db_ddl_report_mysql.sql`
 - `conf-agent/AGENTS.md`
 - `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/00-overview.md`

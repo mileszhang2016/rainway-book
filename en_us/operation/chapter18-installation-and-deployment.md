@@ -23,7 +23,7 @@ The Rainway AI Gateway adopts a layered **Control Plane + Data Plane** architect
 - **Service Controller**: a Kubernetes service discovery component, deployed optionally.
 - **Log Reader**: the access-log collection component, deployed with BFE in the Data Plane. It forwards BFE access logs to Kafka or MySQL for the reporting and observability pipelines. The corresponding repository is `rainway-ai-gateway/log-reader`.
 
-In addition, the reporting standard form (Doris + Grafana) relies on a set of optional external components: Kafka receives log messages from log-reader, Doris stores detail and aggregated data, and Grafana renders the monitoring dashboards. These observability components are not part of the AI Gateway itself; the one-click deployment scripts for the storage and presentation layers are provided by the `rainway-ai-gateway/ai-gateway-observability` repository, as described in "Deploying the Reporting Standard Form (Doris + Grafana)" below.
+In addition, the reporting standard form (one of Doris / ClickHouse / StarRocks, with Grafana optional as the presentation layer) relies on a set of optional external components: Kafka receives log messages from log-reader, the data warehouse stores detail and aggregated data, and Grafana renders the monitoring dashboards (optional). These observability components are not part of the AI Gateway itself; the one-click deployment scripts for the storage and presentation layers are provided by the `rainway-ai-gateway/ai-gateway-observability` repository, as described in "Deploying the Reporting Standard Form" below.
 
 ```mermaid
 flowchart LR
@@ -210,7 +210,7 @@ SQLite is suitable for functional validation and development debugging; it is no
 
 ## Deploying the Reporting Lightweight Form (Optional)
 
-If you want usage reports in the console without introducing Kafka/Doris/Grafana, enable the reporting lightweight form: the log-reader `mod_log_mysql` plugin writes access logs directly to MySQL, AI Gateway API provides the `/report/*` queries and built-in aggregation JOBs, and the console renders the pages directly. The standard form (Doris + Grafana) does not require these steps; see "Deploying the Reporting Standard Form (Doris + Grafana)" below, after which you only need to set `Backend = "doris"` in `[Report]`.
+If you want usage reports in the console without introducing Kafka or a data warehouse, enable the reporting lightweight form: the log-reader `mod_log_mysql` plugin writes access logs directly to MySQL, AI Gateway API provides the `/report/*` queries and built-in aggregation JOBs, and the console renders the pages directly. The standard form (Doris / ClickHouse / StarRocks, with Grafana optional as the presentation layer) does not require these steps; see "Deploying the Reporting Standard Form" below, after which you only need to set the corresponding `Backend` in `[Report]`.
 
 The deployment follows a schema-first order:
 
@@ -235,7 +235,7 @@ The deployment follows a schema-first order:
    Passwd = "******"
 
    [Report]
-   Backend = "mysql"        # mysql | doris; if absent, the report module stays unassembled and /report/* returns 404
+   Backend = "mysql"        # mysql | doris | clickhouse | starrocks; if absent, the report module stays unassembled and /report/* returns 404
    Datasource = "report_db"
    EnableAggregateJob = true
    AggregateIntervalSec = 60
@@ -249,7 +249,7 @@ Notes:
 
 - **One form per cluster**: do not enable `mod_kafka` (→ Doris) and `mod_log_mysql` (→ MySQL) on the same cluster — the data-gap windows of the two pipelines make the two reports inconsistent.
 - **Partitions before data**: MySQL has no dynamic partitioning; the partition management JOB must create partitions before data arrives (writes to a missing partition fail outright). The JOB inspects every 6 hours and pre-creates partitions immediately at startup.
-- **Capacity guidance**: the MySQL form targets up to roughly one million log entries per day; beyond that, use the Doris standard form.
+- **Capacity guidance**: the MySQL form targets up to roughly one million log entries per day; beyond that, use the standard form (Doris / ClickHouse / StarRocks).
 - The MySQL backend does not provide P50/P90/P99 percentile latency; the corresponding cards are automatically hidden in the console.
 
 ## Deploying the Reporting Standard Form (Doris + Grafana)
@@ -271,11 +271,11 @@ End-to-end latency is under one minute (Routine Load commits in 1–5 seconds; t
 
 | Component | Version | Description |
 |---|---|---|
-| Doris | 4.0+ | FE started and query_port (default 9030) reachable |
+| Doris | 3.0+ | FE started and query_port (default 9030) reachable (the tested baseline of ai-gateway-observability is 3.0.8; atomic table-swap and similar syntax follows that version) |
 | Kafka | 2.8+ | Broker reachable; the `bfe_ai_log` topic created (adjust partition count and retention for your scale) |
 | Grafana | — | Installed, with its installation root directory known (containing `bin/` and `conf/provisioning/`) |
 | mysql client | any | Used to connect to the Doris FE and run deployment SQL |
-| log-reader | v1.4.0 | Deployed with BFE, with the `mod_kafka` plugin enabled |
+| log-reader | v1.5.0 | Deployed with BFE, with the `mod_kafka` plugin enabled |
 
 ### Step 1: Deploy the Doris-Side Objects
 
@@ -322,20 +322,23 @@ Based on Grafana's provisioning (file-based configuration) mechanism, `grafana/s
 2. **Configure AI Gateway API**: add a report datasource pointing to the Doris FE and a `[Report]` section to `ai_gateway_api.toml`:
 
    ```toml
-   [Databases.report_db]
-   Driver = "mysql"         # connects to the Doris FE via MySQL protocol
+   [Databases.doris_db]
+   Driver = "mysql"              # connects to the Doris FE via MySQL protocol
    DBName = "bfe_observability"
    Addr = "127.0.0.1:9030"
+   Net = "tcp"                   # must be set explicitly: when Net is empty, FormatDSN drops the address segment and falls back to 127.0.0.1:3306
    User = "report_read"
    Passwd = "******"
+   AllowNativePasswords = true   # must be enabled explicitly: Doris FE authenticates with mysql_native_password
+   InterpolateParams = true      # recommended to enable explicitly, using the text protocol
 
    [Report]
-   Backend = "doris"        # if absent, the report module stays unassembled and /report/* returns 404
-   Datasource = "report_db"
-   Database = ""            # schema override for table names (optional)
+   Backend = "doris"             # if absent, the report module stays unassembled and /report/* returns 404
+   Datasource = "doris_db"
+   Database = ""                 # schema override for table names (optional)
    ```
 
-   For the Doris form, per-minute aggregation is performed by the Doris INSERT JOB `bfe_ai_metrics_1m_job`; options specific to the MySQL form such as `EnableAggregateJob` / `EnablePartitionMgmt` (aggregation and partition management) only take effect with `Backend = "mysql"`.
+   For the Doris form, per-minute aggregation is performed by the Doris INSERT JOB `bfe_ai_metrics_1m_job`; options specific to the MySQL form such as `EnableAggregateJob` / `EnablePartitionMgmt` (aggregation and partition management) only take effect with `Backend = "mysql"`. For the connection configuration of the ClickHouse and StarRocks forms, see Step 3 of the corresponding deployment sections below; annotated examples for all four forms are also available in the report configuration block of `ai-gateway-api/conf/ai_gateway_api.toml`.
 
 ### Step 4: Verify
 
@@ -354,6 +357,173 @@ Notes:
 
 - **One form per cluster**: do not enable `mod_kafka` (→ Doris) and `mod_log_mysql` (→ MySQL) on the same cluster — the data-gap windows of the two pipelines make the two reports inconsistent.
 - **Aggregation table design reference**: the example aggregation table `bfe_ai_metrics_1m` in the repository only demonstrates the pipeline; in production you can split it into multiple aggregation tables by query scenario and adjust the granularity to 5/15 minutes. See the notes in `doris/docs/user/HOWTO.md`.
+
+## Deploying the Reporting Standard Form (ClickHouse)
+
+ClickHouse landing form: BFE access logs are written to Kafka by the log-reader `mod_kafka` plugin; on the ClickHouse side, a Kafka engine table subscribes to the topic, a consuming materialized view flattens the JSON messages into the detail table, and an aggregation materialized view aggregates by minute buckets into the aggregation table; the console report pages query the same data via `[Report].Backend = "clickhouse"`. The one-click deployment script for the storage layer is provided by the `rainway-ai-gateway/ai-gateway-observability` repository. The data pipeline is:
+
+```text
+BFE (Data Plane)──access logs──▶ log-reader (mod_kafka) ──JSON──▶ Kafka
+                                                                │
+                                                                ▼
+                              Kafka engine table bfe_ai_log_kafka ──consuming MV──▶ bfe_ai_request_log (detail table, MergeTree, 7-day TTL)
+                                                                                            │
+                                                                                            ▼
+                                              aggregation MV (toStartOfMinute minute buckets, second-level latency)──▶ bfe_ai_metrics_1m (aggregation table, SummingMergeTree)
+```
+
+### Prerequisites
+
+| Component | Version | Description |
+|---|---|---|
+| ClickHouse | 26.10+ | Cluster started, JSON type supported (development baseline 26.10); native TCP port reachable (9000 by default) |
+| Kafka | 2.8+ | Broker reachable; the `bfe_ai_log` topic created (adjust partition count and retention for your scale) |
+| clickhouse-client | matching the cluster version | Runs deployment SQL locally |
+| log-reader | v1.5.0 | Deployed with BFE, with the `mod_kafka` plugin enabled |
+
+### Step 1: Deploy the ClickHouse-Side Objects
+
+```bash
+cd ai-gateway-observability/clickhouse
+
+# Production (database bfe_observability): edit setup.conf with the ClickHouse and Kafka connection info first
+vim setup.conf
+bash setup.sh
+
+# Test environment (database bfe_observability_test, topic bfe_ai_log_test)
+bash setup.sh ./setup_test.conf
+```
+
+`clickhouse/setup.sh` creates the database and five kinds of objects in six steps: the database (default `bfe_observability`); the detail table `bfe_ai_request_log` (MergeTree, `ORDER BY (hostid, log_time, ai_apikey_id, ai_requested_model)`, `PARTITION BY toDate(log_time)`, `TTL 7 days`; `logid` is UInt64, since the BFE request unique identifier exceeds the Int64 limit); the Kafka engine staging table `bfe_ai_log_kafka` (`JSONEachRow` format, with its own consumer group `clickhouse_bfe_ai_log`); the consuming MV `bfe_ai_log_load_mv` (JSON flattening + UTC wall-clock conversion); the aggregation table `bfe_ai_metrics_1m` (SummingMergeTree, 40 dimensions + 24 metrics, `ORDER BY` on all dimension columns, `TTL 7 days`); and the aggregation MV `bfe_ai_metrics_1m_mv` (`toStartOfMinute` minute buckets, second-level latency). The database name, Kafka address, topic, and consumer group are all parameterized in `setup.conf` / `setup_test.conf`. If a deployment fails and you need a clean retry, use `clickhouse/cleanup.sh`.
+
+### Step 2: Configure AI Gateway API
+
+```toml
+[Databases.clickhouse_db]
+Driver = "clickhouse"        # clickhouse-go/v2 stdlib driver, native TCP protocol
+DBName = "bfe_observability"
+Addr = "127.0.0.1:9000"      # ClickHouse native TCP port 9000, not the HTTP port 8123
+User = "report_read"
+Passwd = "******"
+
+[Report]
+Backend = "clickhouse"
+Datasource = "clickhouse_db"
+Database = ""                # schema override for table names (optional)
+```
+
+Per-minute aggregation is maintained by the ClickHouse aggregation materialized view; options specific to the MySQL form such as `EnableAggregateJob` / `EnablePartitionMgmt` do not apply.
+
+### Step 3: Verify
+
+```bash
+# All tables and MVs present (the database should contain the detail table, Kafka engine table, two MVs, and the aggregation table)
+clickhouse-client -q "SHOW TABLES FROM bfe_observability"
+
+# Kafka consumption progress (num_commits / num_messages_read keep growing, lag stabilizing)
+clickhouse-client -q "SELECT database, table, consumer_id, num_commits, num_messages_read FROM system.kafka_consumers WHERE database = 'bfe_observability'"
+
+# Detail/aggregation row counts
+clickhouse-client -q "SELECT count() FROM bfe_observability.bfe_ai_request_log"
+clickhouse-client -q "SELECT count() FROM bfe_observability.bfe_ai_metrics_1m"
+```
+
+Then open the report pages in the console and confirm the overview cards have data.
+
+Notes:
+
+- **Aggregation table query discipline**: `bfe_ai_metrics_1m` is a SummingMergeTree; queries must fall back on `GROUP BY <dimension>` + `sum(<metric>)`, and direct `SELECT *` reads are forbidden. Query templates are in `clickhouse/docs/design/TABLE_DESIGN.md`.
+- **Consumption semantics**: the Kafka engine table + consuming MV pipeline is at-least-once; redelivered messages are absorbed by `sum` on the aggregation side and deduplicated by the unique key on the detail side.
+- **No ClickHouse Grafana dashboard in this release**: visualization goes through the console report pages.
+
+## Deploying the Reporting Standard Form (StarRocks)
+
+StarRocks landing form: the data pipeline is isomorphic to the Doris form (log-reader `mod_kafka` → Kafka → Routine Load → detail table), with minute-level aggregation maintained by an async materialized view; the console report pages query via `[Report].Backend = "starrocks"`. The one-click deployment script for the storage layer is provided by the `rainway-ai-gateway/ai-gateway-observability` repository:
+
+```text
+BFE (Data Plane)──access logs──▶ log-reader (mod_kafka) ──JSON──▶ Kafka ──Routine Load──▶ StarRocks
+                                                                                       ├─ bfe_ai_request_log  (detail table, DUPLICATE KEY, dynamic partitioning with 7-day retention)
+                                                                                       └─ bfe_ai_metrics_1m   (async materialized view, refreshed every minute)
+```
+
+### Prerequisites
+
+| Component | Version | Description |
+|---|---|---|
+| StarRocks | 3.5+ | FE started and MySQL-protocol port (default 9030) reachable |
+| Kafka | 2.8+ | Broker reachable; the `bfe_ai_log` topic created (adjust partition count and retention for your scale) |
+| mysql client | any | Used to connect to the SR FE and run deployment SQL; **must be invoked with `--skip-comments`** (the SR FE parser rejects statements that contain only comments; the mysql client sends comment lines as standalone statements by default, which raises a 1064 syntax error) |
+| log-reader | v1.5.0 | Deployed with BFE, with the `mod_kafka` plugin enabled |
+
+### Step 1: Deploy the StarRocks-Side Objects
+
+```bash
+cd ai-gateway-observability/starrocks
+
+# Production (database bfe_observability): edit setup.conf with the SR FE and Kafka connection info first
+vim setup.conf
+bash setup.sh
+
+# Test environment (database bfe_observability_test, topic bfe_ai_log_test)
+bash setup.sh ./setup_test.conf
+```
+
+`starrocks/setup.sh` creates the following in four steps: the database (default `bfe_observability`); the detail table `bfe_ai_request_log` (DUPLICATE KEY, 102 columns; the 5 nested columns `req_headers` / `res_headers` / `ai_route_rule_hits` / `ai_cluster_key_names` / `ai_rate_limit_hits` carry JSON text in VARCHAR — SR 3.5 Routine Load does not support nested-structure ingestion — for detail display only; dynamic partitioning `start=-7` / `end=3`; `DISTRIBUTED BY HASH(ai_apikey_id) BUCKETS 32`; `logid` is BIGINT, and out-of-range values are rejected on write); the materialized view `bfe_ai_metrics_1m` (`REFRESH ASYNC EVERY (INTERVAL 1 MINUTE)`, with an explicit leading column `ts_day` as the partition column and `partition_ttl=7 DAY`; the MV name is the report query contract name, so queries are unaware of it); and the Routine Load `bfe_ai_log_load` (consumer group `starrocks_bfe_ai_log`, `kafka_default_offsets=OFFSET_BEGINNING`, `max_error_number=1000`). If a deployment fails and you need a clean retry, use `starrocks/cleanup.sh`.
+
+### Step 2: Configure AI Gateway API
+
+```toml
+[Databases.starrocks_db]
+Driver = "mysql"              # connects to the SR FE via MySQL protocol
+DBName = "bfe_observability"
+Addr = "127.0.0.1:9030"       # SR FE query_port
+Net = "tcp"                   # must be set explicitly: when Net is empty, FormatDSN drops the address segment and falls back to 127.0.0.1:3306
+User = "report_read"
+Passwd = "******"
+AllowNativePasswords = true   # must be enabled explicitly: SR FE authenticates with mysql_native_password
+InterpolateParams = true      # must be enabled explicitly: works around the SR FE COM_STMT binary row-packet defect (malformed encoding when JSON columns are adjacent to NULL columns) by using the text protocol
+
+[Report]
+Backend = "starrocks"
+Datasource = "starrocks_db"
+Database = ""                 # schema override for table names (optional)
+```
+
+Per-minute aggregation is maintained by the async materialized view; options specific to the MySQL form such as `EnableAggregateJob` / `EnablePartitionMgmt` do not apply.
+
+### Step 3: Verify
+
+```bash
+# The Routine Load state should be RUNNING
+mysql --skip-comments -h127.0.0.1 -P9030 -uroot -Dbfe_observability -e "SHOW ROUTINE LOAD FOR bfe_ai_log_load\G"
+
+# Materialized view refresh status (including refresh progress and errors)
+mysql --skip-comments -h127.0.0.1 -P9030 -uroot -Dbfe_observability -e "SHOW MATERIALIZED VIEWS\G"
+
+# Table list
+mysql --skip-comments -h127.0.0.1 -P9030 -uroot -e "USE bfe_observability; SHOW TABLES"
+```
+
+Then open the report pages in the console and confirm the overview cards have data.
+
+Notes:
+
+- **Mutually exclusive ports with Doris**: the StarRocks and Doris FE port systems overlap (query_port both default to 9030); the two cannot be deployed on the same host, and cross-form grayscale comparison requires separate hosts.
+- **Base table column additions require MV rebuild**: after adding columns to the SR detail table, the materialized view does not automatically pick up the new columns and must be dropped and rebuilt (the rebuild automatically backfills in full).
+- **No StarRocks Grafana dashboard in this release**: visualization goes through the console report pages.
+
+## Consumer Group Isolation and Running Multiple Forms in Parallel
+
+The Kafka consumer groups of the Doris, StarRocks, and ClickHouse pipelines are `doris_bfe_ai_log` / `starrocks_bfe_ai_log` / `clickhouse_bfe_ai_log` and **must all be distinct**: consumer groups with the same name overwrite each other's offsets, causing data loss. Multiple storage backends can be deployed in parallel against the same Kafka topic (e.g., Doris + ClickHouse) for grayscale comparison, but production environments still follow "one landing form per cluster" — do not enable multiple landing pipelines on the same cluster.
+
+## Upgrading an Existing Doris Deployment (Cache/Mirror/Intent Report Fields)
+
+Applies to: existing environments deployed with the Doris standard form at an earlier version that need to support the cache/mirror/intent report fields; fresh deployments do not need this step (the SQL used by `setup.sh` already contains the new columns). For detailed steps, see Section 11 of `ai-gateway-observability/doris/docs/user/HOWTO.md`; the upgrade SQL is in `doris/sqls/upgrade/`:
+
+1. **Online ALTER of the detail table, +13 columns**: 10 cache/mirror/intent columns plus the 3 flattened rate-limit scalar columns `rate_limit_policy_id` / `rate_limit_type` / `rate_limit_rule_name`. Executed online without blocking reads or writes; run once per environment (Doris 3.0 does not support `ADD COLUMN IF NOT EXISTS`, so a `Duplicate column` error on re-execution is expected).
+2. **Stop the Routine Load and recreate it with the same name**: the Routine Load does not support online modification of `COLUMNS`; run `STOP ROUTINE LOAD FOR bfe_ai_log_load` and then recreate it with the same name under the new mapping. A same-named task keeps its consumption progress and resumes from the last committed offset; `kafka_default_offsets=OFFSET_BEGINNING` ensures no messages are lost before the task is created.
+3. **Full rebuild of the aggregation table**: `bfe_ai_metrics_1m` uses the AGGREGATE KEY model, and adding dimensions requires a full table rebuild — drop the old INSERT JOB → create `bfe_ai_metrics_1m_v2` with the new schema (40 dimensions + 24 metrics) → atomically swap names with `ALTER TABLE bfe_ai_metrics_1m REPLACE WITH TABLE bfe_ai_metrics_1m_v2 PROPERTIES('swap'='true')` (fall back to a two-step `RENAME` swap if the version does not support it) → recreate the INSERT JOB with the new SQL → delete the old table after verifying that the five report queries work. Run in a low-peak window and rehearse in a test environment first.
+4. **`log_time` timezone semantics**: the Routine Load switches to writing UTC wall-clock by dynamically subtracting the session timezone offset (`DATE_SUB(FROM_UNIXTIME(timestamp), INTERVAL TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) SECOND)`), and the INSERT JOB minute window switches to `UTC_TIMESTAMP()` accordingly; existing historical data was written with a non-UTC convention and carries a +8h offset, requiring a reload or acceptance of the deviation.
 
 ## Configuration File Description and Minimal Runnable Configuration
 
@@ -855,7 +1025,7 @@ This chapter systematically covered the installation and deployment of the Rainw
 - Container images can be built with `make docker`, and cluster deployment uses Kubernetes Deployments, Services, and DaemonSets.
 - The multi-component startup order is: database initialization → AI Gateway API → BFE → Conf Agent, ensuring the Data Plane promptly receives the latest configuration distributed by the Control Plane.
 - The BFE image ships with tzdata built in; when using a custom image, ensure the container has complete timezone data.
-- Reporting has two deployment forms: the lightweight form writes directly to MySQL via the log-reader `mod_log_mysql` plugin; the standard form (Doris + Grafana) deploys the Doris storage layer and Grafana presentation layer with one-click scripts from the ai-gateway-observability repository, and the console queries the same data via `[Report].Backend = "doris"`.
+- Reporting has a lightweight form (log-reader `mod_log_mysql` writes directly to MySQL, with in-process aggregation) and a standard form; the standard form offers a choice of three data warehouses — Doris, ClickHouse, or StarRocks (Doris can be combined with a Grafana Dashboard) — with the storage layer deployed by one-click scripts from the ai-gateway-observability repository, and the console queries the same data via `[Report].Backend`. Existing Doris deployments can be upgraded online for the cache/mirror/intent fields following Section 11 of the HOWTO.
 - Common deployment issues mainly involve database connections, static asset mounting, Conf Agent communication, TLS configuration association checks, port conflicts, and Redis connection failures.
 - Before going live, complete the production deployment checklist, focusing on password security, permission configuration, and the rollback plan.
 
@@ -869,8 +1039,13 @@ This chapter references the following project documentation and code:
 - `ai-gateway-api/Makefile`: build, packaging, Docker image build, and push targets.
 - `conf-agent/AGENTS.md`: Conf Agent architecture, build method, and local startup commands.
 - `conf-agent/docs/zh_cn/config/config.md`: detailed description of the Conf Agent configuration file.
-- `ai-gateway-observability/README.md`: overview and data pipeline of the observability (Doris + Grafana) repository.
-- `ai-gateway-observability/doris/docs/user/HOWTO.md`: Doris deployment and verification steps for the database, tables, Routine Load, and INSERT JOB.
+- `ai-gateway-observability/README.md`: overview and data pipeline of the observability (Doris / ClickHouse / StarRocks docking assets and Grafana) repository.
+- `ai-gateway-observability/doris/docs/user/HOWTO.md`: Doris deployment and verification steps for the database, tables, Routine Load, and INSERT JOB (including Section 11, upgrading existing deployments).
+- `ai-gateway-observability/doris/docs/design/TABLE_DESIGN.md`: Doris detail and aggregation table design.
+- `ai-gateway-observability/clickhouse/docs/user/HOWTO.md`: ClickHouse deployment and verification steps for the database, detail table, Kafka engine table, consuming MV, aggregation table, and aggregation MV.
+- `ai-gateway-observability/clickhouse/docs/design/TABLE_DESIGN.md`: ClickHouse table design and SummingMergeTree query templates.
+- `ai-gateway-observability/starrocks/docs/user/HOWTO.md`: StarRocks deployment and verification steps for the database, detail table, async materialized view, and Routine Load.
+- `ai-gateway-observability/starrocks/docs/design/TABLE_DESIGN.md`: StarRocks table design.
 - `ai-gateway-observability/grafana/docs/user/HOWTO.md`: one-click Grafana datasource and dashboard configuration steps.
 - [BFE Installation Official Documentation](https://www.bfe-networks.net/en_us/installation/install/): guide for standalone deployment of the BFE Data Plane.
 - [ai-gateway-demo deployment example repository](https://github.com/rainway-ai-gateway/ai-gateway-demo): complete Kubernetes and Docker Compose examples.

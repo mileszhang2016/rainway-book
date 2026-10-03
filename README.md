@@ -6,19 +6,19 @@ This book is written for **users and developers of the Rainway AI Gateway**. It 
 
 ## Version Notes
 
-This book is continuously updated along with the Rainway AI Gateway releases. The current version of this book corresponds to **Rainway AI Gateway v0.7.0**. Release address: <https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.7.0>.
+This book is continuously updated along with the Rainway AI Gateway releases. The current version of this book corresponds to **Rainway AI Gateway v0.8.0**. Release address: <https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.8.0>.
 
-v0.7.0 includes the following component versions:
+v0.8.0 includes the following component versions:
 
 | Component | Version | Description |
 |---|---|---|
-| AI Gateway API | v0.0.10 | Control Plane |
+| AI Gateway API | v0.0.11 | Control Plane |
 | AI Gateway EPP | v0.0.2 | EPP scheduling |
-| BFE | v1.8.8 | Data Plane |
+| BFE | v1.8.9 | Data Plane |
 | Dashboard | v0.0.10 | Management console (embedded in the API image) |
-| conf-agent | v0.0.7 | Configuration hot reload agent |
-| Log Reader | v1.4.0 | Access log → Kafka / MySQL (mod_kafka / mod_log_mysql) |
-| ai-gateway-observability | v0.0.1 | Standard reporting form: Doris / Grafana configuration and deployment scripts |
+| conf-agent | v0.0.8 | Configuration hot reload agent |
+| Log Reader | v1.5.0 | Access log → Kafka / MySQL (mod_kafka / mod_log_mysql) |
+| ai-gateway-observability | v0.0.2 | Standard reporting form: Doris / ClickHouse / StarRocks docking assets and deployment scripts |
 
 ## Table of Contents
 

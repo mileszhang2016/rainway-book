@@ -146,7 +146,7 @@ curl -X GET "https://control-plane.example.com/open-api/v1/epp-pool"
 
 ## Creating an EPP-Mode Cluster
 
-The load-balancing mode of a Cluster is set in the "Balancing Mode Configuration" card at step 4 of the cluster wizard (the `WRR` / `EPP` switch and the `epp_config` parameters). For the console operation flow, see [Chapter 21 Cluster and Route Configuration](./chapter21-cluster-and-route-config.md) and the "Balancing Mode Configuration" section of `ai-gateway-web/docs/zh-cn/04-ai-business-cluster.md`. After selecting `EPP`, fill in the scheduling profile, cache affinity, prefix cache affinity, session affinity, KV cache utilization cap, and flow-control configuration as needed.
+The load-balancing mode of a Cluster is set in the "Balancing Mode Configuration" card at step 4 of the cluster wizard (the `WRR` / `EPP` switch and the `epp_config` parameters). For the console operation flow, see [Chapter 21 Cluster and Route Configuration](./chapter21-cluster-and-route-config.md) and the "Balancing Mode Configuration" section of `ai-gateway-web/docs/zh-cn/04-ai-business-cluster.md`. After selecting `EPP`, fill in the load profile, affinity strength, prefix cache affinity, session affinity, admission watermarks, bad-backend eviction, and flow-control configuration as needed.
 
 Equivalently, specify `balance_mode=EPP` and carry `epp_config` when creating a Cluster via OpenAPI:
 
@@ -159,16 +159,20 @@ curl -X POST "https://control-plane.example.com/open-api/v1/clusters" \
     "llm_config": { "provider": "p1", "models": ["m1"] },
     "balance_mode": "EPP",
     "epp_config": {
-        "scheduling_profile": "balanced",
+        "load_profile": "balanced",
+        "affinity": "medium",
         "kv_cache_utilization_max": 0.9,
+        "waiting_queue_max": 32,
+        "running_requests_max": 256,
+        "fallback_on_empty": false,
+        "metrics_staleness_threshold_ms": 200,
         "prefix_cache_affinity": true,
         "session_affinity_enabled": true,
         "session_affinity_header": "x-session-id",
         "flow_control": {
             "max_requests": 1000,
             "queue_ttl": 30,
-            "no_endpoint_queue_ttl": 600,
-            "enable_eviction": false
+            "no_endpoint_queue_ttl": 600
         }
     }
 }'
@@ -180,16 +184,20 @@ After successful creation, the system automatically: validates `epp_config` → 
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `scheduling_profile` | `balanced` | Scheduling profile: `latency-first` / `balanced` / `throughput-first` |
-| `cache_affinity` | unset (follows the profile) | Scorer weight override: `low` / `medium` / `high`; follows `scheduling_profile` when not set explicitly |
+| `load_profile` | `balanced` | Load profile: `queue-first` / `balanced` / `kv-first` |
+| `affinity` | `medium` | Affinity strength: `off` / `low` / `medium` / `high`, mapped to prefix/session affinity scorer weights 0 / 0.3 / 0.6 / 1.0; when `off`, affinity scorers are not injected |
 | `prefix_cache_affinity` | `true` | Prefix cache affinity switch (soft affinity; matching backends are not guaranteed) |
 | `session_affinity_enabled` | `false` | Session affinity switch |
 | `session_affinity_header` | - | Request header carrying the session id; required when `enabled=true`, the two are configured in pairs |
 | `kv_cache_utilization_max` | `0.9` | KV cache utilization filter threshold `(0,1]` |
+| `waiting_queue_max` | `0` (disabled) | Waiting queue length threshold `≥0`; the corresponding filter condition is enabled when greater than 0 |
+| `running_requests_max` | `0` (disabled) | Running requests threshold `≥0`; the corresponding filter condition is enabled when greater than 0 |
+| `fallback_on_empty` | `false` | Whether to fall back and admit when all endpoints are filtered (passed through to utilization-filter's fallbackOnEmpty) |
+| `metrics_staleness_threshold_ms` | `200` | Bad-backend eviction threshold (milliseconds, `>0`): backends whose metric scraping fails consecutively and whose data is stale beyond this value are evicted |
 | `flow_control.max_requests` | unlimited | Global concurrency cap; `>0` or `-1` (explicitly unlimited) |
 | `flow_control.queue_ttl` | EPP default 60 seconds | Queuing budget in seconds when the pool has endpoints; requests exceeding it are rejected with a retryable backpressure error |
 | `flow_control.no_endpoint_queue_ttl` | follows `queue_ttl` | Queuing budget in seconds when the pool has no endpoints |
-| `flow_control.enable_eviction` | `false` | Demand-driven eviction |
+| `flow_control.enable_eviction` | `false` | Only `false` is accepted (writing `true` is rejected with 422) |
 
 Notes:
 
@@ -393,13 +401,17 @@ To determine whether a request actually went through EPP scheduling (rather than
 
 - `balance_mode` enum `WRR` / `EPP`, default `WRR`;
 - `balance_mode=EPP` requires `epp_config`; a non-empty `epp_config` must pass field validation (regardless of balance_mode);
-- `scheduling_profile` ∈ `latency-first` / `balanced` / `throughput-first`, default `balanced`;
-- `cache_affinity` ∈ `low` / `medium` / `high`;
-- `prefix_cache_affinity` / `session_affinity_enabled` / `enable_eviction` are bools;
-- `session_affinity_enabled=true` requires `session_affinity_header` (non-empty header name); the two appear in pairs;
+- `epp_config` is parsed with strict field parsing; unknown fields return 422;
+- `load_profile` ∈ `queue-first` / `balanced` / `kv-first`, default `balanced`;
+- `affinity` ∈ `off` / `low` / `medium` / `high`, default `medium`;
+- `prefix_cache_affinity` / `session_affinity_enabled` / `fallback_on_empty` are bools;
+- `session_affinity_enabled=true` requires `session_affinity_header` (a valid HTTP header name); the two appear in pairs;
 - `kv_cache_utilization_max` ∈ `(0, 1]`, default `0.9`;
+- `waiting_queue_max` / `running_requests_max` ≥ 0, default `0` (disabled);
+- `metrics_staleness_threshold_ms` > 0, default `200`;
 - `flow_control.max_requests` `>0` or `-1` (unlimited by default);
-- `flow_control.queue_ttl` / `no_endpoint_queue_ttl` are integers ≥0 (seconds); `0` means explicitly disabled.
+- `flow_control.queue_ttl` / `no_endpoint_queue_ttl` are integers ≥0 (seconds);
+- `flow_control.enable_eviction` only accepts `false`; writing `true` returns 422.
 
 **Manual Override ("EPP Scheduling Assignments" tab / `PUT /epp-assignments/{cluster}`)**
 

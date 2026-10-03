@@ -84,6 +84,7 @@ OpenAI、DeepSeek、Anthropic、Google Gemini 等模型服务商的 API 协议�
 |---|---|---|
 | BFE 集群 | BFECluster | 登记数据面 BFE 引擎地址，控制面据此知道配置要下发给谁（Server Data，由部署初始化数据维护，无 OpenAPI 管理接口） |
 | 模型服务商 | Provider | 描述一个模型服务提供方，包括协议类型、后端实例池、模型列表与认证密钥 |
+| K8s 实例池 | K8s Pool | 由 K8s 发现组件同步到控制面的后端实例池，Provider 可引用池名替代手工维护实例列表 |
 | AI 业务集群 | Cluster | 流量实际转发的后端集群，通过引用 Provider 声明其上游能力 |
 | 组织 | Entity | 表达部门、团队或项目等组织架构，是配额、限流、模型访问控制与路由规则的挂载点 |
 | API 调用凭证 | API-Key | 业务系统调用数据面转发入口时使用的身份凭证，可挂载到 Entity 继承策略 |
@@ -105,6 +106,10 @@ OpenAI、DeepSeek、Anthropic、Google Gemini 等模型服务商的 API 协议�
 - 服务鉴权 Key 明文（`keys`）。
 
 多个 Cluster 可以引用同一个 Provider，实现实例池与密钥的复用。
+
+### K8s 实例池（K8s Pool）
+
+「K8s 实例池」对应 InnerAPI `/inner-api/v1/k8s_pools` 维护的实例池数据，由部署在 Kubernetes 环境的发现组件（Service Controller）发现服务实例并同步到控制面。Provider 通过 `instance_source=k8s_pool` 与池名引用 K8s 实例池，实例列表由控制面自动同步刷新，无需手工维护后端地址。详细设计参见 [第十章 Provider 与 Cluster 设计](./chapter10-provider-and-cluster.md)。
 
 ### AI 业务集群（Cluster）
 
@@ -196,7 +201,7 @@ Service Controller 用于在 Kubernetes 环境中发现后端服务，并将服�
 
 ### Log Reader（数据面日志采集）
 
-Log Reader 是数据面日志采集组件（仓库 `rainway-ai-gateway/log-reader`），部署在 BFE 侧，负责读取 BFE 产生的访问日志，解析为结构化的 Token 用量、延迟、状态码等记录，并写入 Kafka 或 MySQL，供报表统计与可观测分析消费。详细设计见 [第十五章 可观测性设计](./chapter15-observability.md)。
+Log Reader 是数据面日志采集组件（仓库 `rainway-ai-gateway/log-reader`），部署在 BFE 侧，负责读取 BFE 产生的访问日志（`bfe-access-pb` 协议），将注册过的字段解析为结构化的 Token 用量、延迟、状态码等记录，并按字段注册结果写入 MySQL（`mod_log_mysql` 插件，99 列）或 Kafka（`mod_kafka` 插件，JSON 形态），供报表统计与可观测分析消费。详细设计见 [第十五章 可观测性设计](./chapter15-observability.md)。
 
 ---
 

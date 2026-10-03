@@ -9,6 +9,7 @@
 - 管理面 OpenAPI 与数据面 InnerAPI 的职责划分与路由组织方式；
 - `xreq.Endpoint` 统一抽象如何简化接口注册、鉴权与中间件处理；
 - 全局容器（`stateful/container`）与手动依赖注入的实现方式；
+- 规则类资源的两类资源形态（全量替换集合与单例）及其鉴权项；
 - 操作日志模块的写入机制、脱敏规则与审计价值；
 - 资源依赖冲突的 409 Conflict 错误约定；
 - 从 `main.go` 到 HTTP 服务启动的完整流程。
@@ -28,7 +29,7 @@
 | Conf Agent | 配置代理 | 轮询 InnerAPI，拉取最新配置并触发 BFE 热加载 |
 | Service Controller | 服务发现 | 向控制面同步后端服务实例信息 |
 
-AI Gateway API 当前的功能范围覆盖：API-Key / Entity / Entity-Type 管理、Provider 与 Cluster 管理、模型定价管理、配额计划与限流策略管理、AI 路由规则管理、证书与附加文件管理、认证授权、配置操作日志审计以及面向数据面的配置导出。
+AI Gateway API 当前的功能范围覆盖：API-Key / Entity / Entity-Type 管理、Provider 与 Cluster 管理、模型定价管理、配额计划与限流策略管理、AI 路由规则管理、AI 缓存规则、流量镜像规则、意图配置、上下文压缩规则、K8s 实例池管理、证书与附加文件管理、认证授权、配置操作日志审计以及面向数据面的配置导出。
 
 ### 控制面与数据面的边界
 
@@ -107,6 +108,11 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 | `model/route_rules/` | Global / Entity / API-Key 三级 AI 路由规则 |
 | `model/ioperlog/` | 操作日志 Manager、敏感字段脱敏、变更摘要 diff_keys 计算 |
 | `model/imods/` | mod-api-key、mod-body-process、AI 路由等模块配置导出 |
+| `model/ai_cache/` | AI 缓存规则与语义缓存全局设置的业务逻辑与导出 |
+| `model/ai_context/` | 上下文压缩规则与全局设置的业务逻辑与导出 |
+| `model/traffic_mirror/` | 流量镜像规则的业务逻辑与导出 |
+| `model/iintent_config/` | 意图配置单例的业务逻辑与导出 |
+| `model/ik8s_pool/` | K8s 实例池维护及写入后的扇出同步 |
 | `model/itxn/` | 事务抽象接口 `TxnStorager` |
 | `model/shared/` | 跨包共享类型与通用 Storager 接口 |
 
@@ -134,6 +140,11 @@ AI Gateway API 采用经典的三层架构，将 HTTP 处理、业务逻辑与�
 | `storage/rdb/route_rules/` | `model/shared`、`model/route_rules` | `route_rules` |
 | `storage/rdb/ioperlog/` | `model/ioperlog` | `operation_logs` |
 | `storage/rdb/provider/` | `model/iprovider` | `providers` |
+| `storage/rdb/ai_cache/` | `model/ai_cache` | `ai_cache_rules`、`ai_cache_semantic_settings` |
+| `storage/rdb/ai_context/` | `model/ai_context` | `ai_context_rules`、`ai_context_settings` |
+| `storage/rdb/traffic_mirror/` | `model/traffic_mirror` | `traffic_mirror_rules` |
+| `storage/rdb/iintent_config/` | `model/iintent_config` | `intent_config` |
+| `storage/rdb/k8s_pool/` | `model/ik8s_pool` | `k8s_pools` |
 
 ### 层间交互关系
 
@@ -219,6 +230,10 @@ OpenAPI v1 负责暴露可管理资源，典型模块包括：
 | `certificate` | `/certificates` | 证书管理 |
 | `auth` | `/auth`、`/meta` | 用户、Session Key、Token |
 | `operation_log` | `/operation-logs` | 配置操作日志查询 |
+| `ai_cache` | `/ai-cache-rules`、`/ai-cache-semantic-settings` | AI 缓存规则（全量替换集合）与语义缓存设置（单例） |
+| `ai_context` | `/ai-context-rules`、`/ai-context-settings` | 上下文压缩规则（全量替换集合）与全局设置（单例） |
+| `traffic_mirror` | `/traffic-mirror-rules` | 流量镜像规则（全量替换集合） |
+| `intent_config` | `/intent-config` | 意图配置（单例） |
 
 ### InnerAPI v1 主要导出接口
 
@@ -235,6 +250,10 @@ InnerAPI v1 将控制面持久化的配置按主题导出，供数据面消费�
 | `/configs/mod-body-process` | 导出请求体处理配置 |
 | `/configs/rate-limit-policy` | 导出限流策略配置 |
 | `/configs/ai-route` | 导出 AI 路由配置 |
+| `/configs/ai-cache-rule` | 导出 AI 缓存规则配置 |
+| `/configs/ai-context-rule` | 导出上下文压缩规则配置 |
+| `/configs/traffic-mirror-rule` | 导出流量镜像规则配置 |
+| `/configs/mod-ai-intent` | 导出意图配置 |
 | `/quota/trigger-reset` | 手动触发一次配额周期重置（详见配额章节） |
 
 所有 InnerAPI 导出接口均支持 `version` 查询参数，通过 `model/iversion_control` 实现增量同步：当请求版本与当前版本一致时返回 `Data: nil`，避免重复下发。
@@ -258,6 +277,31 @@ router.Use(middleware.MCCors)
 | `MCCors` | 处理 CORS 预检和响应头 |
 | `McProductProbe` | 从请求头解析产品线上下文 |
 | `McUserProbe` | 从 Session Key 或 Token 解析用户身份，完成权限校验 |
+
+---
+
+## 资源形态：全量替换集合与单例
+
+OpenAPI 资源并非只有“按 id 寻址的 CRUD”一种形态。面向 BFE 模块的规则类配置衍生出两类新资源形态，对应不同的接口面与写入语义。
+
+### 全量替换集合资源
+
+`ai_cache_rules`、`traffic_mirror_rules`、`ai_context_rules` 属于全量替换集合资源：
+
+- 接口只暴露集合整体的 `GET` / `PUT`，没有 `/{id}` 子资源；
+- 一次 `PUT` 在单事务内完成 delete-all + insert-all 整体替换，`rules: null` 视为清空；
+- 规则按 first-match-wins 语义消费，数组顺序即优先级，元素在数组中的位置是配置语义的一部分；
+- 集合元素的数据库自增 id 不对外暴露，API 与导出均按数组序组织。
+
+### 单例资源
+
+`intent_config`、`ai_cache_semantic_settings`、`ai_context_settings` 属于单例资源：
+
+- 全系统固定一行（固定 id），写入即单行覆盖，无集合概念；
+- 版本号 `yyyyMMddHHmmss` 由控制面内部生成并内嵌在导出内容中，不通过 API 暴露；
+- 空表语义各异：`intent_config` 从未发布时 `GET` 返回 404（空问题集即停用分类的软开关语义）；两个 settings 空表表示“未覆盖默认值”，`GET` 返回文档默认值，永不 404。
+
+两类形态仍沿用 `xreq.Endpoint` 注册与 `iauth` 鉴权框架，只是 Manager 内部的写入路径从“按 id 增量修改”变为“整体替换 / 单行覆盖”。鉴权项对应 `model/iauth/features.go` 中的 `FeatureAICache`、`FeatureAIContext`、`FeatureTrafficMirror`、`FeatureAIIntent` 与 `FeatureK8sPool`：前四者分别对应四类 AI 增强策略资源，后者对应 K8s 实例池维护端点（写入方唯一为 K8s 发现组件，见[第十章 Provider 与 Cluster 设计](./chapter10-provider-and-cluster.md)）。
 
 ---
 

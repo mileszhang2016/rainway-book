@@ -8,7 +8,7 @@ This chapter focuses on the lowest-level data persistence mechanism of AI Gatewa
 - The SQL building and scanning mechanism based on `github.com/didi/gendry`.
 - The generic code template of the DAO layer, CRUD function naming, and field conventions.
 - How the Storage layer exposes interfaces to the `model/*` subpackages and converts business models to database models.
-- The Storage mapping for the 27 tables.
+- The Storage mapping for the 34 tables.
 - The transaction abstraction `itxn.TxnStorager` and the implementation in `storage/rdb/txn`.
 - The design rationale for the absence of physical foreign keys, and how data consistency is guaranteed.
 
@@ -25,13 +25,17 @@ storage/rdb/
 │       ├── internal/           # generic CRUD wrapper and gendry adaptation
 │       ├── table_*.go          # one DAO file per table
 │       └── ...
+├── ai_cache/                   # AI cache rule / semantic cache settings Storage
+├── ai_context/                 # context compression rule / global settings Storage
 ├── ai_route/                   # AI route rule Storage
 ├── api_key/                    # API-Key / Token Storage
 ├── auth/                       # authentication / authorization Storage
 ├── basic/                      # product line / BFE cluster / extra file Storage
 ├── cluster_conf/               # cluster / sub-cluster / instance pool / LB matrix / ModelPrice Storage
 ├── entity/                     # Entity / EntityType / Entity ID sequence Storage
+├── iintent_config/             # intent configuration singleton Storage
 ├── ioperlog/                   # operation log Storage
+├── k8s_pool/                   # K8s Pool Storage
 ├── model_price/                # model pricing Storage
 ├── protocol/                   # TLS certificate Storage
 ├── provider/                   # Provider Storage
@@ -39,6 +43,7 @@ storage/rdb/
 ├── rate_limit_policy/          # RateLimitPolicy Storage
 ├── route_conf/                 # domain / product-level route rule Storage (not used for Cluster selection in AI gateway mode)
 ├── route_rules/                # API-Key / Entity / Global route rule Storage
+├── traffic_mirror/             # traffic mirror rule Storage
 ├── txn/                        # transaction abstraction implementation
 └── version_control/            # configuration version control Storage
 ```
@@ -281,9 +286,9 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 }
 ```
 
-## Storage Mapping for the 27 Tables
+## Storage Mapping for the 34 Tables
 
-According to `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`, the current system has 27 persistent tables in total, divided by business module as follows.
+According to `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`, the current system has 34 persistent tables in total, divided by business module as follows.
 
 ### Basic Configuration (6 tables)
 
@@ -341,6 +346,20 @@ According to `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`, t
 |-------|----------|-----------------|-------------|
 | `model_prices` | `table_model_prices.go` | `storage/rdb/model_price/model_price.go` | Model pricing |
 
+### AI Enhancement Policies and K8s Pools (7 tables)
+
+| Table | DAO file | Storage package | Description |
+|-------|----------|-----------------|-------------|
+| `ai_cache_rules` | `table_ai_cache_rules.go` | `storage/rdb/ai_cache/` | AI cache rule collection |
+| `ai_cache_semantic_settings` | `table_ai_cache_semantic_settings.go` | `storage/rdb/ai_cache/` | Semantic cache global settings singleton |
+| `ai_context_rules` | `table_ai_context_rules.go` | `storage/rdb/ai_context/` | Context compression rule collection |
+| `ai_context_settings` | `table_ai_context_settings.go` | `storage/rdb/ai_context/` | Context compression global settings singleton |
+| `traffic_mirror_rules` | `table_traffic_mirror_rules.go` | `storage/rdb/traffic_mirror/` | Traffic mirror rule collection |
+| `intent_config` | `table_intent_config.go` | `storage/rdb/iintent_config/` | Intent configuration singleton |
+| `k8s_pools` | `table_k8s_pools.go` | `storage/rdb/k8s_pool/` | K8s Pools; the sole writer is the K8s discovery component |
+
+Among them, `ai_cache_rules`, `ai_context_rules`, and `traffic_mirror_rules` are full-replacement collection tables (array order is the priority); `intent_config`, `ai_cache_semantic_settings`, and `ai_context_settings` are singleton single-row-overwrite tables; after an instance snapshot of `k8s_pools` is written, the same transaction fans out to refresh the mirrors of referencing providers and the derived instance pools of referencing clusters (see [Chapter 10: Provider and Cluster Design](../design/chapter10-provider-and-cluster.md)).
+
 ### Operation Logs and Sequence Allocation (2 tables)
 
 | Table | DAO file | Storage package | Description |
@@ -356,7 +375,7 @@ The `operation_logs` table records all configuration write operations on the man
 
 `entity_id_seq` is the sequence allocation table for Entity IDs, holding a single fixed row (`name='entity'`) whose `next_seq` column stores the next available sequence number. The Entity ID generation scheme changed from timestamps/random numbers to sequence-table allocation (producing business IDs like `entity-{seq}`); `TEntityIDSeqAllocate` allocates numbers atomically and never reuses allocated values.
 
-Note: the `route_cases` table is defined in the DDL, but there is currently no corresponding DAO or Storage implementation in the code, so the tables actually covered by DAO + Storage number 26.
+Note: the `route_cases` table is defined in the DDL, but there is currently no corresponding DAO or Storage implementation in the code, so the tables actually covered by DAO + Storage number 33.
 
 ### DDL and Upgrade Notes
 
@@ -364,23 +383,25 @@ The project provides no incremental migration scripts; `db_ddl.sql` (with `db_dd
 
 New optional fields evolve via column additions. For example, the `providers` table gained a `protocol_paths` TEXT column (JSON, storing the "protocol -> upstream base path" mapping) in v0.0.10; existing data is NULL, meaning unconfigured, so no data migration is needed and the application layer simply ignores the column when unread.
 
+The K8s instance provisioning capability of the `providers` table is likewise carried via column additions: an `instance_source` VARCHAR(32) column defaulting to `instance_pool` (values `instance_pool` / `k8s_pool`), plus a `k8s_pool_name` VARCHAR(255) column and a `k8s_instance_pool` JSON column, both nullable. Existing data is NULL, i.e. the default manual instance pool mode, so no data migration is needed; the application layer reads the effective pool by instance source through the `EffectiveInstancePool()` contract (see [Chapter 10: Provider and Cluster Design](../design/chapter10-provider-and-cluster.md)).
+
 From the mapping it can be seen that Storage subpackages are divided by business domain rather than by the number of database tables. For example, the `cluster_conf` subpackage manages four tables — `clusters`, `sub_clusters`, `pools`, and `lb_matrices` — because these tables jointly serve the business concept of cluster configuration. The `route_conf` subpackage manages `domains`, `route_basic_rules`, `route_advance_rules`, and `route_default_rules` at the same time, because together they form the product-level route rules (in AI gateway mode they are not used for Cluster selection of AI requests, and are only used for product line identification context or non-AI traffic scenarios). This business-domain aggregation makes Storage interfaces closer to the call patterns of the model-layer Manager, avoiding the complexity of a Manager depending on multiple fine-grained Storages simultaneously.
 
 ## Report Storage Implementation (Standalone Report Database)
 
-Report data lives in a report database separate from the Control Plane database (MySQL `bfe_report` or Doris `bfe_observability`). It is not part of the 26 Control Plane tables above; its DDL is released separately from the ai-gateway-api repository (`db_ddl_report_mysql.sql`, schema-first). The query side is implemented as two Storage packages — `storage/mysqlreport` and `storage/dorisreport` — following the same DAO and gendry builder conventions as the Control Plane, with SQL dialect differences encapsulated in their respective packages.
+Report data lives in a report database separate from the Control Plane database (MySQL `bfe_report`, Doris `bfe_observability`, or the same-named database in ClickHouse / StarRocks). It is not part of the Control Plane tables above; its DDL is released separately from the ai-gateway-api repository (`db_ddl_report_mysql.sql`, schema-first). The query side is implemented as four Storage packages — `storage/mysqlreport`, `storage/dorisreport`, `storage/clickhousereport`, and `storage/starrocksreport` — following the same DAO and gendry builder conventions as the Control Plane, with SQL dialect differences encapsulated in their respective packages.
 
 Design highlights of the two tables:
 
-- **Detail table `bfe_ai_request_log`** (89 columns, same name and columns as Doris): the unique key `(hostid, log_time, ai_apikey_id, ai_requested_model)` matches the Doris UNIQUE KEY, and log-reader writes idempotently via `INSERT ... ON DUPLICATE KEY UPDATE`; `ARRAY<STRUCT>`-like fields are JSON columns on the MySQL side (detail display only, never filter conditions); long-text columns use TEXT to avoid the utf8mb4 row-size limit; daily RANGE partitions roll over.
-- **Aggregation table `bfe_ai_metrics_1m`** (37 dimensions + 24 metrics, same dimension set as the Doris aggregation table): no unique key — the dimension columns are too wide for an InnoDB unique key, and idempotency is guaranteed by the aggregation JOB's transaction semantics.
+- **Detail table `bfe_ai_request_log`** (99 columns, same name and columns as Doris): the unique key `(hostid, log_time, ai_apikey_id, ai_requested_model)` matches the Doris UNIQUE KEY, and log-reader writes idempotently via `INSERT ... ON DUPLICATE KEY UPDATE`; `ARRAY<STRUCT>`-like fields are JSON columns on the MySQL side (detail display only, never filter conditions); long-text columns use TEXT to avoid the utf8mb4 row-size limit; daily RANGE partitions roll over.
+- **Aggregation table `bfe_ai_metrics_1m`** (40 dimensions + 24 metrics, same dimension set as the Doris / ClickHouse / StarRocks aggregation tables): no unique key — the dimension columns are too wide for an InnoDB unique key, and idempotency is guaranteed by the aggregation JOB's transaction semantics.
 
 Two background JOBs run for the MySQL form (`storage/mysqlreport/job.go`; they do not start in the Doris form):
 
 - **Minute aggregation JOB**: a single transaction of `DELETE` for the previous full minute window plus `INSERT SELECT`, making window replays idempotent; dimension columns are normalized with `IFNULL(col,'')` on write (aligned with the COALESCE semantics of the Doris JOB); multi-replica deployments elect a single runner via MySQL `GET_LOCK('report_agg_job', 0)`; process restarts do not backfill historical windows (accepting a ≤1-minute gap, symmetric with the Doris INSERT JOB semantics).
 - **Partition management JOB**: inspects every 6 hours, pre-creates partitions 3 days ahead, and DROPs expired partitions beyond `RetentionDays`; it automatically falls back to batched `DELETE ... LIMIT` cleanup when the target table is non-partitioned. MySQL's `information_schema.PARTITIONS` echoes evaluated integers for expression boundaries (e.g. `TO_DAYS('2026-09-18')` echoes as `738886`), so the parser must support three forms — integer back-conversion, literal text, and `MAXVALUE` — otherwise existing partitions are misjudged as missing and `ADD PARTITION` is repeated (Error 1493), or the initial partition never participates in expired DROP.
 
-Another cross-dialect concern is time rendering: DATETIME → Unix seconds uniformly uses `TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', col)` arithmetic (the integer-second difference between two DATETIME values, with no timezone interpretation), avoiding offsets caused by `UNIX_TIMESTAMP()` interpreting wall-clock in the session timezone — log-reader writes UTC wall-clock, and the MySQL and Doris implementations keep the same convention.
+Another cross-dialect concern is time rendering: the goal is "timezone-independent Unix seconds". The MySQL and Doris (including StarRocks) implementations uniformly use `TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', col)` arithmetic (the integer-second difference between two DATETIME values, with no timezone interpretation), avoiding offsets caused by `UNIX_TIMESTAMP()` interpreting wall-clock in the session timezone — log-reader writes UTC wall-clock, and both sides keep the same convention; the ClickHouse implementation, by contrast, handles DateTime columns (fixed to UTC, no timezone ambiguity) directly with the native `toUnixTimestamp` / `fromUnixTimestamp` / `intDiv` functions.
 
 ## Transaction Implementation (storage/rdb/txn)
 
@@ -610,7 +631,7 @@ This chapter introduced in detail the storage layer implementation of the Rainwa
 - The DAO layer builds SQL based on `github.com/didi/gendry`; the generic CRUD wrapper lives in `storage/rdb/internal/dao/internal/curd.go`.
 - Each DAO file follows a unified template: table name constant, `T<Table>` result struct, `T<Table>Param` parameter struct, and CRUD functions.
 - Storage obtains the database context via `lib.DBContextFactory` and is responsible for model conversion, JSON serialization, pagination calculation, and timestamp filling.
-- The 27 tables are mapped to different Storage subpackages by business module; `route_cases` currently has no DAO/Storage implementation.
+- The 34 tables are mapped to different Storage subpackages by business module; `route_cases` currently has no DAO/Storage implementation.
 - Transactions are abstracted through `model/itxn.TxnStorager`; `storage/rdb/txn/txn.go` provides an RDB-based implementation, and the model-layer Manager is responsible for orchestrating cross-table transaction boundaries.
 - The database design uses no physical foreign keys; consistency is guaranteed by the application layer through logical foreign keys and transactions, balancing performance and flexibility.
 

@@ -146,7 +146,7 @@ curl -X GET "https://control-plane.example.com/open-api/v1/epp-pool"
 
 ## 创建 EPP 模式 Cluster
 
-集群的负载均衡模式在集群向导步骤 4 的「均衡模式配置」卡片中设置（`WRR` / `EPP` 切换及 `epp_config` 参数），控制台操作流程见 [第二十一章 Cluster与路由配置](./chapter21-cluster-and-route-config.md) 与 `ai-gateway-web/docs/zh-cn/04-ai-business-cluster.md` 的「均衡模式配置」小节。选择 `EPP` 后按需填写调度策略、缓存亲和性、前缀缓存亲和性、会话亲和性、KV 缓存利用率上限与流控配置。
+集群的负载均衡模式在集群向导步骤 4 的「均衡模式配置」卡片中设置（`WRR` / `EPP` 切换及 `epp_config` 参数），控制台操作流程见 [第二十一章 Cluster与路由配置](./chapter21-cluster-and-route-config.md) 与 `ai-gateway-web/docs/zh-cn/04-ai-business-cluster.md` 的「均衡模式配置」小节。选择 `EPP` 后按需填写负载画像、亲和强度、前缀缓存亲和性、会话亲和性、准入水位、坏后端剔除与流控配置。
 
 等价地，经 OpenAPI 创建 Cluster 时指定 `balance_mode=EPP` 并携带 `epp_config`：
 
@@ -159,16 +159,20 @@ curl -X POST "https://control-plane.example.com/open-api/v1/clusters" \
     "llm_config": { "provider": "p1", "models": ["m1"] },
     "balance_mode": "EPP",
     "epp_config": {
-        "scheduling_profile": "balanced",
+        "load_profile": "balanced",
+        "affinity": "medium",
         "kv_cache_utilization_max": 0.9,
+        "waiting_queue_max": 32,
+        "running_requests_max": 256,
+        "fallback_on_empty": false,
+        "metrics_staleness_threshold_ms": 200,
         "prefix_cache_affinity": true,
         "session_affinity_enabled": true,
         "session_affinity_header": "x-session-id",
         "flow_control": {
             "max_requests": 1000,
             "queue_ttl": 30,
-            "no_endpoint_queue_ttl": 600,
-            "enable_eviction": false
+            "no_endpoint_queue_ttl": 600
         }
     }
 }'
@@ -180,16 +184,20 @@ curl -X POST "https://control-plane.example.com/open-api/v1/clusters" \
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `scheduling_profile` | `balanced` | 调度档位：`latency-first` / `balanced` / `throughput-first` |
-| `cache_affinity` | 缺省（跟随档位） | scorer 权重覆盖：`low` / `medium` / `high`；未显式设置时跟随 `scheduling_profile` |
+| `load_profile` | `balanced` | 负载画像：`queue-first` / `balanced` / `kv-first` |
+| `affinity` | `medium` | 亲和强度：`off` / `low` / `medium` / `high`，映射为前缀/会话亲和 scorer 权重 0 / 0.3 / 0.6 / 1.0；取 `off` 时不注入亲和 scorer |
 | `prefix_cache_affinity` | `true` | 前缀缓存亲和开关（软亲和，不保证命中匹配后端） |
 | `session_affinity_enabled` | `false` | 会话亲和开关 |
 | `session_affinity_header` | - | session id 来源请求头；`enabled=true` 时必填，二者成对配置 |
 | `kv_cache_utilization_max` | `0.9` | KV cache 利用率过滤阈值 `(0,1]` |
+| `waiting_queue_max` | `0`（不启用） | 等待队列长度阈值 `≥0`，大于 0 时启用对应过滤条件 |
+| `running_requests_max` | `0`（不启用） | 在跑请求数阈值 `≥0`，大于 0 时启用对应过滤条件 |
+| `fallback_on_empty` | `false` | 全部端点被过滤时是否回退放行（透传 utilization-filter 的 fallbackOnEmpty） |
+| `metrics_staleness_threshold_ms` | `200` | 坏后端剔除阈值（毫秒 `>0`）：指标抓取连续失败、数据过期超过该值的后端被剔除 |
 | `flow_control.max_requests` | 不限 | 全局并发上限；`>0` 或 `-1`（显式不限） |
 | `flow_control.queue_ttl` | EPP 默认 60 秒 | 池有端点时的排队预算（秒），超期以可重试背压错误拒绝 |
 | `flow_control.no_endpoint_queue_ttl` | 跟随 `queue_ttl` | 池无端点时的排队预算（秒） |
-| `flow_control.enable_eviction` | `false` | 需求驱动驱逐 |
+| `flow_control.enable_eviction` | `false` | 仅接受 `false`（写入 `true` 校验拒绝 422） |
 
 注意事项：
 
@@ -393,13 +401,17 @@ curl -X PUT "https://control-plane.example.com/open-api/v1/clusters/llm-cluster-
 
 - `balance_mode` 枚举 `WRR` / `EPP`，默认 `WRR`；
 - `balance_mode=EPP` 时 `epp_config` 必填；`epp_config` 非空即须通过字段校验（与 balance_mode 无关）；
-- `scheduling_profile` ∈ `latency-first` / `balanced` / `throughput-first`，默认 `balanced`；
-- `cache_affinity` ∈ `low` / `medium` / `high`；
-- `prefix_cache_affinity` / `session_affinity_enabled` / `enable_eviction` 为 bool；
-- `session_affinity_enabled=true` 时 `session_affinity_header` 必填（非空 header 名），二者成对；
+- `epp_config` 按严格字段解析，未知字段返回 422；
+- `load_profile` ∈ `queue-first` / `balanced` / `kv-first`，默认 `balanced`；
+- `affinity` ∈ `off` / `low` / `medium` / `high`，默认 `medium`；
+- `prefix_cache_affinity` / `session_affinity_enabled` / `fallback_on_empty` 为 bool；
+- `session_affinity_enabled=true` 时 `session_affinity_header` 必填（合法 HTTP header 名），二者成对；
 - `kv_cache_utilization_max` ∈ `(0, 1]`，默认 `0.9`；
+- `waiting_queue_max` / `running_requests_max` ≥ 0，默认 `0`（不启用）；
+- `metrics_staleness_threshold_ms` > 0，默认 `200`；
 - `flow_control.max_requests` `>0` 或 `-1`（缺省不限）；
-- `flow_control.queue_ttl` / `no_endpoint_queue_ttl` 为 ≥0 整数（秒），`0` 为显式禁用驱逐。
+- `flow_control.queue_ttl` / `no_endpoint_queue_ttl` 为 ≥0 整数（秒）；
+- `flow_control.enable_eviction` 仅接受 `false`，写入 `true` 返回 422。
 
 **手工覆写（「EPP 调度分配」页签 / `PUT /epp-assignments/{cluster}`）**
 

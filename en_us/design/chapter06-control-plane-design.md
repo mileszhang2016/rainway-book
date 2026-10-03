@@ -9,6 +9,7 @@ Through this chapter, readers will understand:
 - The division of responsibilities and route organization between the management-plane OpenAPI and the data-plane InnerAPI;
 - How the unified `xreq.Endpoint` abstraction simplifies interface registration, authorization, and middleware handling;
 - The implementation of the global container (`stateful/container`) and manual dependency injection;
+- The two resource forms of rule-type resources (full-replacement collections and singletons) and their authorization features;
 - The write mechanism, masking rules, and audit value of the operation log module;
 - The 409 Conflict error convention for resource dependency conflicts;
 - The complete flow from `main.go` to HTTP service startup.
@@ -28,7 +29,7 @@ The relationship between the AI Gateway API and its surrounding components in th
 | Conf Agent | Configuration agent | Polls InnerAPI, pulls the latest configuration, and triggers BFE hot reload |
 | Service Controller | Service discovery | Syncs backend service instance information to the Control Plane |
 
-The current functional scope of the AI Gateway API covers: API-Key / Entity / Entity-Type management, Provider and Cluster management, model pricing management, QuotaPlan and RateLimitPolicy management, AI routing rule management, certificate and extra file management, authentication and authorization, configuration operation log auditing, and configuration export for the Data Plane.
+The current functional scope of the AI Gateway API covers: API-Key / Entity / Entity-Type management, Provider and Cluster management, model pricing management, QuotaPlan and RateLimitPolicy management, AI routing rule management, AI cache rules, traffic mirror rules, intent configuration, context compression rules, K8s Pool management, certificate and extra file management, authentication and authorization, configuration operation log auditing, and configuration export for the Data Plane.
 
 ### Boundary Between Control Plane and Data Plane
 
@@ -107,6 +108,11 @@ Key packages are as follows:
 | `model/route_rules/` | Global / Entity / API-Key three-level AI routing rules |
 | `model/ioperlog/` | Operation log Manager, sensitive-field masking, and change summary diff_keys computation |
 | `model/imods/` | Export of module configurations such as mod-api-key, mod-body-process, and AI routing |
+| `model/ai_cache/` | AI cache rules and semantic cache global settings: business logic and export |
+| `model/ai_context/` | Context compression rules and global settings: business logic and export |
+| `model/traffic_mirror/` | Traffic mirror rules: business logic and export |
+| `model/iintent_config/` | Intent configuration singleton: business logic and export |
+| `model/ik8s_pool/` | K8s Pool maintenance and post-write fan-out synchronization |
 | `model/itxn/` | Transaction abstraction interface `TxnStorager` |
 | `model/shared/` | Cross-package shared types and generic Storager interfaces |
 
@@ -134,6 +140,11 @@ Key packages are as follows:
 | `storage/rdb/route_rules/` | `model/shared`, `model/route_rules` | `route_rules` |
 | `storage/rdb/ioperlog/` | `model/ioperlog` | `operation_logs` |
 | `storage/rdb/provider/` | `model/iprovider` | `providers` |
+| `storage/rdb/ai_cache/` | `model/ai_cache` | `ai_cache_rules`, `ai_cache_semantic_settings` |
+| `storage/rdb/ai_context/` | `model/ai_context` | `ai_context_rules`, `ai_context_settings` |
+| `storage/rdb/traffic_mirror/` | `model/traffic_mirror` | `traffic_mirror_rules` |
+| `storage/rdb/iintent_config/` | `model/iintent_config` | `intent_config` |
+| `storage/rdb/k8s_pool/` | `model/ik8s_pool` | `k8s_pools` |
 
 ### Inter-Layer Interaction
 
@@ -219,6 +230,10 @@ OpenAPI v1 is responsible for exposing manageable resources. Typical modules inc
 | `certificate` | `/certificates` | Certificate management |
 | `auth` | `/auth`, `/meta` | Users, Session Key, Token |
 | `operation_log` | `/operation-logs` | Configuration operation log queries |
+| `ai_cache` | `/ai-cache-rules`, `/ai-cache-semantic-settings` | AI cache rules (full-replacement collection) and semantic cache settings (singleton) |
+| `ai_context` | `/ai-context-rules`, `/ai-context-settings` | Context compression rules (full-replacement collection) and global settings (singleton) |
+| `traffic_mirror` | `/traffic-mirror-rules` | Traffic mirror rules (full-replacement collection) |
+| `intent_config` | `/intent-config` | Intent configuration (singleton) |
 
 ### Main InnerAPI v1 Export Interfaces
 
@@ -235,6 +250,10 @@ InnerAPI v1 exports the configurations persisted by the Control Plane by topic, 
 | `/configs/mod-body-process` | Export request body processing configuration |
 | `/configs/rate-limit-policy` | Export rate limit policy configuration |
 | `/configs/ai-route` | Export AI routing configuration |
+| `/configs/ai-cache-rule` | Export AI cache rule configuration |
+| `/configs/ai-context-rule` | Export context compression rule configuration |
+| `/configs/traffic-mirror-rule` | Export traffic mirror rule configuration |
+| `/configs/mod-ai-intent` | Export intent configuration |
 | `/quota/trigger-reset` | Manually trigger a quota period reset (see the quota chapter) |
 
 All InnerAPI export interfaces support the `version` query parameter and implement incremental synchronization via `model/iversion_control`: when the requested version matches the current version, `Data: nil` is returned to avoid redundant distribution.
@@ -258,6 +277,31 @@ On top of this, the OpenAPI route subtree additionally mounts `McProductProbe` a
 | `MCCors` | Handles CORS preflight and response headers |
 | `McProductProbe` | Parses the product-line context from request headers |
 | `McUserProbe` | Parses user identity from Session Key or Token and performs permission checks |
+
+---
+
+## Resource Forms: Full-Replacement Collections and Singletons
+
+OpenAPI resources do not come in only one form of "id-addressed CRUD". Rule-type configurations for BFE modules have given rise to two new resource forms, corresponding to different interface surfaces and write semantics.
+
+### Full-Replacement Collection Resources
+
+`ai_cache_rules`, `traffic_mirror_rules`, and `ai_context_rules` are full-replacement collection resources:
+
+- The interface exposes only collection-level `GET` / `PUT`, with no `/{id}` sub-resources;
+- A single `PUT` performs a delete-all + insert-all full replacement within one transaction; `rules: null` is treated as clearing the collection;
+- Rules are consumed with first-match-wins semantics: the array order is the priority, and an element's position in the array is part of the configuration semantics;
+- The database auto-increment id of a collection element is not exposed externally; both the API and the export organize elements by array order.
+
+### Singleton Resources
+
+`intent_config`, `ai_cache_semantic_settings`, and `ai_context_settings` are singleton resources:
+
+- The whole system has a single fixed row (fixed id); a write is a single-row overwrite, with no collection concept;
+- The version number `yyyyMMddHHmmss` is generated internally by the Control Plane and embedded in the exported content; it is not exposed through the API;
+- Empty-table semantics differ per resource: when `intent_config` has never been published, `GET` returns 404 (an empty question set is the soft switch semantics of disabling classification); for the two settings tables, an empty table means "defaults not overridden" — `GET` returns the documented default values and never returns 404.
+
+Both forms still use the `xreq.Endpoint` registration and `iauth` authorization framework; only the write path inside the Manager changes from "incremental modification by id" to "full replacement / single-row overwrite". The authorization items correspond to `FeatureAICache`, `FeatureAIContext`, `FeatureTrafficMirror`, `FeatureAIIntent`, and `FeatureK8sPool` in `model/iauth/features.go`: the first four correspond to the four AI enhancement policy resources, and the last corresponds to the K8s Pool maintenance endpoints (whose sole writer is the K8s discovery component; see [Chapter 10: Provider and Cluster Design](./chapter10-provider-and-cluster.md)).
 
 ---
 

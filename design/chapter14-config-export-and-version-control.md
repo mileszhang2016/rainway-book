@@ -7,7 +7,7 @@
 - 壬远AI网关如何通过 InnerAPI 向数据面暴露运行时配置；
 - `VersionControlManager` 如何利用 MD5 签名与版本号实现增量同步；
 - `config_versions` 表在版本控制中的作用，以及下游如何基于该表判断配置是否变化；
-- 九类配置导出主题各自的职责与导出格式；
+- 十三类配置导出主题各自的职责与导出格式；
 - `mod-api-key` 导出时采用的批量预加载与内存回溯优化手段；
 - Conf Agent 如何拉取配置并与 BFE 热加载机制衔接；
 - 一条配置从数据库到 BFE 生效的完整链路。
@@ -166,9 +166,9 @@ flowchart LR
 
 ---
 
-## 九类配置导出主题
+## 十三类配置导出主题
 
-InnerAPI 当前共导出九类配置主题，详细信息见 `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`。它们分别对应 BFE 的不同模块或配置文件：
+InnerAPI 当前共导出十三类配置主题，详细信息见 `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`。它们分别对应 BFE 的不同模块或配置文件：
 
 | 接口路径                                 | 对应 Manager                | 配置主题              | 说明                                            |
 |------------------------------------------|-----------------------------|-----------------------|-------------------------------------------------|
@@ -181,6 +181,10 @@ InnerAPI 当前共导出九类配置主题，详细信息见 `ai-gateway-api/des
 | `/configs/mod-body-process`              | `ModBodyProcessManager`     | `mod_body_process`    | 请求体处理模块配置                              |
 | `/configs/rate-limit-policy`             | `RateLimitPolicyManager`    | `mod_ai_rate_limit`   | 限流策略配置                                    |
 | `/configs/ai-route`                      | `AIRouteExporter`           | `ai_route`            | AI 路由规则与绑定关系                           |
+| `/configs/ai-cache-rule`                 | `AICacheManager`            | `mod_ai_cache`        | AI 缓存规则配置（含顶层语义缓存全局块）         |
+| `/configs/ai-context-rule`               | `AIContextManager`          | `mod_ai_context`      | 上下文压缩规则配置（含顶层 Defaults 全局块）    |
+| `/configs/traffic-mirror-rule`           | `TrafficMirrorManager`      | `mod_traffic_mirror`  | 流量镜像规则配置                                |
+| `/configs/mod-ai-intent`                 | `IntentConfigManager`       | `intent_config`       | 意图配置（Data 即文件内容原样形态）             |
 
 其中 `gslb.<bfe_cluster>` 因为依赖 BFE 集群名参数，不同 BFE 集群拥有独立的版本线；`extra_files` 按文件名原样返回内容，不走版本控制流程。
 
@@ -207,9 +211,9 @@ type RouteRuleExportData struct {
 
 `certificate` 主题由 `model/iprotocol/exporter.go` 实现。导出时将所有证书/密钥文件路径写入配置，并在 `UpdateVersion` 时对路径做版本化替换（例如 `tls_conf_<version>/...`），便于 BFE 按版本加载。
 
-### mod-api-key、mod-body-process、rate-limit-policy、ai-route
+### 面向 BFE 模块的规则类主题
 
-这四个主题面向 BFE 的 AI 专用模块，导出逻辑集中在 `model/imods/` 与 `model/rate_limit_policy/` 下。其中 `mod-api-key` 的配置量最大、关联关系最复杂，因此采用了专门的性能优化，将在下一节详细说明。
+`mod_api_key_rule`、`mod_body_process`、`mod_ai_rate_limit`、`ai_route`、`mod_ai_cache`、`mod_ai_context`、`mod_traffic_mirror`、`intent_config` 等主题面向 BFE 的 AI 专用模块，导出逻辑集中在 `model/imods/`、`model/rate_limit_policy/` 与各规则域 Manager 下。其中 `mod-api-key` 的配置量最大、关联关系最复杂，因此采用了专门的性能优化，将在下一节详细说明。
 
 ---
 
@@ -363,7 +367,7 @@ Conf Agent 接收到 `Data: null` 后跳过本次写入与热加载；当管理�
 - InnerAPI 是控制面向数据面暴露运行时配置的只读接口，路径前缀为 `/inner-api/v1`；
 - `VersionControlManager` 为每个配置主题统一完成 MD5 签名计算与版本号生成，签名计算前会先将版本号置零，避免版本号变化干扰内容比较；
 - `config_versions` 表按主题记录配置签名与版本号的映射关系，是增量同步的依据；
-- 当前 InnerAPI 共导出九类配置主题，分别对应 BFE 的 Server Data、GSLB、Cluster Table、证书、附加文件、`mod_ai_token_auth`、`mod_body_process`、`mod_ai_rate_limit` 与 `mod_ai_route`；
+- 当前 InnerAPI 共导出十三类配置主题，分别对应 BFE 的 Server Data、GSLB、Cluster Table、证书、附加文件、`mod_ai_token_auth`、`mod_body_process`、`mod_ai_rate_limit`、`mod_ai_route`、AI 缓存、上下文压缩、流量镜像与意图配置；
 - `mod-api-key` 通过批量预加载与内存回溯优化，解决了跨表查询与 Entity 层级回溯带来的性能问题；
 - Conf Agent 以拉取方式获取配置，通过版本目录、Symlink 切换与 BFE `/reload/{module}` 接口完成配置热加载；
 - 拉取式设计使控制面与数据面解耦，支持跨网络区域部署与快速故障恢复。

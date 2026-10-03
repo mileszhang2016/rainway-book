@@ -8,7 +8,7 @@ Through this chapter, readers will understand the actual code organization of th
 - The structure, registration flow, and authorization mounting points of the unified `xreq.Endpoint` abstraction;
 - The roles and execution order of the five middleware components: Recovery, Logger, CORS, Product Probe, and User Probe;
 - How OpenAPI v1 aggregates the Endpoints of each business sub-package through the `endpoints()` merge function;
-- How InnerAPI v1 exports the nine categories of configuration required by the BFE Data Plane;
+- How InnerAPI v1 exports the thirteen categories of configuration required by the BFE Data Plane;
 - The concrete implementations of parameter binding, permission validation, and the unified response format in the interface layer;
 - Complete Action examples for one OpenAPI endpoint and one InnerAPI endpoint.
 
@@ -32,6 +32,8 @@ ai-gateway-api/endpoints/
 │   └── user_probe.go         # User/Token authentication
 ├── openapi_v1/               # Management Plane OpenAPI (prefix /open-api/v1)
 │   ├── endpoints.go          # Merges Endpoints from all sub-packages
+│   ├── ai_cache/             # /ai-cache-rules, /ai-cache-semantic-settings
+│   ├── ai_context/           # /ai-context-rules, /ai-context-settings
 │   ├── api_key/              # /api-keys
 │   ├── auth/                 # /auth, /meta
 │   ├── certificate/          # /certificates
@@ -39,6 +41,7 @@ ai-gateway-api/endpoints/
 │   ├── entity/               # /entities
 │   ├── entity_type/          # /entity-types
 │   ├── global_route_rules/   # /global-route-rules
+│   ├── intent_config/        # /intent-config
 │   ├── model_price/          # /model-prices
 │   ├── operation_log/        # /operation-logs
 │   ├── product_cluster/      # /clusters
@@ -47,18 +50,24 @@ ai-gateway-api/endpoints/
 │   ├── route/                # /expression/verify
 │   ├── route_tables/         # /route-tables
 │   ├── subcluster/           # Not currently registered
-│   └── traffic/              # Not currently registered
+│   ├── traffic/              # Not currently registered
+│   └── traffic_mirror/       # /traffic-mirror-rules
 └── innerapi_v1/              # Data Plane InnerAPI (prefix /inner-api/v1)
     ├── endpoints.go          # Unified registration of export endpoints
+    ├── ai_cache/             # /configs/ai-cache-rule
+    ├── ai_context/           # /configs/ai-context-rule
     ├── ai_route/
     ├── extra_file/
     ├── gslb_data/
+    ├── intent_config_export/ # /configs/mod-ai-intent
+    ├── k8s_pools/            # /k8s_pools/* (K8s discovery component maintenance endpoints)
     ├── mod_api_key/
     ├── mod_body_process/
     ├── protocol/
     ├── quota_reset/            # /quota/trigger-reset
     ├── rate_limit_policy/
     ├── server_data/
+    ├── traffic_mirror/       # /configs/traffic-mirror-rule
     └── export_util/
 ```
 
@@ -415,6 +424,8 @@ var Endpoints = []*xreq.Endpoint{
 
 The top-level `endpoints()` function concatenates these slices into one large `[]*xreq.Endpoint` via `merge` and then registers them uniformly. Currently, the slices exported by sub-packages such as `product_pool`, `subcluster`, `traffic`, `bfe_cluster`, and `domain` are empty, meaning the corresponding endpoints are not actually registered, but the code structure is retained for future enablement on demand. This design means that adding or retiring a business module only requires modifying the merge list in `endpoints()`, without touching the route registration loop.
 
+The `ai_cache`, `ai_context`, `traffic_mirror`, and `intent_config` sub-packages export the rule collection endpoints `/ai-cache-rules`, `/ai-context-rules`, `/traffic-mirror-rules` and the singleton endpoints `/intent-config`, `/ai-cache-semantic-settings`, `/ai-context-settings` respectively. Their request forms are collection-level `GET`/`PUT` or singleton single-row overwrite (for the two resource forms, see [Chapter 6: Control Plane Core Design](../design/chapter06-control-plane-design.md)).
+
 ---
 
 ## InnerAPI v1 Export Endpoint Registration
@@ -450,7 +461,7 @@ func RegisterRouter(router *mux.Router) *mux.Router {
 }
 ```
 
-Unlike OpenAPI, the InnerAPI subtree mounts only `McUserProbe`, not `McProductProbe`, because the Data Plane does not need to distinguish product line context when pulling configuration. Currently, InnerAPI registers 10 endpoints in total: nine categories of configuration export endpoints plus one quota trigger-reset endpoint:
+Unlike OpenAPI, the InnerAPI subtree mounts only `McUserProbe`, not `McProductProbe`, because the Data Plane does not need to distinguish product line context when pulling configuration. Currently, the InnerAPI configuration export endpoints cover 13 topics, plus one quota trigger-reset endpoint and four K8s Pool maintenance endpoints:
 
 | Endpoint Path | Config Topic | Description |
 |---|---|---|
@@ -463,7 +474,13 @@ Unlike OpenAPI, the InnerAPI subtree mounts only `McUserProbe`, not `McProductPr
 | `/configs/mod-body-process` | `mod_body_process` | Request body processing configuration |
 | `/configs/rate-limit-policy` | `mod_ai_rate_limit` | Rate limit policy configuration |
 | `/configs/ai-route` | `ai_route` | AI route configuration |
+| `/configs/ai-cache-rule` | `mod_ai_cache` | AI cache rule configuration |
+| `/configs/ai-context-rule` | `mod_ai_context` | Context compression rule configuration |
+| `/configs/traffic-mirror-rule` | `mod_traffic_mirror` | Traffic mirror rule configuration |
+| `/configs/mod-ai-intent` | `intent_config` | Intent configuration |
 | `/quota/trigger-reset` | None | Manually trigger a quota period reset; returns `{"status":"ok"}` |
+
+The `ai_cache`, `ai_context`, `traffic_mirror`, and `intent_config_export` sub-packages register the AI cache, context compression, traffic mirror, and intent configuration export endpoints in the table above; the `k8s_pools` sub-package registers the K8s Pool maintenance endpoints (`PUT /k8s_pools/{name}/instances`, `GET /k8s_pools`, `GET/DELETE /k8s_pools/{name}`, authorized by `FeatureK8sPool`), whose sole writer is the K8s discovery component — see [Chapter 10: Provider and Cluster Design](../design/chapter10-provider-and-cluster.md) for details.
 
 All InnerAPI export endpoints support the `version` query parameter, which is parsed by `export_util.NewExportFromReq` and then handed to the corresponding Manager's `ConfigExport` method. When the requested version matches the current version, `Data: nil` is returned to avoid redundant distribution.
 
@@ -713,7 +730,7 @@ The following table summarizes the core code locations covered in this chapter a
 - `xreq.Endpoint` unifies path, method, Handler, authorization, and custom registration, and is the core abstraction of the interface layer. Business Actions are converted to `Endpoint.Handler` via `xreq.Convert`.
 - Recovery, Logger, and CORS act as global middleware applying to all APIs; Product Probe and User Probe act as route-subtree middleware serving OpenAPI and InnerAPI respectively, where User Probe handles identity resolution and each Endpoint's `Authorizer` handles fine-grained permission validation.
 - OpenAPI v1 merges the `[]*xreq.Endpoint` exported by each sub-package via the `merge` function and registers them under `/open-api/v1`.
-- InnerAPI v1 registers nine categories of configuration export endpoints through a fixed slice; all export endpoints support `version`-based incremental synchronization, implemented jointly by `export_util.NewExportFromReq` and `model/iversion_control`. It also registers `POST /quota/trigger-reset` for manually triggering a quota period reset.
+- InnerAPI v1 registers thirteen categories of configuration export endpoints through a fixed slice; all export endpoints support `version`-based incremental synchronization, implemented jointly by `export_util.NewExportFromReq` and `model/iversion_control`. It also registers `POST /quota/trigger-reset` for manually triggering a quota period reset.
 - OpenAPI provides the `GET /open-api/v1/operation-logs` operation log query endpoint, authorized by `FeatureOperationLog + ActionReadAll`, returning `{list, pagination}`.
 - Parameter binding is done by `xreq.Bind*`, supporting struct tag validation and custom `Validator`; permission validation is mounted on each Endpoint via `iauth.FA`; the unified response is completed by `xreq.Result` and `xreq.Render`, returning `{ErrNum, Data, ErrMsg}` uniformly to the outside.
 

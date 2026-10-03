@@ -93,17 +93,23 @@ The Cluster resource carries two EPP-related fields:
 | `balance_mode` | string | Cluster balancing mode: `WRR` (default, BFE local weighted round robin) or `EPP` (the EPP scheduler takes over backend selection). This field is the sole source of truth for EPP mode |
 | `epp_config` | object | EPP scheduling configuration in a simplified user-facing form (see below). Required and effective when `balance_mode=EPP`; optional when `balance_mode=WRR` — if provided it is retained and format-validated, but not compiled and not exported |
 
-`epp_config` does not expose the plugin declaration details of the llm-d `EndpointPickerConfig` directly; instead it expresses intent as "scheduling profile + a few first-class tuning parameters":
+`epp_config` does not expose the plugin declaration details of the llm-d `EndpointPickerConfig` directly; instead it expresses intent as "load profile + a few first-class tuning parameters". The parameters fall into four groups — load profile, admission watermarks, bad-backend eviction, and capacity queuing — and affinity strength separately controls the weights of the affinity scorers:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `scheduling_profile` | `balanced` | Scheduling profile: `latency-first` (low latency first, queue weight highest) / `balanced` / `throughput-first` (throughput first, KV cache weight highest) |
-| `cache_affinity` | unset (follows the profile) | Scorer weight override: `low` / `medium` / `high`; when not set explicitly it follows `scheduling_profile`, and when set explicitly it overrides its weights |
+| `load_profile` | `balanced` | Load profile: `queue-first` (queue first, queue scorer weight highest) / `balanced` / `kv-first` (KV cache first, kv scorer weight highest) |
+| `affinity` | `medium` | Affinity strength: `off` / `low` / `medium` / `high`, mapped to affinity scorer weights 0 / 0.3 / 0.6 / 1.0; when `off`, prefix-cache-scorer and session-affinity-scorer are not injected (even if the corresponding feature switches are on) |
 | `prefix_cache_affinity` | `true` | Prefix cache affinity switch (soft affinity) |
 | `session_affinity_enabled` | `false` | Session affinity switch |
 | `session_affinity_header` | - | Request header carrying the session id; required when `enabled=true`, the two appear in pairs |
-| `kv_cache_utilization_max` | `0.9` | Endpoint filter threshold `(0,1]`: endpoints whose KV cache utilization exceeds this value are filtered out |
-| `flow_control` | - | Flow control parameters: `max_requests` (unlimited by default, `-1` for explicitly unlimited), `queue_ttl` (seconds), `no_endpoint_queue_ttl` (seconds), `enable_eviction`; the compiled artifact always carries an explicit priority 0 band, so the global `max_requests` is not silently truncated by the hidden band defaults (5000 concurrency / 1GB memory) |
+| `kv_cache_utilization_max` | `0.9` | Admission watermark, endpoint filter threshold `(0,1]`: endpoints whose KV cache utilization exceeds this value are filtered out |
+| `waiting_queue_max` | `0` (disabled) | Admission watermark, waiting queue length threshold `≥0`: effective when greater than 0, utilization-filter appends a waiting-queue filter condition |
+| `running_requests_max` | `0` (disabled) | Admission watermark, running requests threshold `≥0`: effective when greater than 0, utilization-filter appends a running-requests filter condition |
+| `fallback_on_empty` | `false` | Admission watermark supplement: whether to fall back and admit when all endpoints are filtered; passed through to utilization-filter's fallbackOnEmpty |
+| `metrics_staleness_threshold_ms` | `200` | Bad-backend eviction threshold (milliseconds, `>0`): a backend whose metric scraping fails consecutively and whose data is stale beyond this value is evicted as a bad backend (about 4 consecutive metric scrape failures) |
+| `flow_control` | - | Capacity queuing parameters: `max_requests` (unlimited by default, `-1` for explicitly unlimited), `queue_ttl` (seconds), `no_endpoint_queue_ttl` (seconds, follows `queue_ttl` by default), `enable_eviction` (only `false` accepted); the compiled artifact always carries an explicit priority 0 band, so the global `max_requests` is not silently truncated by the hidden band defaults (5000 concurrency / 1GB memory) |
+
+`epp_config` is parsed with strict field parsing: a request body carrying undefined fields is rejected with 422 directly.
 
 Value rules of the two fields:
 
@@ -196,16 +202,18 @@ The compilation rules from the simplified configuration to `EndpointPickerConfig
 
 | Simplified field | Compiled artifact |
 |------------------|-------------------|
-| Fixed part | Injects the `cluster-table-discovery` endpoint discovery plugin (clusterName taken from this Cluster), `utilization-filter` (threshold from `kv_cache_utilization_max`), two scorers `kv-cache-utilization-scorer` + `queue-scorer`, the `max-score-picker` picker, and `openai-parser` |
-| `scheduling_profile` → scorer weights (kv, queue) | `latency-first` → (0.2, 1.0); `balanced` → (1.0, 0.5); `throughput-first` → (1.0, 0.2) |
-| `cache_affinity` → scorer weights (overrides the profile when set explicitly) | `low` → (0.2, 1.0); `medium` → (0.6, 0.6); `high` → (1.0, 0.2) |
-| `prefix_cache_affinity=true` | A `prefix-cache-scorer` is appended to the scorer chain (weight fixed at 1.0) |
-| `session_affinity_enabled=true` | A `session-affinity-scorer` is appended to the scorer chain (strategy=session_id, session id taken from `session_affinity_header`, weight fixed at 1.0) |
-| `flow_control` present | Generates the `flowControl` section (seconds converted to Go duration), appends `flowControl` to `featureGates`; when `max_requests` is unset or `-1`, the `maxRequests` field is not generated |
+| Fixed part | Injects the `cluster-table-discovery` endpoint discovery plugin (clusterName taken from this Cluster), two scorers `kv-cache-utilization-scorer` + `queue-scorer`, the `max-score-picker` picker, and `openai-parser` |
+| `load_profile` → scorer weights (kv, queue) | `queue-first` → (0.2, 1.0); `balanced` → (0.6, 0.6); `kv-first` → (1.0, 0.2) |
+| `affinity` → affinity scorer weights | `off` → not injected; `low` → 0.3; `medium` → 0.6; `high` → 1.0 (prefix-cache-scorer and session-affinity-scorer share the same weight) |
+| utilization-filter conditions | Always contains `kv-cache-utilization` (threshold from `kv_cache_utilization_max`); `waiting-queue` / `running-requests` are appended only when the corresponding threshold is greater than 0; `fallback_on_empty` is passed through as fallbackOnEmpty |
+| Bad-backend eviction | `saturation-detector` (utilization-detector type) is always injected: `kvCacheUtilThreshold` shares the same source as the filter's KV threshold, `queueDepthThreshold` takes `waiting_queue_max` (5 when not enabled), `metricsStalenessThreshold` takes `metrics_staleness_threshold_ms`, `stalenessPolicy=ignore`; this plugin does not enter the schedulingProfiles scoring chain and is referenced jointly by utilization-filter and flow-control backpressure |
+| `prefix_cache_affinity=true` | A `prefix-cache-scorer` is appended to the scorer chain (weight taken from the `affinity` mapping) |
+| `session_affinity_enabled=true` | A `session-affinity-scorer` is appended to the scorer chain (strategy=session_id, session id taken from `session_affinity_header`, weight taken from the `affinity` mapping) |
+| `flow_control` | The `flowControl` section is always emitted (including the `saturationDetector.pluginRef` reference and the priority 0 band, seconds converted to Go duration); `flowControl` is appended to `featureGates` only when `flow_control` is configured; when `max_requests` is unset or `-1`, the global `maxRequests` field is not generated, and `enable_eviction` is not emitted |
 
 A key note on flow-control compilation: all EPP requests run in the priority 0 band, so the compiled artifact always carries an explicit band 0. llm-d falls back to hidden defaults for unconfigured bands (5000 concurrency / 1GB memory), while the global limit and band limits are enforced independently (hasCapacity checks both), so omitting the band would silently truncate a global `max_requests` above 5000. When `max_requests` is set explicitly, band 0 mirrors it; when it is unset or `-1`, the global `maxRequests` field is not generated, but band 0 is still emitted explicitly (10000 concurrency, 5Gi memory), keeping the capacity deterministic and auditable.
 
-Affinity scorers are feature switches (on/off + fixed weight 1.0), orthogonal to the profile weights: the profile only tunes the weights of the two base scorers (kv, queue).
+The weights of affinity scorers are uniformly mapped from the `affinity` strength and are orthogonal to `load_profile`: `load_profile` only tunes the weights of the two base scorers (kv, queue); when `affinity=off`, neither affinity scorer is injected even if `prefix_cache_affinity` / `session_affinity_enabled` are on.
 
 ### cluster_table Export: The Source for EPP to Discover Inference Backends
 
@@ -234,7 +242,7 @@ An EPP-mode Cluster exports `GslbBasic` in server_data_conf:
 
 `EndpointPickerConfig` is an internal implementation abstraction of llm-d, containing plugin instances, the pluginRef reference graph, DAG layer ordering, and Quantity formats. Exposing it directly to users costs: users need to understand the whole plugin system to assemble a correct configuration, while AI Gateway API can only perform JSON Schema structural validation — reference errors surface only at EPP compile time.
 
-With the simplified "profile + tuning parameters" form: the user's expression cost drops from "assembling a plugin chain" to "pick a profile and fill in a few numbers"; the compiled artifact is deterministically generated from a code template, with reference integrity and DAG acyclicity guaranteed by construction, so the configuration is valid out of the box; the EPP-side consumption format stays unchanged. There is no advanced pass-through mode; if a need for custom plugin chains emerges in the future, it can be opened up then.
+With the simplified "load profile + tuning parameters" form: the user's expression cost drops from "assembling a plugin chain" to "pick a load profile, set an affinity strength, and fill in a few numbers"; the compiled artifact is deterministically generated from a code template, with reference integrity and DAG acyclicity guaranteed by construction, so the configuration is valid out of the box; the EPP-side consumption format stays unchanged. There is no advanced pass-through mode; if a need for custom plugin chains emerges in the future, it can be opened up then.
 
 ---
 
@@ -284,11 +292,12 @@ The assignment determines which Clusters this instance holds: Cells with the pri
 
 ### The Scheduling Plugin Chain
 
-The compiled `EndpointPickerConfig` defines each Cluster's scheduling pipeline. Plugins composed by profile include:
+The compiled `EndpointPickerConfig` defines each Cluster's scheduling pipeline. Plugins injected according to the parameter combination include:
 
 - **cluster-table-discovery**: endpoint discovery, whose data source is the cluster_table export;
-- **utilization-filter**: filters out endpoints whose KV cache utilization exceeds `kv_cache_utilization_max` (fail-closed: no candidate when all endpoints are filtered); when backend metrics are missing, the corresponding scores are neutralized (kv score treated as 1.0, the filter not applied) and scheduling degrades gracefully;
-- **kv-cache-utilization-scorer / queue-scorer**: base scoring items, with weights determined by the profile (and overridden by `cache_affinity`);
+- **utilization-filter**: filters out endpoints whose KV cache utilization exceeds `kv_cache_utilization_max` (fail-closed: no candidate when all endpoints are filtered); when `waiting_queue_max` / `running_requests_max` are enabled, the corresponding filter conditions are appended; when backend metrics are missing, the corresponding scores are neutralized (kv score treated as 1.0, the filter not applied) and scheduling degrades gracefully;
+- **saturation-detector** (utilization-detector type): the always-injected saturation detection plugin; the KV cache threshold shares the same source as utilization-filter, and metric staleness determination takes the bad-backend eviction threshold; it does not enter the schedulingProfiles scoring chain and is referenced jointly by utilization-filter and flow-control backpressure;
+- **kv-cache-utilization-scorer / queue-scorer**: base scoring items, with weights determined by `load_profile`;
 - **prefix-cache-scorer**: prefix cache affinity (soft affinity). The index is a per-endpoint LRU in EPP's local memory (written autonomously by the `approx-prefix-cache` producer), requiring no external storage such as Redis;
 - **session-affinity-filter / session-affinity-scorer**: session affinity. Binding state is likewise in EPP's local memory; the session id is parsed from the request header specified by `session_affinity_header`;
 - **max-score-picker**: takes the endpoint with the highest total weighted score; ties yield deterministically in rotation.
@@ -353,7 +362,7 @@ sequenceDiagram
 ## Chapter Summary
 
 - EPP intelligent scheduling solves the three limitations of WRR: no load awareness, no prefix cache affinity, and no session affinity; BFE delegates backend selection to ai-gateway-epp via gRPC ext_proc.
-- A Cluster's `balance_mode` (WRR/EPP) is the sole source of truth for EPP mode; `epp_config` uses a simplified "profile + tuning parameters" user-facing form, deterministically compiled into the llm-d `EndpointPickerConfig` at export time, valid out of the box.
+- A Cluster's `balance_mode` (WRR/EPP) is the sole source of truth for EPP mode; `epp_config` uses a simplified "load profile + tuning parameters" user-facing form, deterministically compiled into the llm-d `EndpointPickerConfig` at export time, valid out of the box.
 - `/epp-pool` statically registers the instance pool in singleton + full-replacement mode; the assigner automatically generates Cluster→instance-group assignments with greedy + deterministic tie-break, storing only the primary and expanding standby at read time, with automatic repair when dangling.
 - epp_data distributes the compiled configuration and the assignment full view merged in a single endpoint (version increment); all EPP instances share the same snapshot and self-match roles locally.
 - server_data_conf exports the ordered `EPPAddr` to BFE; when there is no valid assignment, a single Cluster degrades explicitly to WRR + error log without blocking the whole distribution.

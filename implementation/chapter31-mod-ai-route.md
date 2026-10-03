@@ -9,6 +9,8 @@
 - 理解 **apikey → entity → global** 三级路由表的匹配逻辑；
 - 了解 `targets` 加权选择与 `fallbacks` 降级流程的实现方式；
 - 理解 `mod_ai_route` 与 `mod_ai_token_auth` 在请求上下文上的协作关系；
+- 理解缓存命中短路对路由执行、日志字段与报表口径的影响；
+- 理解意图懒解析的触发时序（`req_ai_intent_in` 首次求值才分类）；
 - 熟悉模块暴露的监控指标。
 
 ## mod_ai_route 模块职责
@@ -632,6 +634,40 @@ mod_ai_route.NewModuleAiRoute(),
 
 若顺序颠倒，`mod_ai_route` 可能拿到空的 `ClientApiKey`，导致所有请求都走 miss 路径。因此，在新增或调整 AI 网关模块时，必须严格保持这一顺序。
 
+## 缓存命中短路与意图懒解析
+
+### 缓存查找在鉴权与路由之间
+
+`mod_ai_cache` 在 `bfe/bfe_modules/bfe_modules.go` 的 moduleList 中位于 `mod_ai_token_auth` 与 `mod_ai_route` 之间，同样注册在 `HandleFoundProduct` 回调点（`bfe/bfe_modules/mod_ai_cache/mod_ai_cache.go` 的 `cacheRequestHandler`）。`HandleFoundProduct` 阶段的执行顺序为：
+
+```
+mod_ai_token_auth（鉴权 / 配额绑定）
+  → mod_ai_cache（缓存查找，命中短路）
+  → mod_ai_route（规则求值）
+```
+
+`mod_ai_cache` 在精确命中（或语义命中）时返回 `BfeHandlerFinish` 与缓存响应，该回调点的后续模块不再执行，请求不进入 `ServeHTTPForAI()` 转发循环；未命中则返回 `BfeHandlerGoOn`，把 miss 上下文（缓存键、问题文本、规则）挂到请求上，留待 `HandleReadResponse` 阶段回写。
+
+### 命中短路对路由与下游的影响
+
+命中请求不再执行 `mod_ai_route`，由此产生以下可观测语义：
+
+- 请求上下文中不存在 `AiRouteResult`，访问日志中的路由命中字段（`ai_route_rule_hits`、`ai_target_model`）为空；
+- 下游报表判定缓存命中改用访问日志字段 `ai_cache_status=hit`（精确命中）/`hit_semantic`（语义命中），而不是路由字段；
+- `mod_ai_token_auth` 依据 `AiBasicInfo.AiCacheHit` 跳过 `HandleRequestFinish` 阶段的配额结算；
+- 缓存规则 `cond` 引用 `req_ai_intent_in` 时，加载期仅输出 WARN 不拒绝（`bfe/bfe_modules/mod_ai_cache/cache_rule_load.go`）：缓存查找先于路由执行，意图条件只在未命中路径参与求值，命中时懒解析不触发，引用意图条件会削弱缓存前移的收益。
+
+### 意图懒解析时序
+
+`mod_ai_intent` 不注册任何请求回调，其 `Init()` 仅调用 `bfe_basic.SetAiIntentResolver` 注入解析器与置信门限（`bfe/bfe_modules/mod_ai_intent/mod_ai_intent.go`）。意图分类的触发点是路由规则的条件求值：
+
+1. `routeFoundProductHandler` 调用 `routeTable.Search(apiKey, req)`；
+2. `RouteTable.Match` 按序对规则求值 `Cond`；
+3. 首次求值到 `req_ai_intent_in` 时，`bfe_basic` 通过注入的 resolver 调用决策服务（System One 协议 `POST /v1/systemone`，超时默认 300ms）完成分类；
+4. 分类结果写入 `AiBasicInfo.AiIntent` 并进入进程内 LRU 缓存，同请求内的后续条件求值直接复用；决策服务连续失败时熔断打开（默认失败阈值 5、探测间隔 5000ms），熔断期间 `req_ai_intent_in` 恒不匹配，流量回落后续规则。
+
+因此，不含意图条件的路由规则求值路径对决策服务零开销；缓存命中请求由于路由求值整体被短路，意图懒解析同样不触发。意图条件原语的完整语义与配置示例见[第十一章 AI 路由规则设计](../design/chapter11-ai-route-rules.md)的"语义路由与意图条件"一节。
+
 ## 监控项
 
 `mod_ai_route` 定义了 `ModuleAiRouteState`（`bfe/bfe_modules/mod_ai_route/mod_ai_route.go`）用于暴露请求级监控：
@@ -765,13 +801,14 @@ flowchart TD
     B --> C[findProduct 租户识别]
     C --> D[HandleFoundProduct]
     D --> E[mod_ai_token_auth 鉴权]
-    E --> F[mod_ai_rate_limit 限流]
-    F --> G[mod_ai_route 路由查找]
+    E --> CH{mod_ai_cache 缓存命中?}
+    CH -->|命中| HIT[返回缓存响应<br/>路由不执行]
+    CH -->|未命中| G[mod_ai_route 路由查找]
     G --> H{命中 AI 路由?}
     H -->|否| I[返回 404]
     H -->|是| J[ServeHTTPForAI 转发]
     J --> K[加权选择 target]
-    K --> L[aiClusterInvoke 转发]
+    K --> L[aiClusterInvoke 转发<br/>HandleAfterAITargetModel 校验 / 限流 / 压缩<br/>HandleForward 流量镜像]
     L --> M{成功?}
     M -->|否且可降级| N[尝试下一个 fallback]
     N --> L
@@ -800,7 +837,8 @@ flowchart TD
 `mod_ai_route` 是壬远 AI 网关数据面中承上启下的路由模块：
 
 - 它注册在 `HandleFoundProduct` 回调点，依赖 `mod_ai_token_auth` 写入的 `ClientApiKey` 进行路由查找；
-- 通过 `ApikeyRouteTableBindings` 实现了 **apikey → entity → global** 三级优先级路由，每张路由表内部再按规则顺序匹配条件表达式；
+- `mod_ai_cache` 位于鉴权与路由之间，缓存命中即短路返回，命中请求不执行路由查找，`ai_route_rule_hits`/`ai_target_model` 日志字段为空，报表改用 `ai_cache_status` 判定缓存命中；
+- 通过 `ApikeyRouteTableBindings` 实现了 **apikey → entity → global** 三级优先级路由，每张路由表内部再按规则顺序匹配条件表达式；意图分类由 `mod_ai_intent` 懒解析提供，在 `req_ai_intent_in` 首次求值时触发；
 - 配置文件采用 JSON DTO 与运行时结构分层设计，兼容 `route_rules`/`RouteRules` 与 `api_key`/`apikey` 等历史字段差异；
 - 配置加载阶段完成条件表达式编译与权重校验，保证启动与热加载时的配置正确性；
 - 热加载在校验完成后再原子替换内存路由表，失败不会影响当前运行中的规则；
@@ -821,7 +859,11 @@ flowchart TD
 - `bfe/bfe_basic/request_ai_route.go`
 - `bfe/bfe_server/reverseproxy.go`
 - `bfe/bfe_model_protocol/`（协议适配层，`shouldTriggerFallback` 中的 ErrorNormalizer 挂钩来源）
+- `bfe/bfe_modules/mod_ai_cache/mod_ai_cache.go`、`cache_rule_load.go`、`request.go`（缓存查找与命中短路）
+- `bfe/bfe_modules/mod_ai_intent/mod_ai_intent.go`、`intent_resolve.go`、`decision_client.go`（意图懒解析）
 - `bfe/docs/zh_cn/sys_design/model_protocol_adapter.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
+- `bfe/docs/zh_cn/sys_design/mod_ai_intent.md`
+- `bfe/docs/zh_cn/sys_design/ai_cache.md`
 - `bfe/docs/zh_cn/modules/mod_ai_route/mod_ai_route.md`
 - `bfe/docs/zh_cn/configuration/mod_ai_route/ai_route.data.md`

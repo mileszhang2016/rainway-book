@@ -8,13 +8,14 @@ In an AI gateway scenario, the forwarding target of a request is determined enti
 - Understand the three-level organization of AI route tables: Global / Entity / API-Key;
 - Master the data model, validation rules, and lifecycle consistency of the `route_rules` table;
 - Learn how AI route rules are exported to BFE, including binding order and file format;
+- Master the semantics of the `req_ai_intent_in` intent condition primitive and a complete example of route rules consuming intent;
 - Master the design and configuration of Fallback and the default route.
 
 ## Where AI Route Rules Sit in the Request Processing Pipeline
 
 In AI gateway mode, BFE handles requests through a dedicated `ServeHTTPForAI()` path. This path still calls `findProduct()`, but unlike traditional BFE, which matches a product by hostname, the AI gateway scenario configures a default product line in the host table (`defaultProduct`, corresponding to the Control Plane's `AIRouteInnerProductName`). Therefore, `findProduct()` falls back to that default product, which is used only to load the module configuration context of that product line; **traditional product-level BFE route rules are not used to select the target Cluster**. The final model and cluster a request is forwarded to is determined entirely by the `mod_ai_route` module based on AI route rules.
 
-AI route rules are executed at the `HandleFoundProduct` stage, after `mod_ai_token_auth` authentication and before `mod_ai_rate_limit` rate limiting. Each rule contains:
+AI route rules are executed at the `HandleFoundProduct` stage, after `mod_ai_token_auth` authentication and `mod_ai_cache` cache lookup, and before `mod_ai_rate_limit` rate limiting. Each rule contains:
 
 - A match condition `Cond`;
 - One or more `targets` (cluster + model + weight);
@@ -25,11 +26,12 @@ flowchart LR
     Client -->|HTTPS| BFE[BFE Data Plane]
     BFE --> findProduct[findProduct\nfalls back to default product line]
     findProduct --> mod_auth[mod_ai_token_auth<br/>auth / quota]
-    mod_auth --> mod_route[mod_ai_route<br/>AI route rules]
+    mod_auth --> mod_cache[mod_ai_cache<br/>cache lookup, short-circuit on hit]
+    mod_cache --> mod_route[mod_ai_route<br/>AI route rules]
     mod_route -->|targets / fallbacks| Backend[Backend AI services]
 ```
 
-The diagram above shows the request pipeline in AI gateway mode: product identification falls back to the default product line, which serves only the middleware and configuration context; the actual forwarding target is determined by AI route rules.
+The diagram above shows the request pipeline in AI gateway mode: product identification falls back to the default product line, which serves only the middleware and configuration context; after authentication the cache is looked up first — a hit short-circuits and returns, and only on a miss do AI route rules run to determine the forwarding target.
 
 ## Three-Level AI Route Tables: Global / Entity / API-Key
 
@@ -225,6 +227,73 @@ AI route rules keep their lifecycle consistent with that of API-Keys / Entities:
 | Neither API-Key nor Entity has a route table configured | Bound only to the Global Route Table (if enabled) |
 | Global Route Table disabled | No global fallback; requests may end up with no rule to match |
 | Referenced Cluster deleted | Cluster deletion fails validation; references must be removed or rules deleted first |
+
+## Semantic Routing and Intent Conditions
+
+Beyond conventional request-feature primitives (such as `req_host_in`, `req_body_json_in`), the `cond` of AI route rules also supports the intent condition primitive `req_ai_intent_in`, enabling semantic routing based on the semantic content of requests. The primitive is defined as `PrimitiveAiIntentIn` in `bfe/bfe_basic/condition/primitive.go`, with the signature:
+
+```
+req_ai_intent_in(String question_name, String value_list [, Float min_confidence])
+```
+
+Parameter semantics:
+
+- `question_name`: the intent question name, corresponding to a question configured in `intent_questions.data`;
+- `value_list`: the list of candidate answers, with multiple answers separated by `|` (following the BFE `*_in` primitive convention);
+- `min_confidence`: an optional confidence floor. When omitted, the question-level `MinConfidence` is used (default 0.6); an explicit 0 means no confidence check — any answer matches.
+
+Example:
+
+```
+req_ai_intent_in("task_type", "test_writing|doc_writing", 0.9)
+```
+
+This means: the condition matches when the classification result of the intent question `task_type` is `test_writing` or `doc_writing` with a confidence no lower than 0.9.
+
+### Lazy Resolution Timing
+
+Intent classification is provided by `mod_ai_intent` using a lazy-resolution design: the module `Init()` only injects the resolver and confidence threshold into `bfe_basic` (`bfe_basic.SetAiIntentResolver`), registering no request callbacks; the classification call to the decision service (System One protocol `POST /v1/systemone`, timeout default 300ms) is not triggered until rule evaluation first references `req_ai_intent_in` (typically during route rule evaluation in `mod_ai_route`). Requests whose route rules contain no intent conditions carry zero overhead. Classification results are cached in an in-process LRU cache and reused across multiple condition evaluations.
+
+This brings two semantic constraints:
+
+- When the decision service is unavailable, the confidence is below the threshold, or the question is not configured, `req_ai_intent_in` never matches (fail-safe semantics), and traffic naturally falls through to subsequent rules; referencing a nonexistent question name likewise never hits;
+- the cache lookup of `mod_ai_cache` runs before routing, so hit requests short-circuit and return directly — route rules (together with intent lazy resolution) never execute. Therefore, when a cache rule file's `cond` references `req_ai_intent_in`, load time only logs a WARN without rejecting it (see `bfe/bfe_modules/mod_ai_cache/cache_rule_load.go`), and the intent condition semantics only take effect on the miss path.
+
+Clients can also declare intent directly via the explicit intent header `X-AI-Intent: <question>=<option>` (multiple questions separated by semicolons), which takes priority over model classification and produces no decision service call on this path.
+
+### Complete Example of Route Rules Consuming Intent
+
+The Control Plane maintains the following route table per API-Key (Entity / API-Key levels likewise):
+
+```json
+{
+    "enabled": true,
+    "rules": [
+        {
+            "name": "writing-tasks-to-deepseek",
+            "cond": "req_ai_intent_in(\"task_type\", \"test_writing|doc_writing\", 0.9)",
+            "targets": [
+                {"cluster_name": "cluster_deepseek_a", "model": "deepseek-v4-pro", "weight": 100}
+            ],
+            "fallbacks": [
+                {"cluster_name": "cluster_deepseek_c", "model": "deepseek-v3.2"}
+            ]
+        },
+        {
+            "name": "default-route",
+            "cond": "default_t()",
+            "targets": [
+                {"cluster_name": "cluster_global", "model": "", "weight": 100}
+            ],
+            "fallbacks": []
+        }
+    ]
+}
+```
+
+The effect of this configuration: writing requests (intent classification confidence ≥ 0.9) are routed to `cluster_deepseek_a`, and all other requests take the `default-route` global fallback. When the decision service fails or classification confidence is insufficient, `req_ai_intent_in` does not match, and writing requests automatically fall back to the default route — semantic routing never causes a request to fail.
+
+The data model of the intent question set (`intent_questions.data`) and the decision service protocol are detailed in the mod_ai_intent section of [Chapter 7: Data Plane Forwarding Design](./chapter07-data-plane-design.md); the implementation timing is detailed in [Chapter 31: Implementing the AI Route Module](../implementation/chapter31-mod-ai-route.md).
 
 ## Binding Order and File Format Exported to BFE
 
@@ -466,6 +535,7 @@ This chapter introduced the AI route rule design of the Rainway AI Gateway:
 - AI route tables are divided into three levels — Global, Entity, and API-Key — with the binding order API-Key → Entity (bottom-up) → Global;
 - The `route_rules` table distinguishes levels via `type` and `owner`, and rules are stored as a JSON array;
 - The Control Plane validates rule names, conditions, weights, and Fallbacks at save time, and keeps the lifecycle consistent with that of API-Keys / Entities;
+- The `req_ai_intent_in` primitive supports semantic routing by intent classification results; intent lazy resolution is provided by `mod_ai_intent`, and when the decision service is unavailable it fails safe and falls through to subsequent rules;
 - AI route rules are exported via InnerAPI as `ai_route.json` and land in BFE as `ai_route.data`; `ApikeyRouteTableBindings` determines the lookup order;
 - Fallback provides ordered degradation when targets are unavailable, and the Global default route serves as the last-resort fallback; together they improve routing reliability.
 
@@ -477,7 +547,9 @@ This chapter introduced the AI route rule design of the Rainway AI Gateway:
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/00-common.md`
 - `bfe/docs/zh_cn/configuration/mod_ai_route/ai_route.data.md`
 - `bfe/docs/zh_cn/sys_design/mod_ai_route.md`
+- `bfe/docs/zh_cn/sys_design/mod_ai_intent.md`
 - `ai-gateway-api/model/shared/types.go`
 - `ai-gateway-api/model/route_rules/route_rules.go`
 - `ai-gateway-api/model/imods/ai_route_exporter.go`
 - `bfe/bfe_modules/mod_ai_route/mod_ai_route.go`
+- `bfe/bfe_basic/condition/primitive.go` (`PrimitiveAiIntentIn`)

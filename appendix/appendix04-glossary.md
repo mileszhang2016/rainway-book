@@ -33,12 +33,18 @@
 **操作日志（Operation Log）**
 ：平台写操作的只读审计记录，由配置变更自动产生，包含操作人、动作、资源、结果与变更摘要（before/after JSON，敏感字段脱敏）。
 
+**上下文压缩（Context Compression）**
+：按目标模型 token 预算对超大上下文做无损裁剪与规则改写两阶段压缩，fail-open。
+
 ## D
 
 **Dashboard（控制台）**
 ：壬远 AI 网关的 Web 管理界面，面向运维人员提供资源管理、消费者管理、路由管理、用户管理等功能。
 
 ## E
+
+**有效实例池（Effective Instance Pool）**
+：Provider 实际生效的后端实例集合（`k8s_pool` 模式下取 K8s 池镜像，否则取 `instance_pool`），控制面下游唯一消费口径。
 
 **Entity（组织）**
 ：调用方分组，可表达部门、团队或项目。每个 Entity 可挂载配额计划、限流策略、模型黑白名单与路由规则。
@@ -70,6 +76,9 @@
 **Instance Pool（实例池）**
 ：在 Provider 中定义的后端 AI 服务真实地址、端口与权重集合，供 Cluster 引用。控制台支持 IP 模式与服务商域名模式两种接入方式。
 
+**意图分类（Intent Classification）**
+：由决策服务对请求做语义分类（choice/score 问题），路由条件 `req_ai_intent_in` 按分类结果分流；支持显式意图头与置信度门限。
+
 ## J
 
 **均衡模式**
@@ -77,10 +86,16 @@
 
 ## K
 
+**K8s 实例池（K8s Pool）**
+：由 K8s 发现组件经 InnerAPI 维护的后端实例集合，Provider 可切换实例来源（`instance_pool` / `k8s_pool`），以有效实例池契约下发。
+
 **Key Affinity（Key 亲和性）**
-：基于 Redis 实现会话级 Key 亲和，同一 `ClientKeyId` 在一定时间内持续命中同一 Provider Key。
+：基于 Redis 实现会话级 Key 亲和，同一 `ClientKeyId` 在一定时间内持续命中同一 Provider Key；Redis 连接由 `bfe.conf` 的 `[AIKeyAffinity]` 配置段自持。
 
 ## M
+
+**物化视图（Materialized View）**
+：ClickHouse/StarRocks 侧按明细实时聚合的预计算表；ClickHouse 查询需 `GROUP BY` 维度 + `sum(指标)` 兜底（SummingMergeTree），StarRocks 异步 MV 随基表加列需重建。
 
 **Model Mapping（模型映射）**
 ：Cluster 中将用户请求的模型名映射为后端实际使用的模型名的机制。
@@ -126,6 +141,9 @@
 **Redis 唯一真实来源**
 ：配额余额、限流计数等运行时状态直接读写 Redis，管理面查询余额时不再维护数据库冷副本。
 
+**Routine Load**
+：Doris/StarRocks 持续消费 Kafka 写入表的导入任务；起始偏移 `OFFSET_BEGINNING` 保证任务创建前的消息不丢失。
+
 **Route Rule（路由规则）**
 ：AI 路由表中的单条规则，包含 `Cond` 命中条件、`targets` 目标列表与可选的 `fallbacks` 降级列表。
 
@@ -133,6 +151,9 @@
 ：Global / Entity / API-Key 三级 AI 路由规则集合，按 `apikey > entity > global` 优先级依次匹配。
 
 ## S
+
+**语义缓存（Semantic Cache）**
+：在精确匹配缓存之上按 embedding 向量相似度复用答案的缓存形态；依赖 embedding 服务与 Chroma 向量库，距离门限可配。
 
 **Session Key**
 ：Dashboard 登录后由 `/auth/session-keys` 生成的会话凭证，格式为 `Authorization: Session {session_key}`。
@@ -156,6 +177,9 @@
 
 **TPM（Tokens Per Minute）**
 ：每分钟 Token 消耗上限，采用滑动窗口计数。
+
+**流量镜像（Traffic Mirror）**
+：将命中的 AI 请求副本异步转发到影子集群的能力，用于版本灰度与影子验证；主路径不被阻塞。
 
 **RPM（Requests Per Minute）**
 ：每分钟请求次数上限，采用固定窗口计数。

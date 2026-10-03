@@ -11,6 +11,7 @@ Conf Agent（配置代理）是壬远 AI 网关控制面（Control Plane）与�
 - 解释普通配置任务、多 Key JSON 任务、附加文件任务三种拉取模式的适用场景。
 - 掌握版本化目录、符号链接（symlink）切换、旧版本清理的实现细节。
 - 识别失败回滚的关键路径与日志含义。
+- 理解标准 Reloader 为何只需配置即可接入新模块、无需改动代码。
 
 ## Conf Agent 目录结构
 
@@ -29,7 +30,7 @@ Conf Agent 的代码位于仓库根目录的 `conf-agent/` 下。按照功能可
 | `xhttp/` | HTTP 请求装饰器与错误处理。 |
 | `xlog/` | 结构化日志输出。 |
 
-一个典型的生产配置文件见 `conf-agent/conf/conf-agent.toml`，其中为 `server_data_conf`、`mod_ai_route`、`mod_ai_token_auth` 等模块分别定义了 `Reloader`。
+一个典型的生产配置文件见 `conf-agent/conf/conf-agent.toml`，其中为 `server_data_conf`、`cluster_conf`、`tls_conf` 以及 `mod_ai_route`、`mod_ai_token_auth`、`mod_ai_rate_limit`、`mod_body_process`、`mod_ai_cache`、`mod_traffic_mirror`、`mod_ai_intent`、`mod_ai_context` 等 11 个模块分别定义了 `Reloader`。
 
 ## Agent 与 Reloader 生命周期
 
@@ -207,6 +208,31 @@ func calculateVersion(fileContent []byte) (string, error) {
 }
 ```
 
+### 标准 Reloader：四个 AI 数据面模块
+
+`conf-agent.toml` 中的 `mod_ai_cache`、`mod_traffic_mirror`、`mod_ai_intent`、`mod_ai_context` 四个 Reloader 均为标准 `NormalFileTasks` 形态，与 `mod_ai_route` 的先例完全一致——每个 Reloader 只包含一个普通文件任务，外加 `BFEReloadAPI`、`ReloadFile` 与 `CopyFiles` 三个字段：
+
+```toml
+# conf-agent/conf/conf-agent.toml
+[Reloaders.mod_ai_cache]
+BFEReloadAPI    = "/reload/mod_ai_cache"
+ReloadFile      = "ai_cache.data"
+CopyFiles       = ["ai_cache.data", "mod_ai_cache.conf"]
+[[Reloaders.mod_ai_cache.NormalFileTasks]]
+ConfAPI         = "/inner-api/v1/configs/ai-cache-rule"
+ConfFileName    = "ai_cache.data"
+```
+
+其余三个 Reloader 与 ConfAPI 主题、BFE 热加载接口的对应关系如下：
+
+| Reloader | 数据文件（`ReloadFile` / `CopyFiles`） | ConfAPI | BFE 热加载接口 |
+|----------|----------------------------------------|---------|----------------|
+| `mod_traffic_mirror` | `mirror_rule.data` | `/inner-api/v1/configs/traffic-mirror-rule` | `/reload/mod_traffic_mirror` |
+| `mod_ai_intent` | `intent_questions.data` | `/inner-api/v1/configs/mod-ai-intent` | `/reload/mod_ai_intent` |
+| `mod_ai_context` | `context_rule.data` | `/inner-api/v1/configs/ai-context-rule` | `/reload/mod_ai_context` |
+
+这个例子同时说明了 Reloader 的扩展机制：`config.Init` 将 TOML 中的每个 `[Reloaders.xxx]` 段解析进 `ConfigFile.Reloaders` map（`config/config_file.go`），段名即 Reloader 名；`ConfDir` 与 `BFEReloadAPI` 缺省按段名推导（`BFEConfDir/xxx` 与 `/reload/xxx`），不显式填写即生效。prober、file_store、trigger 只面向 `ReloaderConfig` 结构体工作，对 Reloader 名毫无感知。因此接入一个配置形态为"一份数据文件 + 一个下发接口"的新 BFE 模块，只需在 `conf-agent.toml` 中增加一个 `[Reloaders.xxx]` 段，不需要任何 Go 代码改动；只有配置形态超出普通文件任务时（如 TLS 证书这类需要跟随 JSON Path 下载附加文件的场景），才需要扩展 prober 的任务类型。
+
 ### 多 Key JSON 任务：MultiKeyFileTask
 
 多 Key JSON 任务（Multi-Key JSON File Task）用于“一个 API 返回多个子配置”的场景，例如 `server_data_conf` 的一个接口同时返回 `host_rule.data`、`route_rule.data`、`cluster_conf.data`。实现位于 `conf_reload/prober/task_multip_key.go`。
@@ -260,7 +286,7 @@ type FileStore struct {
 ```
 
 - `ConfDir`：BFE 读取配置时使用的目录名，例如 `/home/work/bfe/conf/mod_ai_route`。
-- `CopyFiles`：每次生成新版本时需要从当前 `ConfDir` 复制到新版本的文件或目录，用于保留无法通过 API 获取的静态配置。例如 `mod_ai_route` 的 `mod_ai_route.conf` 通常由运维人员手写，不会从控制面下发，因此需要列入 `CopyFiles`。
+- `CopyFiles`：每次生成新版本时需要从当前 `ConfDir` 复制到新版本的文件或目录，用于保留无法通过 API 获取的静态配置。例如 `mod_ai_route` 的 `mod_ai_route.conf` 以及 `mod_ai_cache` 的 `mod_ai_cache.conf` 等模块静态文件通常由运维人员手写，不会从控制面下发，因此需要列入 `CopyFiles`。
 - `VersionKeepCount`：保留的版本目录数量，至少为 1。设置为 2 时，磁盘上通常同时存在当前版本和上一个版本，便于紧急回滚。
 
 ### 写入临时版本目录
@@ -418,7 +444,7 @@ func (trigger *Trigger) TriggerBFEReload(ctx context.Context, version string) er
 }
 ```
 
-注意 `ReloadFile` 的作用：某些 BFE 模块（如 `mod_ai_route`）要求 `path` 指向具体的数据文件而不是目录，因此配置中通过 `ReloadFile = "ai_route.data"` 指定最终文件路径。
+注意 `ReloadFile` 的作用：`mod_ai_route`、`mod_ai_cache`、`mod_traffic_mirror`、`mod_ai_intent`、`mod_ai_context` 等模块要求 `path` 指向具体的数据文件而不是目录，因此配置中通过 `ReloadFile`（如 `ai_route.data`、`ai_cache.data`）指定最终文件路径。
 
 ## 清理旧版本与失败回滚
 
@@ -570,6 +596,7 @@ Conf Agent 是壬远 AI 网关实现“控制面下发、数据面无中断加�
 - **配置拉取**：普通任务一对一拉取；多 Key JSON 任务从一个大 JSON 中拆分多个文件；附加文件任务通过 JSON Path 解析并下载证书等额外资源。
 - **版本化存储**：每次生成 `ConfDir_{version}` 临时目录，写入 `.conf-agent-version` 标记；切换时通过 symlink/junction 原子指向新版本。
 - **热加载触发**：`trigger` 调用 BFE monitor 端口的 `/reload/{module}`，并在 URL 中传递临时目录路径。
+- **标准 Reloader 扩展**：`[Reloaders.xxx]` 段名驱动 `ConfDir` 与 `/reload/{name}` 缺省推导，prober、file_store、trigger 对 Reloader 名零感知；接入"一份数据文件 + 一个下发接口"形态的新 BFE 模块只需增加配置段，无需 Go 代码改动。
 - **清理与回滚**：`VersionKeepCount` 控制保留版本数；失败发生在 symlink 切换前不会影响数据面，symlink 切换失败则保留 BFE 已加载版本并记录日志。
 - **健壮性与自愈**：切换软链前校验 `.conf-agent-version` 标记、store 失败清理半成品目录、清理阶段清扫无标记空目录；reloader 跨 store / trigger 两阶段累计连续失败计数，每 10 次输出 `reload keeps failing` 汇总 ERROR，恢复时输出 `reload recovered`。
 

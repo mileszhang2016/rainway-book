@@ -93,17 +93,23 @@ Cluster 资源携带两个与 EPP 相关的字段：
 | `balance_mode` | string | 集群均衡模式：`WRR`（默认，BFE 本地加权轮询）或 `EPP`（EPP 调度器接管后端选择）。该字段是 EPP 模式的唯一判定来源 |
 | `epp_config` | object | EPP 调度配置，采用简化用户形态（见下）。`balance_mode=EPP` 时必填并生效；`balance_mode=WRR` 时可选，传入则保留并做格式校验，但不编译、不导出 |
 
-`epp_config` 不直接暴露 llm-d `EndpointPickerConfig` 的插件声明细节，而是以"调度档位 + 少量一等公民调优参数"表达意图：
+`epp_config` 不直接暴露 llm-d `EndpointPickerConfig` 的插件声明细节，而是以"负载画像 + 少量一等公民调优参数"表达意图。参数分为四组：负载画像、准入水位、坏后端剔除与容量排队，另有亲和强度控制亲和类 scorer 的权重：
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `scheduling_profile` | `balanced` | 调度档位：`latency-first`（低延迟优先，队列权重最高）/ `balanced`（均衡）/ `throughput-first`（吞吐优先，KV cache 权重最高） |
-| `cache_affinity` | 缺省（跟随档位） | scorer 权重覆盖项：`low` / `medium` / `high`；未显式设置时跟随 `scheduling_profile`，显式设置后覆盖其权重 |
+| `load_profile` | `balanced` | 负载画像：`queue-first`（队列优先，queue scorer 权重最高）/ `balanced`（均衡）/ `kv-first`（KV cache 优先，kv scorer 权重最高） |
+| `affinity` | `medium` | 亲和强度：`off` / `low` / `medium` / `high`，映射为亲和 scorer 权重 0 / 0.3 / 0.6 / 1.0；取 `off` 时不注入 prefix-cache-scorer 与 session-affinity-scorer（即使对应特性开关开启） |
 | `prefix_cache_affinity` | `true` | 前缀缓存亲和开关（软亲和） |
 | `session_affinity_enabled` | `false` | 会话亲和开关 |
 | `session_affinity_header` | - | session id 来源请求头；`enabled=true` 时必填，二者成对出现 |
-| `kv_cache_utilization_max` | `0.9` | 端点过滤阈值 `(0,1]`：KV cache 利用率超过该值的端点被过滤 |
-| `flow_control` | - | 流控参数：`max_requests`（缺省不限，`-1` 显式不限）、`queue_ttl`（秒）、`no_endpoint_queue_ttl`（秒）、`enable_eviction`；编译产物始终显式下发 priority 0 band，全局 `max_requests` 不被隐藏 band 默认值（5000 并发 / 1GB 内存）静默截断 |
+| `kv_cache_utilization_max` | `0.9` | 准入水位，端点过滤阈值 `(0,1]`：KV cache 利用率超过该值的端点被过滤 |
+| `waiting_queue_max` | `0`（不启用） | 准入水位，等待队列长度阈值 `≥0`：大于 0 时启用，utilization-filter 追加 waiting-queue 过滤条件 |
+| `running_requests_max` | `0`（不启用） | 准入水位，在跑请求数阈值 `≥0`：大于 0 时启用，utilization-filter 追加 running-requests 过滤条件 |
+| `fallback_on_empty` | `false` | 准入水位补充项：全部端点被过滤时是否回退放行，透传 utilization-filter 的 fallbackOnEmpty |
+| `metrics_staleness_threshold_ms` | `200` | 坏后端剔除阈值（毫秒，`>0`）：后端指标抓取连续失败、数据过期超过该值即视为坏后端剔除（约连续 4 次指标抓取失败） |
+| `flow_control` | - | 容量排队参数：`max_requests`（缺省不限，`-1` 显式不限）、`queue_ttl`（秒）、`no_endpoint_queue_ttl`（秒，缺省跟随 `queue_ttl`）、`enable_eviction`（仅接受 `false`）；编译产物始终显式下发 priority 0 band，全局 `max_requests` 不被隐藏 band 默认值（5000 并发 / 1GB 内存）静默截断 |
+
+`epp_config` 按严格字段解析：请求体携带未定义的字段直接返回 422。
 
 两个字段的取值规则：
 
@@ -196,16 +202,18 @@ Authorization: Token <token>
 
 | 简化字段 | 编译产物 |
 |----------|----------|
-| 固定部分 | 注入 `cluster-table-discovery` 端点发现插件（clusterName 取本 Cluster）、`utilization-filter`（阈值取 `kv_cache_utilization_max`）、`kv-cache-utilization-scorer` + `queue-scorer` 两个 scorer、`max-score-picker` picker、`openai-parser` |
-| `scheduling_profile` → scorer 权重 (kv, queue) | `latency-first` → (0.2, 1.0)；`balanced` → (1.0, 0.5)；`throughput-first` → (1.0, 0.2) |
-| `cache_affinity` → scorer 权重（显式设置时覆盖档位） | `low` → (0.2, 1.0)；`medium` → (0.6, 0.6)；`high` → (1.0, 0.2) |
-| `prefix_cache_affinity=true` | scorer 链追加 `prefix-cache-scorer`（权重固定 1.0） |
-| `session_affinity_enabled=true` | scorer 链追加 `session-affinity-scorer`（strategy=session_id，session id 取自 `session_affinity_header`，权重固定 1.0） |
-| `flow_control` 存在时 | 生成 `flowControl` 段（秒数转为 Go duration），`featureGates` 追加 `flowControl`；`max_requests` 缺省或 `-1` 时不生成 `maxRequests` 字段 |
+| 固定部分 | 注入 `cluster-table-discovery` 端点发现插件（clusterName 取本 Cluster）、`kv-cache-utilization-scorer` + `queue-scorer` 两个 scorer、`max-score-picker` picker、`openai-parser` |
+| `load_profile` → scorer 权重 (kv, queue) | `queue-first` → (0.2, 1.0)；`balanced` → (0.6, 0.6)；`kv-first` → (1.0, 0.2) |
+| `affinity` → 亲和 scorer 权重 | `off` → 不注入；`low` → 0.3；`medium` → 0.6；`high` → 1.0（prefix-cache-scorer 与 session-affinity-scorer 共用同一权重） |
+| utilization-filter conditions | 恒含 `kv-cache-utilization`（阈值取 `kv_cache_utilization_max`）；`waiting-queue` / `running-requests` 仅对应阈值大于 0 时追加；`fallback_on_empty` 透传为 fallbackOnEmpty |
+| 坏后端剔除 | 恒注入 `saturation-detector` 插件（utilization-detector）：`kvCacheUtilThreshold` 与 filter 的 KV 阈值同源、`queueDepthThreshold` 取 `waiting_queue_max`（未启用时取 5）、`metricsStalenessThreshold` 取 `metrics_staleness_threshold_ms`、`stalenessPolicy=ignore`；该插件不进 schedulingProfiles 打分链，由 utilization-filter 与流控背压共同引用 |
+| `prefix_cache_affinity=true` | scorer 链追加 `prefix-cache-scorer`（权重取 `affinity` 映射值） |
+| `session_affinity_enabled=true` | scorer 链追加 `session-affinity-scorer`（strategy=session_id，session id 取自 `session_affinity_header`，权重取 `affinity` 映射值） |
+| `flow_control` | `flowControl` 段恒下发（含 `saturationDetector.pluginRef` 引用与 priority 0 band，秒数转为 Go duration）；`featureGates` 追加 `flowControl` 仅发生在配置了 `flow_control` 时；`max_requests` 缺省或 `-1` 时不生成全局 `maxRequests` 字段，`enable_eviction` 不下发 |
 
 流控编译的一个关键注记：EPP 的全部请求都运行在 priority 0 band，编译产物因此始终显式携带 band 0。llm-d 对未配置 band 会回退到隐藏默认值（5000 并发 / 1GB 内存），而全局限额与 band 限额独立生效（hasCapacity 同时校验两者），不显式下发就会把全局 `max_requests`（大于 5000 时）静默截断。`max_requests` 显式配置时 band 0 与之镜像；缺省或 `-1` 时全局 `maxRequests` 字段不生成，band 0 仍显式下发（10000 并发、5Gi 内存），容量确定且可审计。
 
-亲和类 scorer 是特性开关（开/关 + 固定权重 1.0），与档位权重正交：档位只调节 (kv, queue) 两个基础 scorer 的权重。
+亲和类 scorer 的权重由 `affinity` 强度统一映射，与 `load_profile` 正交：`load_profile` 只调节 (kv, queue) 两个基础 scorer 的权重；`affinity=off` 时即使 `prefix_cache_affinity` / `session_affinity_enabled` 开启也不注入两类亲和 scorer。
 
 ### cluster_table 导出：EPP 发现推理后端的来源
 
@@ -234,7 +242,7 @@ EPP 模式 Cluster 在 server_data_conf 中导出 `GslbBasic`：
 
 `EndpointPickerConfig` 是 llm-d 的内部实现抽象，包含插件实例、pluginRef 引用图、DAG 层序与 Quantity 格式。把它直接暴露给用户的代价是：用户需要理解整套插件体系才能正确组装配置，而 AI Gateway API 只能做 JSON Schema 结构校验，引用错误要到 EPP 编译期才暴露。
 
-采用"档位 + 调优参数"的简化形态后：用户表达成本从"组装插件链"降为"选一个档位、填几个数字"；编译产物由代码模板确定性生成，引用完整性与 DAG 无环由构造保证，配置出厂即合法；EPP 侧消费格式不变。本期不提供原样透传的高级模式，如未来出现自定义插件链需求再开放。
+采用"负载画像 + 调优参数"的简化形态后：用户表达成本从"组装插件链"降为"选一个负载画像、定一个亲和强度、填几个数字"；编译产物由代码模板确定性生成，引用完整性与 DAG 无环由构造保证，配置出厂即合法；EPP 侧消费格式不变。本期不提供原样透传的高级模式，如未来出现自定义插件链需求再开放。
 
 ---
 
@@ -284,11 +292,12 @@ assignment 决定本实例持有哪些 Cluster：primary 角色的 Cell 对外�
 
 ### 调度插件链
 
-编译后的 `EndpointPickerConfig` 定义每 Cluster 的调度管线，按档位组合的插件包括：
+编译后的 `EndpointPickerConfig` 定义每 Cluster 的调度管线，按参数组合注入的插件包括：
 
 - **cluster-table-discovery**：端点发现，数据源即 cluster_table 导出；
-- **utilization-filter**：过滤 KV cache 利用率超过 `kv_cache_utilization_max` 的端点（fail-closed：全部端点被过滤时无候选）；后端指标缺失时相应得分中性化（kv 得分视为 1.0、filter 不生效），调度正常退化；
-- **kv-cache-utilization-scorer / queue-scorer**：基础打分项，权重由档位（及 `cache_affinity` 覆盖）决定；
+- **utilization-filter**：过滤 KV cache 利用率超过 `kv_cache_utilization_max` 的端点（fail-closed：全部端点被过滤时无候选）；`waiting_queue_max` / `running_requests_max` 启用时追加对应条件的过滤；后端指标缺失时相应得分中性化（kv 得分视为 1.0、filter 不生效），调度正常退化；
+- **saturation-detector**（utilization-detector 类型）：恒注入的饱和度检测插件，KV cache 阈值与 utilization-filter 同源、指标过期判定取坏后端剔除阈值；它不进 schedulingProfiles 打分链，由 utilization-filter 与流控背压共同引用；
+- **kv-cache-utilization-scorer / queue-scorer**：基础打分项，权重由 `load_profile` 决定；
 - **prefix-cache-scorer**：前缀缓存亲和（软亲和）。索引为 EPP 本地内存中的 per-endpoint LRU（由 `approx-prefix-cache` producer 自主学习写入），无需 Redis 等外部存储；
 - **session-affinity-filter / session-affinity-scorer**：会话亲和。binding 状态同样为 EPP 本地内存，session id 从 `session_affinity_header` 指定的请求头解析；
 - **max-score-picker**：加权求和取最高总分端点，同分确定性轮转让位。
@@ -353,7 +362,7 @@ sequenceDiagram
 ## 本章小结
 
 - EPP 智能调度解决 WRR 无负载感知、无 prefix cache 亲和、无 session 亲和的三重局限；BFE 经 gRPC ext_proc 把后端选择委托给 ai-gateway-epp。
-- Cluster 的 `balance_mode`（WRR/EPP）是 EPP 模式的唯一判定来源；`epp_config` 采用"档位 + 调优参数"的简化用户形态，导出时确定性编译为 llm-d `EndpointPickerConfig`，出厂即合法。
+- Cluster 的 `balance_mode`（WRR/EPP）是 EPP 模式的唯一判定来源；`epp_config` 采用"负载画像 + 调优参数"的简化用户形态，导出时确定性编译为 llm-d `EndpointPickerConfig`，出厂即合法。
 - `/epp-pool` 以单例 + 全量替换模式静态登记实例池；分配器以贪心 + 确定性 tie-break 自动生成 Cluster→实例组分配，只存主、standby 读时展开，悬空时自动修复。
 - epp_data 单端点合并下发编译配置与分配全量视图（version 增量），所有 EPP 实例同一快照、本地自匹配角色。
 - server_data_conf 向 BFE 导出有序 `EPPAddr`；无有效分配时单 Cluster 显式降级为 WRR + error 日志，不阻塞整份下发。

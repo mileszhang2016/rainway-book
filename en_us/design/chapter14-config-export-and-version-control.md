@@ -7,7 +7,7 @@ Through this chapter, the reader will understand:
 - How Rainway AI Gateway exposes runtime configuration to the Data Plane via InnerAPI;
 - How `VersionControlManager` uses MD5 signatures and version numbers to implement incremental sync;
 - The role of the `config_versions` table in version control, and how downstream components determine whether configuration has changed based on this table;
-- The responsibilities and export formats of the nine configuration export topics;
+- The responsibilities and export formats of the thirteen configuration export topics;
 - The batch preloading and in-memory backtracking optimizations used when exporting `mod-api-key`;
 - How Conf Agent pulls configuration and connects with BFE's hot reload mechanism;
 - The complete path of a configuration from the database to taking effect in BFE.
@@ -166,9 +166,9 @@ The benefits of this mechanism are:
 
 ---
 
-## The Nine Config Export Topics
+## The Thirteen Config Export Topics
 
-InnerAPI currently exports nine configuration topics in total. Details are in `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`. They correspond to different BFE modules or configuration files:
+InnerAPI currently exports thirteen configuration topics in total. Details are in `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`. They correspond to different BFE modules or configuration files:
 
 | Interface path                           | Corresponding Manager       | Config topic          | Description                                         |
 |------------------------------------------|-----------------------------|-----------------------|-----------------------------------------------------|
@@ -181,6 +181,10 @@ InnerAPI currently exports nine configuration topics in total. Details are in `a
 | `/configs/mod-body-process`              | `ModBodyProcessManager`     | `mod_body_process`    | Request body processing module config               |
 | `/configs/rate-limit-policy`             | `RateLimitPolicyManager`    | `mod_ai_rate_limit`   | Rate limit policy config                            |
 | `/configs/ai-route`                      | `AIRouteExporter`           | `ai_route`            | AI route rules and bindings                         |
+| `/configs/ai-cache-rule`                 | `AICacheManager`            | `mod_ai_cache`        | AI cache rule config (including the top-level semantic cache global block) |
+| `/configs/ai-context-rule`               | `AIContextManager`          | `mod_ai_context`      | Context compression rule config (including the top-level Defaults global block) |
+| `/configs/traffic-mirror-rule`           | `TrafficMirrorManager`      | `mod_traffic_mirror`  | Traffic mirror rule config                          |
+| `/configs/mod-ai-intent`                 | `IntentConfigManager`       | `intent_config`       | Intent configuration (Data is the raw file content) |
 
 Among them, `gslb.<bfe_cluster>` depends on the BFE cluster name parameter, so different BFE clusters have independent version lines; `extra_files` returns content as-is by filename and does not go through the version control flow.
 
@@ -207,9 +211,9 @@ The generation flow: query all `domains`, `clusters`, and `products`, assemble t
 
 The `certificate` topic is implemented by `model/iprotocol/exporter.go`. On export, all certificate/key file paths are written into the configuration, and `UpdateVersion` performs a versioned replacement of the paths (e.g. `tls_conf_<version>/...`) to make it easy for BFE to load by version.
 
-### mod-api-key, mod-body-process, rate-limit-policy, ai-route
+### Rule-Type Topics for BFE Modules
 
-These four topics target BFE's AI-specific modules, and their export logic is concentrated under `model/imods/` and `model/rate_limit_policy/`. Among them, `mod-api-key` has the largest configuration volume and the most complex relationships, so it adopts dedicated performance optimizations, detailed in the next section.
+The `mod_api_key_rule`, `mod_body_process`, `mod_ai_rate_limit`, `ai_route`, `mod_ai_cache`, `mod_ai_context`, `mod_traffic_mirror`, `intent_config`, and similar topics target BFE's AI-specific modules. Their export logic is concentrated under `model/imods/`, `model/rate_limit_policy/`, and the respective rule-domain Managers. Among them, `mod-api-key` has the largest configuration volume and the most complex relationships, so it adopts dedicated performance optimizations, detailed in the next section.
 
 ---
 
@@ -363,7 +367,7 @@ After receiving `Data: null`, Conf Agent skips this write and hot reload; when a
 - InnerAPI is a read-only interface through which the Control Plane exposes runtime configuration to the Data Plane, with the path prefix `/inner-api/v1`;
 - `VersionControlManager` uniformly performs MD5 signature computation and version number generation for each configuration topic; before computing the signature, it first zeroes out the version number, preventing version number changes from interfering with content comparison;
 - The `config_versions` table records the mapping between configuration signatures and version numbers per topic, and is the basis of incremental sync;
-- InnerAPI currently exports nine configuration topics, corresponding to BFE's Server Data, GSLB, Cluster Table, certificates, extra files, `mod_ai_token_auth`, `mod_body_process`, `mod_ai_rate_limit`, and `mod_ai_route`;
+- InnerAPI currently exports thirteen configuration topics, corresponding to BFE's Server Data, GSLB, Cluster Table, certificates, extra files, `mod_ai_token_auth`, `mod_body_process`, `mod_ai_rate_limit`, `mod_ai_route`, AI cache, context compression, traffic mirror, and intent configuration;
 - `mod-api-key` solves the performance problems caused by cross-table queries and Entity hierarchy backtracking through batch preloading and in-memory backtracking;
 - Conf Agent pulls configuration and completes hot reload through version directories, Symlink switching, and BFE's `/reload/{module}` interface;
 - The pull-based design decouples the Control Plane from the Data Plane, and supports cross-network-region deployment and rapid failure recovery.
