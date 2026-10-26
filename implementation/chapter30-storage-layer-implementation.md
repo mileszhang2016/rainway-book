@@ -8,7 +8,7 @@
 - 基于 `github.com/didi/gendry` 的 SQL 构建与扫描机制。
 - DAO 层的通用代码模板、CRUD 函数命名与字段约定。
 - Storage 层如何面向 `model/*` 各子包暴露接口，并完成业务模型到数据库模型的转换。
-- 27 张表的 Storage 映射关系。
+- 34 张表的 Storage 映射关系。
 - 事务抽象 `itxn.TxnStorager` 与 `storage/rdb/txn` 的实现方式。
 - 无物理外键的设计考量与数据一致性保障思路。
 
@@ -25,13 +25,17 @@ storage/rdb/
 │       ├── internal/           # 通用 CRUD 封装与 gendry 适配
 │       ├── table_*.go          # 每张表对应一个 DAO 文件
 │       └── ...
+├── ai_cache/                   # AI 缓存规则 / 语义缓存设置 Storage
+├── ai_context/                 # 上下文压缩规则 / 全局设置 Storage
 ├── ai_route/                   # AI 路由规则 Storage
 ├── api_key/                    # API-Key / Token Storage
 ├── auth/                       # 认证/授权 Storage
 ├── basic/                      # 产品线 / BFE 集群 / 附加文件 Storage
 ├── cluster_conf/               # 集群 / 子集群 / 实例池 / LB 矩阵 / ModelPrice Storage
 ├── entity/                     # Entity / EntityType / Entity ID 序号分配 Storage
+├── iintent_config/             # 意图配置单例 Storage
 ├── ioperlog/                   # 操作日志 Storage
+├── k8s_pool/                   # K8s 实例池 Storage
 ├── model_price/                # 模型定价 Storage
 ├── protocol/                   # TLS 证书 Storage
 ├── provider/                   # Provider Storage
@@ -39,6 +43,7 @@ storage/rdb/
 ├── rate_limit_policy/          # RateLimitPolicy Storage
 ├── route_conf/                 # 域名 / 产品级路由规则 Storage（AI 网关模式下不用于 Cluster 选择）
 ├── route_rules/                # API-Key / Entity / Global 路由规则 Storage
+├── traffic_mirror/             # 流量镜像规则 Storage
 ├── txn/                        # 事务抽象实现
 └── version_control/            # 配置版本控制 Storage
 ```
@@ -280,9 +285,9 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 }
 ```
 
-## 27 张表的 Storage 映射关系
+## 34 张表的 Storage 映射关系
 
-根据 `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`，当前系统共 27 张持久化表，按业务模块划分如下。
+根据 `ai-gateway-api/design-docs/sys-design/数据库设计文档.md`，当前系统共 34 张持久化表，按业务模块划分如下。
 
 ### 基础配置（6 张表）
 
@@ -340,6 +345,20 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 |------|----------|------------|------|
 | `model_prices` | `table_model_prices.go` | `storage/rdb/model_price/model_price.go` | 模型定价 |
 
+### AI 增强策略与 K8s 实例池（7 张表）
+
+| 表名 | DAO 文件 | Storage 包 | 说明 |
+|------|----------|------------|------|
+| `ai_cache_rules` | `table_ai_cache_rules.go` | `storage/rdb/ai_cache/` | AI 缓存规则集合 |
+| `ai_cache_semantic_settings` | `table_ai_cache_semantic_settings.go` | `storage/rdb/ai_cache/` | 语义缓存全局设置单例 |
+| `ai_context_rules` | `table_ai_context_rules.go` | `storage/rdb/ai_context/` | 上下文压缩规则集合 |
+| `ai_context_settings` | `table_ai_context_settings.go` | `storage/rdb/ai_context/` | 上下文压缩全局设置单例 |
+| `traffic_mirror_rules` | `table_traffic_mirror_rules.go` | `storage/rdb/traffic_mirror/` | 流量镜像规则集合 |
+| `intent_config` | `table_intent_config.go` | `storage/rdb/iintent_config/` | 意图配置单例 |
+| `k8s_pools` | `table_k8s_pools.go` | `storage/rdb/k8s_pool/` | K8s 实例池，写入方唯一为 K8s 发现组件 |
+
+其中 `ai_cache_rules`、`ai_context_rules`、`traffic_mirror_rules` 为全量替换集合表（数组序即优先级），`intent_config`、`ai_cache_semantic_settings`、`ai_context_settings` 为单例行覆盖表，`k8s_pools` 的实例快照写入后在同一事务内扇出刷新引用 provider 的镜像与引用 cluster 的派生实例池（见 [第十章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)）。
+
 ### 操作日志与序号分配（2 张表）
 
 | 表名 | DAO 文件 | Storage 包 | 说明 |
@@ -355,7 +374,7 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 
 `entity_id_seq` 是 Entity ID 的序号分配表，仅有一行固定记录（`name='entity'`），`next_seq` 保存下一个可用序号。Entity ID 由此前的时间戳/随机数方案改为序列表分配（生成形如 `entity-{seq}` 的业务 ID），`TEntityIDSeqAllocate` 通过原子语句分配序号且已分配值不复用。
 
-注意：`route_cases` 表在 DDL 中定义，但当前代码中暂无对应 DAO 与 Storage 实现，因此实际由 DAO + Storage 覆盖的表为 26 张。
+注意：`route_cases` 表在 DDL 中定义，但当前代码中暂无对应 DAO 与 Storage 实现，因此实际由 DAO + Storage 覆盖的表为 33 张。
 
 ### DDL 与升级说明
 
@@ -363,23 +382,25 @@ func rateLimitPolicyDataToParam(param *rate_limit_policy.RateLimitPolicyParam) *
 
 新增可选字段通过加列方式演进，例如 `providers` 表在 v0.0.10 增加 `protocol_paths` TEXT 列（JSON，存"协议 → 上游 base path"映射），存量数据为 NULL 即未配置，无需数据迁移，应用层不读即忽略。
 
+`providers` 表的 K8s 实例供给能力同样以加列方式承载：`instance_source` VARCHAR(32) 列默认 `instance_pool`（取值 `instance_pool` / `k8s_pool`），`k8s_pool_name` VARCHAR(255) 列与 `k8s_instance_pool` JSON 列均可空，存量数据为 NULL 即缺省手工实例池模式，无需数据迁移，应用层经 `EffectiveInstancePool()` 契约按实例来源读取有效池（见[第十章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)）。
+
 从映射关系可以看出，Storage 子包的划分依据是业务域而非数据库表数量。例如 `cluster_conf` 子包同时管理 `clusters`、`sub_clusters`、`pools`、`lb_matrices` 四张表，因为这几张表共同服务于集群配置这一业务概念；`route_conf` 子包同时管理 `domains`、`route_basic_rules`、`route_advance_rules`、`route_default_rules`，因为它们共同组成产品级路由规则（AI 网关模式下不用于 AI 请求的 Cluster 选择，仅用于产品线识别上下文或非 AI 流量场景）。这种按业务域聚合的方式，让 Storage 接口更贴近模型层 Manager 的调用需求，避免了 Manager 同时依赖多个细粒度 Storage 的复杂局面。
 
 ## 报表存储实现（独立报表库）
 
-报表数据存放在独立于控制面库的报表库中（MySQL `bfe_report` 或 Doris `bfe_observability`），不在上述控制面 26 张表之列，DDL 由 ai-gateway-api 仓库单独发布（`db_ddl_report_mysql.sql`，schema-first）。查询侧实现为 `storage/mysqlreport` 与 `storage/dorisreport` 两个 Storage 包（DAO 惯例与 gendry 构建器同控制面一致），SQL 方言差异封在各自包内。
+报表数据存放在独立于控制面库的报表库中（MySQL `bfe_report`、Doris `bfe_observability` 或 ClickHouse / StarRocks 中同名库），不在上述控制面表之列，DDL 由 ai-gateway-api 仓库单独发布（`db_ddl_report_mysql.sql`，schema-first）。查询侧实现为 `storage/mysqlreport`、`storage/dorisreport`、`storage/clickhousereport`、`storage/starrocksreport` 四个 Storage 包（DAO 惯例与 gendry 构建器同控制面一致），SQL 方言差异封在各自包内。
 
 两张表的设计要点：
 
-- **明细表 `bfe_ai_request_log`**（89 列，与 Doris 同名同列）：唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model)` 与 Doris UNIQUE KEY 一致，log-reader 以 `INSERT ... ON DUPLICATE KEY UPDATE` 幂等覆盖写入；`ARRAY<STRUCT>` 类字段在 MySQL 侧为 JSON 列（仅明细展示用，不做过滤条件）；长文本列使用 TEXT 以规避 utf8mb4 行长度上限；按天 RANGE 分区滚动。
-- **聚合表 `bfe_ai_metrics_1m`**（37 维 + 24 指标，维度集合与 Doris 聚合表一致）：不设唯一键——维度列过多无法构成 InnoDB 唯一键，且幂等性由聚合 JOB 的事务语义保证。
+- **明细表 `bfe_ai_request_log`**（99 列，与 Doris 同名同列）：唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model)` 与 Doris UNIQUE KEY 一致，log-reader 以 `INSERT ... ON DUPLICATE KEY UPDATE` 幂等覆盖写入；`ARRAY<STRUCT>` 类字段在 MySQL 侧为 JSON 列（仅明细展示用，不做过滤条件）；长文本列使用 TEXT 以规避 utf8mb4 行长度上限；按天 RANGE 分区滚动。
+- **聚合表 `bfe_ai_metrics_1m`**（40 维 + 24 指标，维度集合与 Doris / ClickHouse / StarRocks 聚合表一致）：不设唯一键——维度列过多无法构成 InnoDB 唯一键，且幂等性由聚合 JOB 的事务语义保证。
 
 MySQL 形态的两个后台 JOB（`storage/mysqlreport/job.go`，Doris 形态不启动）：
 
 - **分钟聚合 JOB**：`DELETE` 上一整分钟窗口 + `INSERT SELECT` 单事务写入，窗口重放幂等；维度列写入时 `IFNULL(col,'')` 归一（与 Doris JOB 的 COALESCE 语义对齐）；多副本部署用 MySQL `GET_LOCK('report_agg_job', 0)` 抢锁防重；进程重启不补历史窗口（接受 ≤1 分钟空洞，与 Doris INSERT JOB 语义对称）。
 - **分区管理 JOB**：每 6h 巡检，向前预建 3 天分区、DROP 超出 `RetentionDays` 的过期分区，非分区形态自动降级 `DELETE ... LIMIT` 分批清理。MySQL 的 `information_schema.PARTITIONS` 对表达式边界回显求值后的整数（如 `TO_DAYS('2026-09-18')` 回显 `738886`），解析需同时支持整数反解、字面文本与 `MAXVALUE` 三种形态，否则会把现有分区误判为缺失而重复 `ADD PARTITION`（Error 1493），或让初始分区永远不参与过期 DROP。
 
-另一个跨方言的口径要点是时间渲染：DATETIME → Unix 秒统一用 `TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', col)` 算术差（两条 DATETIME 的整数秒差，不做时区解读），避免 `UNIX_TIMESTAMP()` 按会话时区解读墙钟导致的偏移——log-reader 按 UTC 墙钟写入，MySQL 与 Doris 两侧实现保持同一口径。
+另一个跨方言的口径要点是时间渲染：目标是"时区无关的 Unix 秒"。MySQL 与 Doris（含 StarRocks）实现统一用 `TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', col)` 算术差（两条 DATETIME 的整数秒差，不做时区解读），避免 `UNIX_TIMESTAMP()` 按会话时区解读墙钟导致的偏移——log-reader 按 UTC 墙钟写入，两侧口径一致；ClickHouse 实现则直接用 `toUnixTimestamp` / `fromUnixTimestamp` / `intDiv` 原生函数处理 DateTime 列（列固定 UTC，无时区歧义）。
 
 ## 事务实现（storage/rdb/txn）
 
@@ -609,7 +630,7 @@ func (s *RouteRulesStorager) FetchRouteRulesList(
 - DAO 层基于 `github.com/didi/gendry` 构建 SQL，通用 CRUD 封装在 `storage/rdb/internal/dao/internal/curd.go` 中。
 - 每个 DAO 文件遵循统一模板：表名常量、`T<Table>` 结果结构体、`T<Table>Param` 参数结构体、CRUD 函数。
 - Storage 通过 `lib.DBContextFactory` 获取数据库上下文，负责模型转换、JSON 序列化、分页计算和时间戳填充。
-- 27 张表按业务模块映射到不同的 Storage 子包，`route_cases` 当前无 DAO/Storage 实现。
+- 34 张表按业务模块映射到不同的 Storage 子包，`route_cases` 当前无 DAO/Storage 实现。
 - 事务通过 `model/itxn.TxnStorager` 抽象，`storage/rdb/txn/txn.go` 提供基于 RDB 的实现，模型层 Manager 负责编排跨表事务边界。
 - 数据库设计不使用物理外键，由应用层通过逻辑外键和事务保证一致性，兼顾性能与灵活性。
 

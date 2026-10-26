@@ -13,7 +13,7 @@ Through this chapter, readers will learn to complete the following operations in
 - Bind API-Keys to Entities, quota plans, rate limit policies, and route rules;
 - Complete typical configuration flows through the OpenAPI and troubleshoot common configuration issues.
 
-This chapter is intended for operations engineers and platform engineers. It assumes that the Control Plane (AI Gateway API) has been deployed and is accessible, listens on the default port `8183`, and that you already have a valid Session Key or long-term Token for authentication. All Dashboard operations in this chapter are based on Dashboard v0.0.10; the relevant entries are concentrated in the "Consumer Management" module.
+This chapter is intended for operations engineers and platform engineers. It assumes that the Control Plane (AI Gateway API) has been deployed and is accessible, listens on the default port `8183`, and that you already have a valid Session Key or long-term Token for authentication. The Dashboard operations in this chapter follow the current console UI; the relevant entries are concentrated in the "Consumer Management" module.
 
 ---
 
@@ -29,13 +29,14 @@ Both API-Keys and Entities can be bound to three types of policy resources:
 
 When an API-Key is attached to an Entity, the Data Plane BFE considers both the API-Key's own policies and the policies inherited up the Entity hierarchy, forming the final effective rules. Understanding this inheritance relationship is the prerequisite for configuring quotas and permissions correctly.
 
-In Dashboard v0.0.10, the entries for the objects covered in this chapter are as follows:
+The Dashboard entries for the objects covered in this chapter are as follows:
 
 | Object | Dashboard Entry |
 |------|----------------|
 | Entity Type | Consumer Management → Entity Management → Entity Type Management tab |
 | Entity Organization | Consumer Management → Entity Management → Entity Organization Management tab (the default tab) |
 | API-Key | Consumer Management → API Key Management |
+| Batch Tasks (what batch rate limits govern) | Consumer Management → Batch Tasks |
 
 The following sections first introduce the Dashboard console operations, and then give the corresponding OpenAPI usage.
 
@@ -110,13 +111,13 @@ Click the **Create Entity** button in the upper-right corner of the list, and a 
 | Field | Required | Default | Format Requirements | Description |
 |------|------|--------|----------|------|
 | Name | Yes | Empty | 1-64 characters; lowercase letters, digits, `_`, `-`, `@` only; cannot start or end with `_`, `-`, or `@`; no control characters or leading/trailing spaces | Globally unique and cannot be modified after creation; supports the form `username@project` |
-| Description | No | Empty | Up to 255 characters | Organization description; can be left blank |
+| Description | No | Empty | Up to 255 bytes (counted in UTF-8 bytes), no control characters | Organization description; can be left blank |
 | Type | Yes | Empty | — | Dropdown selection; options come from Entity Type Management; cannot be modified after creation |
 | Parent Entity | No | None | The parent organization's type level must be smaller than the current type's level | Dropdown selection, filterable; once selected, the current organization becomes its child organization |
 | Allowed Models | No | `*` (all models) | — | Selecting `*` means all models are allowed (most permissive); selecting specific models means only those models are allowed (stricter). The two are mutually exclusive: once `*` is selected, no specific model can be selected; once a specific model is selected, `*` is cleared automatically |
 | Blocked Models | No | Empty | — | The list of models blocked from access; a hit is rejected immediately (403) and takes priority over the allowed models |
 
-The Quota Information area has the same fields as the API-Key quota form; see "QuotaPlan Configuration". Once rate limiting is enabled in the Rate Limit Configuration area, you can configure TPM rules, RPM rules, and max concurrency; for the detailed fields and applicable scenarios of rate limit rules, see [Chapter 23: Rate Limit Policy Configuration](./chapter23-rate-limit-config.md).
+The Quota Information area has the same fields as the API-Key quota form; see "QuotaPlan Configuration". Once rate limiting is enabled in the Rate Limit Configuration area, you can configure TPM rules, RPM rules, max concurrency, and batch rate limits; for the detailed fields and applicable scenarios of rate limit rules, see [Chapter 23: Rate Limit Policy Configuration](./chapter23-rate-limit-config.md).
 
 ### Editing and Deleting Organizations
 
@@ -158,7 +159,26 @@ Click the **Create** button in the upper-right corner of the list, and a creatio
 
 Common ways to fill in Allowed Subnets: keep the default `*` for unrestricted IPs; use `10.0.0.0/8` to allow only the corporate intranet; use `192.168.1.0/24` to allow only a specific office; use `172.16.5.10/32` to allow only a specific server. Here `/8`, `/24`, and `/32` are shorthand for the subnet mask, indicating the size of the allowed IP range; consult your network administrator when unsure.
 
-The Quota Information area is the same as the organization's quota form (see "Configuring Quotas in the Dashboard"); once rate limiting is enabled in the Rate Limit Configuration area, you can likewise configure TPM / RPM rules and max concurrency — see [Chapter 23: Rate Limit Policy Configuration](./chapter23-rate-limit-config.md) for rate limit rule configuration. Click the **Submit** button at the bottom to create; after the creation succeeds, the Key value is generated automatically by the system.
+The Quota Information area is the same as the organization's quota form (see "Configuring Quotas in the Dashboard"); once rate limiting is enabled in the Rate Limit Configuration area, you can likewise configure TPM / RPM rules, max concurrency, and batch rate limits — see [Chapter 23: Rate Limit Policy Configuration](./chapter23-rate-limit-config.md) for rate limit rule configuration. Click the **Submit** button at the bottom to create; after the creation succeeds, the Key value is generated automatically by the system.
+
+#### Batch Rate Limits (`batch_limits`)
+
+After TPM / RPM / max concurrency, the Rate Limit Configuration card contains a "Batch Rate Limits" section with four numeric inputs in one row, limiting the batch tasks of this API-Key (requests passed through to provider-native Batch APIs):
+
+| Field | UI Label | Meaning |
+|------|----------|---------|
+| `max_create_rpm` | Batch task creation RPM | Number of batch tasks that may be created per minute |
+| `max_active_batches` | Max in-flight batch tasks | Cap on batch tasks that are simultaneously non-terminal |
+| `max_file_bytes` | Max file size (bytes) | Byte limit of a single batch input file |
+| `max_file_lines` | Max file lines | Line limit of a single batch input file |
+
+- All four dimensions are **counted per API-Key and are model-independent**; leaving a field empty or `0` means that dimension is not configured;
+- When all four are empty, nothing is submitted and the whole `batch_limits` section is omitted from the request;
+- Not configuring batch rate limits does not mean batch traffic is unlimited: the Data Plane still enforces the global hard caps of BFE `mod_ai_batch.data`;
+- When rate limiting is enabled, at least one of TPM, RPM, max concurrency, or batch rate limits must be configured, otherwise submission is blocked with "Add a TPM/RPM rule, configure batch limits, or set max concurrency to Banned / Limit concurrency";
+- Negative values are blocked ("{label} cannot be negative"), and the inputs parse integers only.
+
+The Rate Limit Configuration card of Entity organizations offers the same "Batch Rate Limits" section with identical fields and semantics. For the counting semantics of the four dimensions and the Data Plane evaluation order, see [Chapter 23: Rate Limit Policy Configuration](./chapter23-rate-limit-config.md).
 
 ### Creating an API-Key (OpenAPI)
 
@@ -199,7 +219,13 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
         "rpm": [
           {"name": "rpm_1min", "model": "*", "window_minutes": 1, "max_requests": 100}
         ],
-        "max_concurrency": 50
+        "max_concurrency": 50,
+        "batch_limits": {
+          "max_create_rpm": 60,
+          "max_active_batches": 10,
+          "max_file_bytes": 104857600,
+          "max_file_lines": 1000000
+        }
       }
     },
     "route_rules": {
@@ -220,6 +246,8 @@ curl -X POST http://localhost:8183/open-api/v1/api-keys \
 ```
 
 The response contains `id` (internal identifier) and `key` (authentication value). The Key value cannot be modified after creation; in the Dashboard list it is masked, and you can click to view the full value and copy it (see "Key List and Viewing the Key Value"). It is recommended to save the complete Key to a secure credential management location immediately after creation; to replace a Key, delete the old Key and create a new one.
+
+> Note: `rate_limit_policy.rules.batch_limits` in the request body is an optional batch-task rate-limiting section (field meanings and counting semantics in [Chapter 23 Rate Limit Configuration](./chapter23-rate-limit-config.md)); `max_create_rpm`, `max_active_batches`, `max_file_bytes`, and `max_file_lines` are all optional, omitted or `0` means that dimension is not configured, and omitting all of them produces no BFE `rules.batch` section. The section is supported by the inline policy of API-Keys and Entities as well as by the standalone policy resource `/rate-limit-policies`.
 
 ### Querying API-Keys
 
@@ -522,7 +550,7 @@ The runtime checks of an API-Key are executed in two phases: **rate limit check 
 
 The target model resolution chain is: route "specified model" → cluster "strip prefix" → cluster "model redirect", resolving the final model name in sequence (consistent with the model the backend actually receives). Therefore:
 
-- The "Applicable Model" of rate limit rules and the validation object of model access control are both the **forwarded target model**, not the raw model name in the request body; only when redirection / prefix stripping / target override are all disabled does filling in the client-requested model name remain equivalent to the legacy behavior;
+- The "Applicable Model" of rate limit rules and the validation object of model access control are both the **forwarded target model**, not the raw model name in the request body; when redirection / prefix stripping / target override are all disabled, the target model is simply the client-requested model name;
 - The allowed / blocked models should be real model names that exist on the provider; when model redirect is enabled, clients can still request with the original model name, and the allowlist is evaluated against the redirected model;
 - When a fallback cluster is configured, each cluster attempt is validated independently against the target model resolved for that attempt.
 
@@ -568,7 +596,7 @@ curl -X POST http://localhost:8183/open-api/v1/entities \
   }'
 ```
 
-`description` is an optional organizational description field: 0-255 characters, with control characters not allowed; the Dashboard entity list supports searching and sorting by this field. Update semantics: omitting `description` in a full `PUT` update clears it, omitting it in a `PATCH` partial update keeps the current value, and passing `""` explicitly clears it.
+`description` is an optional organizational description field: 0-255 bytes (counted in UTF-8 bytes), with control characters not allowed; the Dashboard entity list supports searching and sorting by this field. Update semantics: omitting `description` in a full `PUT` update clears it, omitting it in a `PATCH` partial update keeps the current value, and passing `""` explicitly clears it.
 
 ### Creating an API-Key and Attaching It to an Entity
 
@@ -782,6 +810,7 @@ Once the above configuration takes effect, the API-Key is subject to all of the 
 - `QuotaPlan` supports two units, `total_token` and `RMB`, applicable to scenarios billed by total token volume and by cost budget respectively; RMB quotas are stored internally in Redis as fixed-point integers and displayed externally with 4 decimal places. In the Dashboard, you can choose unlimited / limited quota and configure "Pass When Quota Insufficient", the quota unit, the total quota, and the reset period.
 - The balance is read directly from Redis; both the OpenAPI detail response and the dedicated `quota-plan` endpoint return the real-time `used` / `remaining`; the Data Plane treats a missing Redis balance key as exhausted (429) instead of 500; the Dashboard detail drawer supports one-click "Reset Quota"; the OpenAPI manual reset endpoint can restore the balance to the current or a new quota without interfering with periodic scheduling; and the Inner API `POST /inner-api/v1/quota/trigger-reset` immediately triggers a periodic reset protected by a distributed lock.
 - At runtime, requests are executed in the order "model access control → rate limit check → quota deduction"; for an API-Key, the rate limit check and quota deduction run during the request authentication phase, while model access control runs during the forwarding phase after the target model has been resolved; the "Applicable Model" of rate limiting and the model access control are both matched against the forwarded target model, and with fallback, each cluster attempt is validated independently against its own resolved target model.
+- Besides TPM / RPM / max concurrency, the Rate Limit Configuration card also offers a "Batch Rate Limits" section (`max_create_rpm`, `max_active_batches`, `max_file_bytes`, `max_file_lines`); all four dimensions are counted per API-Key and are model-independent, and leaving a field empty or `0` means that dimension is not configured. Even without batch rate limits, the global hard caps of BFE `mod_ai_batch.data` still apply.
 - Entities support a hierarchical structure; after an API-Key is attached, it inherits the model allowlist (intersection), blocklist (union), quota plans, rate limit policies, and route rules; policies take effect in the priority order API-Key level → Entity level → Global level.
 - In practice, it is recommended to plan the Entity hierarchy first, then attach API-Keys and layer fine-grained policies on top, achieving organizational-level budget control and project-level resource isolation. When encountering anomalies, troubleshoot comprehensively by combining the API-Key status, quota balance, Entity inheritance result, and BFE logs.
 

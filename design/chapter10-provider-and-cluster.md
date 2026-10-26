@@ -9,6 +9,8 @@
 - 掌握控制面如何根据 Provider + Cluster 生成 BFE 数据面所需的 `AIConf`。
 - 了解模型发现、Key 引用与权重、Key Policy、Key Affinity 等关键机制。
 - 了解 `protocol_paths` 协议路径改写的语义、校验规则与数据面执行方式。
+- 了解 `llm_config.normalize_upstream_error` 上游错误归一化的配置语义与默认值约定。
+- 了解 K8s 实例池供给机制与有效实例池契约。
 - 能够写出符合规范的实际配置。
 
 ## Provider 的设计目标与数据模型
@@ -19,7 +21,7 @@ Provider（提供商）回答的是“下游是谁、能访问哪些模型、如
 
 - **身份与能力声明**：Provider 持有名称、描述、支持的模型列表、模型访问协议（`model_protocols`）、模型发现端点（`model_endpoint`）等元信息。
 - **认证信息归集**：Provider 是 API-Key 明文的唯一持有者，cluster 只通过 `name` 引用，不再暴露 key 内容。
-- **后端实例归集**：Provider 维护 `instance_pool`，供多个 cluster 复用同一套后端地址。
+- **后端实例归集**：Provider 维护 `instance_pool`（或由 K8s 发现组件供给的实例池），供多个 cluster 复用同一套后端地址。
 - **独立生命周期**：Provider 可以独立创建、更新、删除；删除前由控制面检查是否有 cluster 引用。
 
 ### 数据模型
@@ -63,8 +65,11 @@ Provider（提供商）回答的是“下游是谁、能访问哪些模型、如
 - `name`：Provider 唯一标识，全局唯一。
 - `model_endpoint`：模型发现端点，默认 `{schema: "https", uri: "/v1/models"}`。
 - `models`：该 provider 支持的模型列表，可以是手动维护，也可以由模型发现接口回填。
-- `keys`：API-Key 列表，每项包含 `name` 与 `key` 明文。`name` 用于 cluster 引用。
-- `instance_pool`：后端实例池，至少包含一个实例，且至少有一个实例的 `weight > 0`。
+- `keys`：API-Key 列表，每项包含 `name` 与 `key`（密钥值）。`name` 用于 cluster 引用。落库时该字段所在列 `providers.api_keys` 为 `MEDIUMTEXT`，整个 key 池序列化为单个 `enc$v1$` 信封密文（不是逐字段加密）；配置 `[Security].MasterKeyFile` 时控制面启动自检该列类型，仍为 JSON 类型则拒绝启动，读路径遇到无法解密的坏值返回 500（见 [第十七章 安全设计](./chapter17-security-design.md)）。下发配置文件中的密钥同样以信封形式传输，仅数据面加载后以明文使用。
+- `instance_pool`：后端实例池。实例来源为手工维护（缺省）时，至少包含一个实例，且至少有一个实例的 `weight > 0`；实例来源为 K8s 实例池时该字段不参与校验，详见下文「K8s 实例池供给」。
+- `instance_source`：实例供给方式，`instance_pool`（手工维护，缺省）或 `k8s_pool`（K8s 发现组件维护）。
+- `k8s_pool_name`：`instance_source=k8s_pool` 时必填，引用的 K8s 实例池名。
+- `k8s_instance_pool`：K8s 实例池的只读镜像，由控制面从 `k8s_pools` 表同步，请求体携带该字段返回 422。
 - `model_protocols`：支持的模型访问协议，当前枚举为 `openai`、`anthropic`、`gemini`，至少包含一种。
 - `protocol_paths`：可选，协议 → 上游 base path 的声明式映射，用于将标准入口 `/v1/...` 改写为 provider 原生前缀，详见下文「协议路径改写」。
 - `time_zone` / `tiers`：用于高峰/闲时价格匹配，初期只支持 `peak` tier。
@@ -124,6 +129,13 @@ Cluster（集群）回答的是“流量如何转发、用哪些模型、key 权
             "redis_prefix": "bfe:ai:key_affinity",
             "penalty_enable": true
         },
+        "normalize_upstream_error": {
+            "enabled": true,
+            "stream_enabled": true,
+            "unrecognized_action": "rewrite_generic",
+            "max_body_bytes": 65536,
+            "redact_secrets": true
+        },
         "provider": "deepseek",
         "match_prefix": "deepseek/",
         "strip_prefix": true
@@ -141,6 +153,7 @@ Cluster（集群）回答的是“流量如何转发、用哪些模型、key 权
 - `llm_config.keys`：只保留 `name` 与 `weight`，`name` 必须引用 provider 中存在的 key。
 - `llm_config.key_policy`：多 Key 选择策略与重试退避，当前 `strategy` 仅支持 `weighted_random`。
 - `llm_config.key_affinity`：基于 Redis + `ClientKeyId` 的会话级 Key 亲和性。
+- `llm_config.normalize_upstream_error`：可选的上游错误归一化配置，详见下文「上游错误归一化」。
 
 ## Provider 与 Cluster 解耦的原因与收益
 
@@ -174,7 +187,7 @@ graph LR
 
 - Provider 是“能力提供者”，Cluster 是“转发策略”。
 - Cluster 通过 `llm_config.provider` 强引用 Provider。
-- 控制面在创建 Cluster 时，根据 Provider 的 `instance_pool` 自动生成实例池、子集群并绑定到集群。
+- 控制面在创建 Cluster 时，根据 Provider 的有效实例池（`EffectiveInstancePool()`）自动生成实例池、子集群并绑定到集群。
 - `model-prices` 只按名称弱关联 Provider，不阻塞删除。
 
 ### 核心收益
@@ -214,6 +227,47 @@ Provider 与 Cluster 解耦后，二者各自拥有独立的生命周期，但�
 
 无论是 `PATCH /providers/{provider_name}` 还是 `PATCH /clusters/{cluster_name}`，请求体中都不能包含 `name` 字段。名称由 URI 路径参数唯一指定，若请求体携带 `name`，接口返回 `422 Unprocessable Entity`。
 
+## K8s 实例池供给
+
+除了手工维护的 `instance_pool`，Provider 的实例来源还可以是 K8s 实例池：部署在 Kubernetes 环境的控制器 ai-gateway-controller（原名 Service Controller）把带 `ai-gateway-api-name` 标签的 Service/Endpoints 的 Ready 实例经 InnerAPI `k8s_pools` 全量上报到控制面，Provider 通过引用池名获得动态后端列表，实例随 K8s 服务变化自动增减，无需手工维护；池成员经 `cluster_table` 间接到达 BFE。
+
+### 实例来源双模式
+
+`providers` 表以三个字段表达实例来源双模式：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `instance_source` | `VARCHAR(32)`，默认 `instance_pool` | 实例供给方式：`instance_pool` 表示实例列表由人手工维护；`k8s_pool` 表示实例由 K8s 发现组件供给 |
+| `k8s_pool_name` | `VARCHAR(255)`，可空 | `instance_source=k8s_pool` 时必填，引用的 K8s 实例池名 |
+| `k8s_instance_pool` | JSON，可空 | K8s 实例池的只读镜像，由控制面从 `k8s_pools` 表同步写入；OpenAPI 请求体携带该字段返回 422 |
+
+`k8s_pool_name` 的命名规范为 1-64 个字符，仅允许字母、数字与 `_`、`-`、`.`，且不得以 `.`、`-`、`_` 开头或结尾。引用无需预先存在：池不存在等价于零实例，等待发现组件首次同步后实例自动出现。
+
+### 有效实例池契约
+
+`model/iprovider/provider.go` 中的 `EffectiveInstancePool()` 定义了有效实例池契约，是下游消费实例池的唯一入口：
+
+```text
+EffectiveInstancePool(p) = p.instance_source == "k8s_pool" ? p.k8s_instance_pool : p.instance_pool
+```
+
+- cluster 创建实例快照、实例池同步、变更判等全部经由该契约读取有效池，不直接触碰 `instance_pool` / `k8s_instance_pool` 原始字段。
+- 当写入合并后的 `instance_source` 解析为 `instance_pool` 时，`k8s_instance_pool` 镜像被强制清空——`instance_pool` 模式下镜像恒为空。
+- 合法空池只出现在 `k8s_pool` 模式：有效池为空时，引用该 provider 的 cluster 以空条目下发，BFE 加载接受，该 cluster 的请求返回 500（`BK_NO_BACKEND`，message `no available backend for this request`），须配合告警使用；`cluster_table` 中缺失的子集群同样按空 backend 处理，热加载释放旧实例后也会出现同一错误。`instance_pool` 模式下的非空校验（至少一个实例、(addr, port) 去重、至少一个 `weight > 0`）保持不变。
+
+### k8s_pools 表与维护端点
+
+`k8s_pools` 表登记所有 K8s 实例池（`name` 唯一、`instances` JSON、`created_at` / `updated_at`），其写入方唯一为 K8s 发现组件，经 InnerAPI（鉴权 `FeatureK8sPool`）维护：
+
+| 端点 | 说明 |
+|------|------|
+| `PUT /inner-api/v1/k8s_pools/{name}/instances` | 全量替换实例列表，请求体为裸 JSON 数组；实例 `addr` 必填、`port` 取值 1-65535、`weight` 取值 [0,100] 缺省 100，(addr, port) 组合池内唯一；空数组合法，等价于零实例 |
+| `GET /inner-api/v1/k8s_pools` | 池列表，含 `instance_count` / `last_sync_time` |
+| `GET /inner-api/v1/k8s_pools/{name}` | 单池查询，池不存在返回 404 |
+| `DELETE /inner-api/v1/k8s_pools/{name}` | 删池无引用保护，引用该池的 provider 镜像随之清零 |
+
+写入成功后，控制面在单事务内完成扇出（`model/ik8s_pool/k8s_pool.go` 的 `K8sPoolManager.ReplaceInstances` / `DeletePool`）：刷新所有引用该池的 provider 的 `k8s_instance_pool` 镜像，并同步更新引用 cluster 的派生实例池；空池同样参与同步，即 clear 语义。扇出任一步失败，整个写入回滚，保证池记录、provider 镜像与 cluster 派生池三者一致。
+
 ## AIConf 的生成
 
 BFE 数据面消费的配置结构与重构前保持一致。控制面通过 `model/icluster_conf/exporter.go` 将 Provider 与 Cluster 的数据合并，生成最终的 `AIConf`。下面这张图展示了生成过程：
@@ -221,7 +275,7 @@ BFE 数据面消费的配置结构与重构前保持一致。控制面通过 `mo
 ```mermaid
 flowchart LR
     subgraph Provider
-        P1[instance_pool]
+        P1[有效实例池]
         P2[keys 明文]
         P3[model_protocols]
         P4[models]
@@ -261,7 +315,7 @@ flowchart LR
 
 | BFE 配置项 | 来源（新模型） |
 |------------|----------------|
-| 实例池 / 子集群 / 集群 | Cluster + Provider.instance_pool |
+| 实例池 / 子集群 / 集群 | Cluster + Provider 有效实例池（`EffectiveInstancePool()`） |
 | `AIConf.Models` | `cluster.llm_config.models` |
 | `AIConf.ModelMappings` | `cluster.llm_config.model_mappings` |
 | `AIConf.Keys` | `provider.keys`（key 明文） + `cluster.llm_config.keys`（weight）按 name join |
@@ -270,6 +324,7 @@ flowchart LR
 | `AIConf.MatchPrefix` / `StripPrefix` | `cluster.llm_config.match_prefix` / `strip_prefix` |
 | `AIConf.ModelProtocols` | `provider.model_protocols` 按 cluster 的 provider 引用透传 |
 | `AIConf.ProtocolPaths` | `provider.protocol_paths` 按 cluster 的 provider 引用透传 |
+| `AIConf.NormalizeUpstreamError` | `cluster.llm_config.normalize_upstream_error` |
 | `AIConf.ModelTable` | 由 provider 查询 `model-prices` 自动填充 |
 
 ### ModelTable 的自动填充
@@ -315,6 +370,47 @@ BFE 在转发时按检测到的请求协议改写上游路径，两个协议分�
 两点注意：path 在部分 provider 上挂计费语义（火山 `/api/v3` 按量 vs `/api/coding` 订阅），订阅 Key 误配按量前缀会错扣费，配置时需核对 Key 类型与 path 的对应关系；模型发现端点（`model_endpoint`）不随 `protocol_paths` 自动生成，例如百炼 Anthropic 协议的模型发现需手工配置 `/apps/anthropic/v1/models`。
 
 改写执行细节与 fallback 重算语义见[第七章 数据面转发设计：BFE](./chapter07-data-plane-design.md)。
+
+## 上游错误归一化（normalize_upstream_error）
+
+不同 provider 的错误响应格式千差万别（状态码、错误码、错误体的字段名各不相同），直接透传会让客户端难以统一处理失败。为此，Cluster 的 `llm_config` 提供可选的 `normalize_upstream_error` 对象，开启后由 BFE 按 `openai` / `anthropic` / `gemini` 协议适配器把上游错误统一映射为网关内部的 `UPSTREAM_*` 错误目录，再以下游请求的协议风格重写响应。
+
+### 数据面行为
+
+BFE 侧的对应配置项为 `AIConf.NormalizeUpstreamError`（`Enabled` / `StreamEnabled` / `UnrecognizedAction` / `MaxBodyBytes` / `RedactSecrets`），主要行为包括：
+
+- 非流式响应按 `enabled` 开关归一；SSE 流按 `stream_enabled` 开关归一，流内错误帧会被重写（访问日志中的 `ai_stream_error_rewritten` 记录该行为），流被异常截断时记录 `ai_stream_truncated`；
+- 归一后的网关响应打 `X-Bfe-Gw-Error` 标记头，客户端可据此识别响应来自网关归一而非上游原文；
+- 归一过程对凭据做脱敏，覆盖 raw / base64 / URL / JSON 转义等常见形态，避免上游错误体把 API-Key 明文带回给客户端；
+- `unrecognized_action` 控制无法识别的错误体的处置：`passthrough` 原样透传，`rewrite_generic` 重写成通用错误格式。
+
+访问日志包含以下字段（bfe-access-pb 定义于 pb 字段 810-815，要求 bfe-access-pb ≥ v0.3.12）：`ai_upstream_status`、`ai_upstream_err_code`、`ai_err_normalized`、`ai_err_normalize_miss`、`ai_stream_error_rewritten`、`ai_stream_truncated`。
+
+### 控制面配置
+
+`normalize_upstream_error` 复用 `clusters.llm_config` JSON 列存储，不需要独立 DDL。全部字段均为可选指针，缺省等价于 BFE 关闭归一化（保持历史透传行为）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `enabled` | `*bool` | 非流式响应归一开关，默认 `false`。 |
+| `stream_enabled` | `*bool` | SSE 流归一开关，默认 `false`。 |
+| `unrecognized_action` | `*string` | 无法识别的错误体的处置，枚举 `passthrough` / `rewrite_generic`。 |
+| `max_body_bytes` | `*int64` | 错误体读取上限；`≤0` 或未设置时使用 BFE 默认 65536。 |
+| `redact_secrets` | `*bool` | 凭据脱敏开关；`nil` 使用 BFE 默认 `true`，显式 `false` 关闭脱敏。 |
+
+导出方面，InnerAPI `server_data_conf` 把 `cluster.llm_config.normalize_upstream_error` 映射为 BFE `AIConf.NormalizeUpstreamError`；默认值不下发，由 BFE `Effective()` 在加载期合成，避免下发冗余配置。控制面的校验规则与 BFE `AIConfCheck` 逐条对齐（如 `unrecognized_action` 枚举、数值范围），非法配置在保存时以 422 拒绝。
+
+配置示例：
+
+```json
+"normalize_upstream_error": {
+    "enabled": true,
+    "stream_enabled": true,
+    "unrecognized_action": "rewrite_generic",
+    "max_body_bytes": 65536,
+    "redact_secrets": true
+}
+```
 
 ## 模型发现机制
 
@@ -472,6 +568,13 @@ curl -X POST "http://api-server:8183/api/v1/clusters" \
             "redis_prefix": "bfe:ai:key_affinity",
             "penalty_enable": true
         },
+        "normalize_upstream_error": {
+            "enabled": true,
+            "stream_enabled": true,
+            "unrecognized_action": "rewrite_generic",
+            "max_body_bytes": 65536,
+            "redact_secrets": true
+        },
         "provider": "deepseek",
         "match_prefix": "deepseek/",
         "strip_prefix": true
@@ -515,7 +618,9 @@ curl -X POST "http://api-server:8183/api/v1/providers/tools/discover-models" \
 - **解耦收益**：职责更清晰、配置更少重复、Cluster 不再暴露 key 明文、BFE 无感知、model-prices 与 provider 之间可弱引用。
 - **AIConf 生成**：控制面将 Provider 与 Cluster 的数据按 name join，生成 BFE 所需的实例池、子集群、`AIConf.Keys`、`AIConf.ModelTable`、`AIConf.ModelProtocols` 等字段。
 - **模型发现**：通过 `/providers/tools/discover-models` 探测第三方模型列表，再回填到 Provider。
+- **K8s 实例池供给**：`instance_source` 双模式（手工 `instance_pool` / K8s 发现组件维护的 `k8s_pool`），`EffectiveInstancePool()` 是下游唯一消费口；K8s 池由发现组件经 InnerAPI 独占写入，写入后单事务扇出刷新 provider 镜像与引用 cluster 的派生实例池。
 - **Key 机制**：Cluster 通过 `name` 引用 Provider 的 key 并设置权重；`key_policy` 控制选择策略与重试退避；`key_affinity` 提供基于 Redis 的会话级 Key 亲和性。
+- **上游错误归一化**：`llm_config.normalize_upstream_error` 将上游错误按协议适配器统一映射为 `UPSTREAM_*` 错误目录，字段全部可选、缺省保持历史透传行为；导出映射为 `AIConf.NormalizeUpstreamError`，默认值由 BFE 加载期合成。
 
 理解 Provider 与 Cluster 的边界，是正确配置壬远 AI 网关、实现多模型提供商灵活调度的基础。
 
@@ -526,6 +631,7 @@ curl -X POST "http://api-server:8183/api/v1/providers/tools/discover-models" \
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/clusters.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/cluster-table.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/ai-route.md`
+- `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/k8s-pools.md`
 - [第六章 控制面核心设计：AI Gateway API](./chapter06-control-plane-design.md)
 - [第二十章 Provider 配置](../operation/chapter20-provider-and-model-config.md)
 - [第二十一章 Cluster 配置](../operation/chapter21-cluster-and-route-config.md)

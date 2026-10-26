@@ -153,6 +153,22 @@ Click "Tiered Pricing Configuration" in the action column to open a standalone d
 
 Time rules: start/end times use the `HH:MM` format; the end time must be later than the start time—split into two ranges when crossing midnight; empty applicable ranges mean every day; weekday values are 0=Sunday … 6=Saturday; multiple time ranges within the same tier are matched by OR, with the semantics `start <= current time < end` (left-closed, right-open). After configuration, you must also maintain a `peak` tier price item for the same `provider` on the model pricing page; requests that do not hit peak hours fall back to the default price.
 
+### Batch Task Pricing (`batch_discount`)
+
+Model pricing supports a batch-task discount: `batch_discount` on a price row (value in `(0,1]`) expands that row's token prices by the coefficient into `mode=batch` price rows distributed with the `ModelTable`, and the `mode` whitelist includes `batch`; manually maintained `mode=batch` price rows take precedence over coefficient expansion. Rows without a discount produce no batch price, and batch requests are billed at the chat base price. For the design and billing semantics, see [Chapter 13 Model Pricing and Cost Accounting Design](../design/chapter13-model-pricing.md).
+
+The discount is maintained in the model pricing form: the input sits inside the "Price" card of the create / edit drawer, after the time-segmented prices, is labeled "Batch Discount Coefficient", takes a 0–1 number with a step of 0.1 (placeholder `0.5`), and defaults to `0.5` for a new price row. UI rules:
+
+| Item | Description |
+|------|------|
+| Validation | A floating-point number within `(0,1]`; an invalid value blocks submission with "The batch discount coefficient must be a floating-point number within (0,1]" |
+| Display condition | Not rendered when "Model Mode" (`mode`) is `batch`; `mode=batch` price rows do not carry a batch discount coefficient |
+| Submit semantics | Attached only when the model mode is not `batch` and a coefficient is filled in; clearing it is treated as not configured and no batch price rows are expanded on export |
+| Scope of effect | Affects only the batch price rows distributed to BFE (every token price key plus each tier price expanded by the coefficient); it does not rewrite the stored prices of the row |
+| View mode | For non-`batch` modes the coefficient value is shown (`-` when unset); for `mode=batch` it shows "- (mode=batch price rows don't have a batch discount coefficient)" |
+
+The equivalent OpenAPI field is `batch_discount` on the price row, which can be maintained through `POST/PUT /model-prices`.
+
 ### Deleting a Provider
 
 Click "Delete" and confirm. If the provider is still referenced by a business Cluster, the deletion fails with the prompt "Deletion failed: this provider may still be referenced by a cluster"; you must first change the "Provider" of the relevant Clusters or delete those Clusters before deleting the provider. Note: a `provider` with the same name existing in `model-prices` does **not** prevent the provider from being deleted.

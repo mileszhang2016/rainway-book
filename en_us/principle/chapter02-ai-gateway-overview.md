@@ -129,7 +129,7 @@ The overall architecture of the Rainway AI Gateway consists of five core compone
 - **Dashboard**: the management console, performing visual operations through the OpenAPI;
 - **BFE**: the Data Plane, responsible for traffic forwarding, AI routing, authentication, rate limiting, and access logging;
 - **Conf Agent**: the configuration agent, pulling the latest configuration from the InnerAPI and triggering BFE hot reload;
-- **Service Controller**: the service discovery component, synchronizing Kubernetes backend services.
+- **ai-gateway-controller** (formerly Service Controller): the Kubernetes service discovery component; it reports the Ready instances of Services/Endpoints as a K8s pool (InnerAPI `k8s_pools`), which the Control Plane fans out and exports to BFE through `cluster_table`.
 
 ```mermaid
 graph TD
@@ -138,7 +138,7 @@ graph TD
     D[Dashboard] -->|OpenAPI| E[AI Gateway API Control Plane]
     E -->|InnerAPI / config distribution| F[Conf Agent]
     F -->|Hot reload| B
-    G[Service Controller] -->|Service discovery| E
+    G[ai-gateway-controller] -->|InnerAPI k8s_pools| E
 ```
 
 Compared with products such as Higress and OmniRoute, the Rainway AI Gateway is differentiated in the following aspects:
@@ -168,7 +168,6 @@ Subsequent chapters will build on this foundation to dive into the Rainway AI Ga
 - `ai-gateway-api/README.md`
 - `ai-gateway-api/design-docs/sys-design/总体设计文档.md`
 - `bfe/docs/zh_cn/introduction/overview.md`
-- `document-ai-gateway/竞品分析/higress/bfe-vs-higress-ai-gateway-comparison.md`
-- `document-ai-gateway/竞品分析/OmniRoute/OmniRoute-vs-bfe-AI网关能力对比分析.md`
-- `document-ai-gateway/竞品分析/higress/Higress AI网关配额管理功能分析.md`
-- `document-ai-gateway/竞品分析/tokenHub/control-data-plane-analysis.md`
+- [Higress project homepage](https://github.com/higress-group/higress)
+- [TokenHub project homepage](https://github.com/astaxie/TokenHub)
+- [OmniRoute project homepage](https://github.com/diegosouzapw/OmniRoute)

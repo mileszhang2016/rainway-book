@@ -9,6 +9,7 @@
 - 理解流式与非流式场景下 Token 用量如何汇总到 `TokenUsage` 上下文。
 - 了解 RMB 配额分时段定价如何与响应体处理联动。
 - 理解内容审核（`textfilter`）如何与 Token 提取共享同一事件处理框架。
+- 了解同链路模块 `mod_ai_context`（上下文压缩）与 `mod_traffic_mirror`（流量镜像）的实现要点。
 
 ## mod_body_process 模块职责
 
@@ -38,14 +39,18 @@ type BodyProcessor struct {
 
 ## 在 BFE 模块链中的位置
 
-`mod_body_process` 在 `bfe/bfe_modules/bfe_modules.go:156` 中注册，位于 `mod_ai_route` 之后、`mod_ai_rate_limit` 之前。注册顺序如下：
+`mod_body_process` 在 `bfe/bfe_modules/bfe_modules.go` 的 moduleList 中注册，位于 `mod_ai_route` 之后、`mod_ai_rate_limit` 之前。AI 相关模块的注册顺序如下：
 
 ```go
 // bfe/bfe_modules/bfe_modules.go
-mod_ai_token_auth.NewModuleAITokenAuth(), // 负责 API Key 校验与 QuotaPlan 绑定
-mod_ai_route.NewModuleAiRoute(),          // 负责选模型/选集群
-mod_body_process.NewModuleBodyProcess(),  // 负责响应体解析与 Token 提取
-mod_ai_rate_limit.NewModuleAiRateLimit(), // 依赖 Token 计算结果做限流
+mod_ai_token_auth.NewModuleAITokenAuth(),    // 负责 API Key 校验与 QuotaPlan 绑定
+mod_ai_cache.NewModuleAiCache(),             // 负责缓存查找，命中短路
+mod_ai_route.NewModuleAiRoute(),             // 负责选模型/选集群
+mod_ai_intent.NewModuleAiIntent(),           // 意图懒解析注入，无请求回调
+mod_traffic_mirror.NewModuleTrafficMirror(), // 只注册 HandleForward
+mod_body_process.NewModuleBodyProcess(),     // 负责响应体解析与 Token 提取
+mod_ai_rate_limit.NewModuleAiRateLimit(),    // 依赖 Token 计算结果做限流
+mod_ai_context.NewModuleAiContext(),         // HandleAfterAITargetModel 压缩
 ```
 
 `mod_body_process` 向 BFE 回调链注册了三个钩子：
@@ -450,10 +455,67 @@ func (d *SSEEventDecoder) Decode() ([]Event, error) {
 ```go
 // bfe/bfe_modules/bfe_modules.go
 mod_ai_token_auth.NewModuleAITokenAuth(),
+mod_ai_cache.NewModuleAiCache(),
 mod_ai_route.NewModuleAiRoute(),
+mod_ai_intent.NewModuleAiIntent(),
+mod_traffic_mirror.NewModuleTrafficMirror(),
 mod_body_process.NewModuleBodyProcess(),
 mod_ai_rate_limit.NewModuleAiRateLimit(),
+mod_ai_context.NewModuleAiContext(),
 ```
+
+## 上下文压缩实现要点（mod_ai_context）
+
+`mod_ai_context`（`bfe/bfe_modules/mod_ai_context/`）按目标模型的 token 预算在转发前压缩请求上下文，注册在 `mod_ai_rate_limit` 之后、`mod_access_pb3` 之前，挂钩两个回调点：
+
+| 回调点 | 函数 | 作用 |
+|--------|------|------|
+| `HandleAfterAITargetModel` | `contextCompressHandler`（`handler.go`） | 目标模型解析后、转发前执行压缩；随 fallback 每次 attempt 触发，但以 `AiBasicInfo.ContextCompressStatus` 做幂等守卫，整个请求只压一次 |
+| `HandleReadResponse` | `responseAnnotationHandler`（`handler.go`） | 压缩过的响应注入 `x-ai-context-compression: tokens=%d->%d; mode=%s` 注解头 |
+
+预算与触发（`handler.go`、`estimate.go`）：
+
+- 上下文窗口按目标模型名启发（`modelContextWindow`）：gemini 100 万、claude 20 万、codex 40 万，默认 12.8 万 token；
+- 预算 = 窗口 − 输出预留；`reserveTokens` 为 0（auto）时取 `clamp(窗口×15%, 256, 16000)`，规则可覆盖 `maxContextTokens`/`reserveTokens`；
+- 估计 token 数超过 `budget × triggerRatio`（默认 0.7）才触发，否则记 `skip_under_threshold`。
+
+降级管线（`pipeline.go`，按序执行，前一层足以达标即停）：
+
+1. L1 工具结果截断（`toolResultMaxChars` 默认 2000 字符）；
+2. L1.5 仅保留最新 `keepLatestImages` 张内联图（默认 2）；
+3. L2 thinking 块删除（`thinkingPolicy=trim-all-but-last|keep`）；
+4. `conservative` 模式止步，记 `trim`；`balanced`/`aggressive` 进入 P2 规则改写（`rewrite.go`，`strength=lite|full`）；
+5. 保真度门（`fidelity.go`）：受保护 token 存活率低于 `protectedSurvivalRate`（默认 0.95）时丢弃改写产物，回退 trim 快照；
+6. `repairMessages`（`repair.go`）校正 tool-call 配对，不合法则回滚原文（`repair_rollback`）。
+
+压缩只改写转发用 `OutRequest`，原始请求不动，访问日志与计费仍按原请求统计；任何异常 fail-open 放行原文。状态机共 8 个取值（`context_state.go`）：`skip_no_rule`、`skip_protocol`、`skip_body_incomplete`、`skip_parse_err`、`skip_under_threshold`、`trim`、`rewrite`、`repair_rollback`，在访问日志中对应 793-796 号 `ai_context_*` 字段。模块 conf 仅引导配置（`ProductRulePath`），业务调参全部在规则文件顶层 `Defaults` 块，随规则文件热加载。
+
+## 流量镜像实现要点（mod_traffic_mirror）
+
+`mod_traffic_mirror`（`bfe/bfe_modules/mod_traffic_mirror/`）把符合规则的请求异步镜像到影子集群，只注册 `HandleForward` 一个回调（`mod_traffic_mirror.go` 的 `mirrorHandler`），位于转发循环内、主路径之外；匹配、快照与提交全部异步执行，绝不阻塞主路径转发。`Request.Context` 中的 `CtxMirrored` once 标记保证 AI fallback 重试重新进入 `HandleForward` 时不会重复镜像。
+
+镜像规则（`mirror_rule_load.go`）字段：
+
+| 字段 | 说明 |
+|------|------|
+| `cond` | 命中条件；本模块特例——为空表示匹配所有请求 |
+| `percentage` | 0-100 采样百分比 |
+| `removeHeaders` / `setHeaders` | 敏感头剥离 / 注入头 |
+| `bodyRewrites` | 一期仅支持 `path="model"`（改写模型字段） |
+| `pathRewrite` | 镜像请求路径改写 |
+
+镜像请求默认注入 `X-Bfe-Mirror: true` 标识头。镜像后端挑选使用 `bfe_balance.BalanceGslb.PickBackend()`（`mirror_sender.go`）——这是 bfe_balance 提供的无副作用挑选入口：不读不改请求、无会话保持与重试副作用；`bfe_server` 启动时通过 `SetGlobalBalTable`（`bfe_server/bfe_server.go`）进程级注册平衡表。
+
+异步提交由有界队列 + 信号量驱动（`mirror_sender.go`），关键 conf 键（`conf_mod_traffic_mirror.go`）：
+
+| 配置键 | 默认值 | 说明 |
+|--------|--------|------|
+| `ConnectTimeoutMs` / `TTFBTimeoutMs` / `TotalTimeoutMs` | 2000 / 30000 / 600000 | 镜像请求三段超时（ms） |
+| `MaxMirrorBodyBytes` / `MaxResponseBodyBytes` | 2MB / 16MB | 镜像请求体与响应体上限 |
+| `MaxConcurrent` / `QueueCapacity` | 1024 / 4096 | 模块级并发信号量与提交队列容量 |
+| `CircuitBreakerFailThreshold` / `CircuitBreakerCooldownSec` | 50 / 30 | 熔断：连续失败阈值与冷却时间（秒） |
+
+镜像结果（usage / error / finish_reason 解析）只写入模块私有 Prometheus registry，不进访问日志；访问日志仅同步记录 `mirror_hit`（842）、`mirror_cluster`（843）两个字段。
 
 ## 本章小结
 
@@ -464,6 +526,7 @@ mod_ai_rate_limit.NewModuleAiRateLimit(),
 - `QuotaUsageProcessor` 默认注入响应处理链，负责从 SSE 事件或非流式 JSON 中提取 `input_tokens`、`output_tokens`、`total_tokens` 等用量信息，并写入 `TokenUsage` 上下文。
 - RMB 配额扣减仍由 `mod_ai_token_auth` 在请求结束时完成；`mod_body_process` 只提供准确的 Token 用量数据，两者通过请求上下文解耦。
 - 分时段定价的 tier 匹配在 BFE 侧通过 `ModelTable.ActiveTierName` 完成，成本逐项 `quota.CalcCostUnits` 换算为定点整数后累加，避免浮点误差。
+- 同链路模块 `mod_ai_context` 在 `HandleAfterAITargetModel` 按目标模型 token 预算压缩请求上下文（幂等守卫保证 fallback 只压一次），`mod_traffic_mirror` 在 `HandleForward` 异步镜像流量，两者均只影响转发用 `OutRequest` 或旁路流量，不改变 `mod_body_process` 的用量提取与配额链路。
 
 理解 `mod_body_process` 的实现，有助于在扩展新的模型协议、新的内容审核策略或新的计费维度时，保持数据面代码的清晰与可维护性。后续若需支持新的响应格式（如 protobuf 流、multipart），可在 `body_process.go` 中新增 `EventDecoder` 实现并接入 `ContentTypeDecoder` 的分发逻辑；若需新增体处理策略（如 PII 脱敏、关键词替换），则只需实现 `EventProcessor` 并在规则配置中注册即可。
 
@@ -471,6 +534,8 @@ mod_ai_rate_limit.NewModuleAiRateLimit(),
 
 - `bfe/bfe_modules/mod_body_process/` — 模块完整源码。
 - `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go` — API Key 校验、RMB 成本计算与配额扣减。
+- `bfe/bfe_modules/mod_ai_context/` — 上下文压缩模块（`handler.go`、`pipeline.go`、`context_state.go`）。
+- `bfe/bfe_modules/mod_traffic_mirror/` — 流量镜像模块（`mod_traffic_mirror.go`、`mirror_sender.go`、`mirror_rule_load.go`）。
 - `bfe/bfe_modules/bfe_modules.go` — BFE 模块注册顺序。
 - `bfe/bfe_basic/request_ai_basic.go` — `TokenUsage`、`TokenTimeInfo` 定义。
 - `bfe/AGENTS.md` — BFE 模块变更指南（AI gateway module changes 部分）。

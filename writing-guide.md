@@ -68,7 +68,7 @@
    - BFE / 数据面 / 数据平面
    - API-Key（注意大小写）
    - Provider / Cluster / Entity / QuotaPlan / RateLimitPolicy
-2. 组件名称统一：AI Gateway API、Dashboard、BFE、Conf Agent、Service Controller。
+2. 组件名称统一：AI Gateway API、Dashboard、BFE、Conf Agent、ai-gateway-controller（原名 Service Controller）。
 3. 路径统一：章节文件命名遵循 `chapterXX-short-title.md`。
 
 ## 八、章节对应关系

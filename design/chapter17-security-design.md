@@ -7,6 +7,9 @@
 - 壬远AI网关在传输层、认证授权层、策略执行层分别提供了哪些安全机制；
 - API-Key 作为请求链路的直接凭证，如何在控制面存储、如何随 Entity 继承策略、如何在数据面被校验；
 - 控制面的认证授权模型（Visitor、Scope、Feature-Action）及其与 OpenAPI / InnerAPI 的集成方式；
+- 用户口令的 bcrypt 哈希存储、密码策略与存量明文懒迁移机制；
+- 静态数据加密的信封格式、keyring 管理与密钥轮换收敛任务；
+- 管理面 IP 白名单的配置模型、中间件位置、故障语义与热加载；
 - TLS/HTTPS 在控制面与数据面的配置要点；
 - 访问日志审计字段与控制面操作日志如何支撑安全事件追溯与计费对账；
 - Redis 中 Quota Key 与 Rate-Limit Key 的清理触发条件与敏感数据保护实践；
@@ -80,6 +83,8 @@ API-Key 与 **Entity（业务组织单元）** 通过 `api_keys.entity_id` 关�
 
 这种设计使得管理员可以在组织层面统一管控策略，而 API-Key 只作为最终使用凭证。详见 `ai-gateway-api/design-docs/sys-design/details/API-Key与Entity关联及模型继承.md`。
 
+API-Key 值本身不以明文落盘：数据库中的 `api_keys.api_key` 以 `enc$v1$` 信封加密存储，唯一性校验改用不可逆的哈希列，DAO 层透明加解密。落盘加密的完整设计见下文"静态数据加密"一节。
+
 ### 传输安全
 
 API-Key 在 HTTP Header 中传输，必须通过 **TLS/HTTPS** 加密，防止中间人窃取或篡改。生产环境中应关闭明文 HTTP 入口，强制 HTTPS 访问。同时建议：
@@ -88,6 +93,69 @@ API-Key 在 HTTP Header 中传输，必须通过 **TLS/HTTPS** 加密，防止�
 - 利用 `allowed_subnets` 限制可调用的客户端 IP 段；
 - 在 Dashboard 中避免完整展示 API-Key，仅显示前缀与最后几位；
 - API-Key 删除后立即清理其在 Redis 中的 Quota Key 与 Rate-Limit Key，防止残留数据被复用。
+
+### 上游凭证头的清理
+
+当网关使用配置在 Provider 中的 Key 向上游发起请求时，出站请求只保留本次注入的那一个凭证头；客户端带来的 `Authorization`、`x-api-key`、`x-goog-api-key`（各协议注册的凭证头并集）全部删除。这一互斥规则有三重安全意义：
+
+- 防止调用方的下游凭证被转发给第三方上游，造成凭证泄露或跨租户冒用；
+- 防止上游在同时收到两个凭证时按客户端凭证鉴权，绕过网关的 Key 池、惩罚与配额控制；
+- 清理只作用于出站 header 副本，入站 header 保留用于日志与审计，但不再参与上游鉴权。
+
+无 Keys 配置的透传集群既不清理也不注入，客户端凭证按设计直达上游，此时应由集群准入、网络边界与上游自身的鉴权策略保证可信。
+
+---
+
+## 静态数据加密（Encryption at Rest）
+
+控制面数据库中的 API-Key 与上游 Provider 密钥均不以明文落盘：控制面以基于 keyring 的落盘加密保护这两类字段（实现见 `ai-gateway-api/lib/xcrypto/` 与 `ai-gateway-api/design-docs/sys-design/details/密钥静态加密.md`），DAO 层对读写做透明加解密，业务代码无感知。
+
+### 信封格式与密钥注入
+
+落盘加密复用与导出加密相同的信封格式：
+
+```
+enc$v1$<base64(keyID(1B) | nonce(12B) | AES-256-GCM 密文+tag)>
+```
+
+无前缀 marker 的值按明文直通，便于灰度迁移。密钥通过 `ai_gateway_api.toml` 的 `[Security]` 段注入，文件路径是唯一注入方式，不提供环境变量：
+
+```toml
+[Security]
+# keyring 文件（TOML）路径；空 = 关闭落盘加密
+MasterKeyFile = "/etc/ai-gateway/master_keys.toml"
+
+# keyring 中用于加密新写入值的密钥 ID
+ActiveKeyID = 1
+```
+
+与导出 keyring（见 [第十四章](./chapter14-config-export-and-version-control.md)）不同，落盘 keyring 的每个密钥经 **HKDF-SHA256** 派生出两种用途的子密钥：`db-enc-key`（字段加解密）与 `hash-pepper`（哈希胡椒）。keyring 支持多钥并存与**原子热替换**：更新文件后调用 monitor 端口的 `/reload/security` 即可完成轮换，无需重启。
+
+启动语义为 fail-fast：若库中已存在密文但 keyring 缺失或密钥不匹配，控制面拒绝启动；若库中无密文且未配置密钥，允许启动，便于从明文逐步过渡到加密（渐进启用）。
+
+### Provider 密钥列的类型与启动自检
+
+`providers.api_keys` 列的类型为 `MEDIUMTEXT`，整列以单个 `enc$v1$` 信封承载 key 池 JSON 序列化后的密文；无前缀的值仍按明文 JSON 读取。整列信封而非逐字段加密的取舍是：key 池的条目数量与字段结构随 Provider 类型变化，整列加密让 schema 不感知内部结构，也避免同一 Provider 的多个 key 出现部分加密、部分明文的混合状态。
+
+配置了 `[Security].MasterKeyFile` 时，控制面在启动阶段自检 `providers.api_keys` 的数据库列类型：若仍为 JSON 类型，则拒绝启动，并输出待执行的 `ALTER TABLE` 语句（对应升级脚本 `ai-gateway-api/database/db_ddl_upgrade_to_0.0.11.sql` §1.6 中的列类型调整）。该校验把"密文写入 JSON 列"这类隐式失败提前到启动期，而不是等到第一次写入 Provider 才暴露。
+
+读路径遇到无法解密的坏值（信封损坏、`keyID` 不在 keyring、密钥不匹配）时返回 500，不静默降级为明文、空值或"未配置密钥"，避免把密钥损坏伪装成 Provider 无凭证而向上游发出错误请求。
+
+### 配套数据库结构
+
+- `api_keys` 表含 `api_key_hash char(64)` 列，内容为 `HMAC-SHA256(pepper, key)` 的十六进制串，不可逆，用于唯一性校验；唯一键为 `uk_api_key_hash`；
+- `keyrotate_sweep_tasks` 表记录密钥轮换收敛任务，字段含 `created_by`、`mode`、`dry_run`、`scope`、`scanned`、`rewritten`、`summary` 等；
+- `keyrotate_sweep_lock` 表是多实例部署下的任务互斥锁，支持失联接管，防止多个控制面实例并发执行收敛。
+
+### 收敛任务 sweep
+
+存量明文不会自动加密，而是由收敛任务（sweep）强制收敛：
+
+- `mode=reencrypt`（默认）：将库中密文与明文统一重加密到当前 active 密钥；
+- `mode=decrypt`：解密回明文，作为密钥丢失等场景的**回滚预案**；
+- 支持 `dry_run`（只扫描统计，不重写数据）；按主键游标分批扫描，批内带心跳防止锁表超时，依赖锁表实现多实例互斥。
+
+sweep 任务的历史可通过 `GET /open-api/v1/security/reencrypt-sweeps` 翻查：支持 `page`/`page_size` 分页与 `sort_by`（仅 `started_at`、`task_id`）/`sort_order` 排序，并可按 `status`/`mode`/`scope`/`dry_run`/`start_time`/`end_time` 过滤。任务对象含 `created_by`；运行中任务的 `summary` 为空对象、`duration_ms` 为 0；dry-run 成功的任务 `error="dry_run"`。
 
 ---
 
@@ -191,14 +259,61 @@ var APIKeyCreateRoute = &xreq.Endpoint{
 HTTP Request
     │
     ▼
-MCRecovery ──► MCLogger ──► MCCors
+MCRecovery ──► MCLogger ──► McIPProbe ──► MCCors
     │
     ▼
 /open-api/v1: McProductProbe ──► McUserProbe
 /inner-api/v1: McUserProbe
 ```
 
-`McUserProbe` 负责解析 `Authorization` Header 并完成认证，将 `Visitor` 写入 `context`；`McProductProbe` 负责从 URL Path 中解析产品线上下文。每个带 `Authorizer` 的 Endpoint 会单独创建 Subrouter 并挂载鉴权中间件。
+`McUserProbe` 负责解析 `Authorization` Header 并完成认证，将 `Visitor` 写入 `context`；`McProductProbe` 负责从 URL Path 中解析产品线上下文。每个带 `Authorizer` 的 Endpoint 会单独创建 Subrouter 并挂载鉴权中间件。`McIPProbe` 即上节所述管理面 IP 白名单中间件。
+
+### 用户口令的 bcrypt 哈希存储
+
+Dashboard 用户的口令统一以 **bcrypt** 哈希形式存储在 `users.password` 中（实现见 `ai-gateway-api/lib/xcrypto/password.go` 与 `model/iauth/authentication.go`）：
+
+- 登录、改密等比对路径全部使用 bcrypt 恒时比较，不存在任何旁路口令（`"SKIP"` 字面量不具特权），杜绝时间侧信道；
+- `[Security].PasswordHashCost` 控制哈希强度，默认 10，合法范围 4-16，越界时启动 fail-fast；
+- 密码策略为 8-72 **字节**（按 UTF-8 字节计数，受 bcrypt 72 字节上限约束）；
+- **存量明文口令的迁移**：历史明文口令在该用户首次登录成功时，于同事务内重哈希落库（懒迁移）；因此升级顺序为先升代码、后刷数据——若先用脚本改写库中口令，旧代码将无法校验、新代码也无法识别。
+
+---
+
+## 管理面访问控制（IP 白名单）
+
+除 Token/密码认证外，控制面支持按**客户端 IP 子网**限制管理接口的访问范围（实现见 `ai-gateway-api/stateful/access_control.go` 与 `endpoints/middleware/ip_probe.go`）。配置位于 `ai_gateway_api.toml` 的 `[AccessControl]` 段；样例配置中整段默认注释，即关闭状态。
+
+```toml
+[AccessControl]
+# 总开关，默认 false
+Enable = true
+# 可信代理网段（CIDR 列表）
+TrustedProxies = ["10.0.0.0/8"]
+
+[[AccessControl.Rules]]
+Name = "ops-console"
+PathPrefix = "/open-api/v1"
+Subnets = ["192.168.0.0/16"]
+# 观察模式：命中拒绝时仅记录日志与计数，不真正拒绝
+Audit = false
+```
+
+关键语义：
+
+- `Subnets` 为必填，缺失时启动 fail-fast；
+- 客户端 IP 解析遵循与 BFE `mod_trust_clientip` 同源的逻辑：仅当对端 IP 属于 `TrustedProxies` 时才解析 `X-Forwarded-For`，从右起跳过可信代理、取第一个非可信 IP；不可信来源携带的 XFF 一律忽略（一期不使用 `X-Real-IP`）；
+- 按 `PathPrefix` **最长匹配**选取一条规则；未命中任何规则的请求直接放行；
+- 命中拒绝时返回 `403 {"ErrNum":403,"Type":"Access Forbidden"}`。
+
+### 中间件位置与故障语义
+
+全局中间件 `McIPProbe` 位于 `MCLogger` 之后、`MCCors` 之前，先于鉴权执行，被拒绝的请求不会进入认证与授权流程。
+
+白名单组件自身故障时采取 **fail-open**：客户端 IP 解析失败时放行请求，同时通过 Prometheus 计数器 `mgmt_access_reject_total{rule="unresolvable"}` 暴露异常，便于运维及时发现配置问题。
+
+### 热加载
+
+访问控制规则与可信代理网段支持热更新：修改配置后调用 monitor 端口的 `/reload/access_control` 即可生效，无需重启。
 
 ---
 
@@ -416,8 +531,11 @@ BFE 的 TLS 配置通常位于 `conf/tls_conf/tls_rule_conf.data`，示例片段
 ## 本章小结
 
 - 壬远AI网关采用分层防御思想，安全机制覆盖传输层、认证授权层、请求准入层与策略执行层。
-- API-Key 是请求链路的直接凭证，应通过 HTTPS 传输，并结合 Entity 继承实现组织级策略管控。
-- 控制面采用 Visitor 抽象与 Feature-Action 权限模型，支持 Password、Session、Token、Skip 四种认证方式；生产环境必须关闭 `SkipTokenValidate`。
+- API-Key 是请求链路的直接凭证，应通过 HTTPS 传输，并结合 Entity 继承实现组织级策略管控；API-Key 与上游 Provider 密钥均以 `enc$v1$` 信封加密落盘，DAO 透明加解密。
+- 上游凭证注入遵循"只保留本次注入头"的互斥规则，客户端的 `Authorization` / `x-api-key` / `x-goog-api-key` 不随出站请求转发；`providers.api_keys` 为 `MEDIUMTEXT` 整列信封，配置密钥时启动自检列类型并在 JSON 类型下 fail-fast。
+- 控制面采用 Visitor 抽象与 Feature-Action 权限模型，支持 Password、Session、Token、Skip 四种认证方式；生产环境必须关闭 `SkipTokenValidate`；用户口令以 bcrypt 哈希存储，密码策略为 8-72 字节，存量明文通过首次登录懒迁移。
+- 落盘加密密钥经 `MasterKeyFile` 注入，支持多钥 HKDF 派生与 `/reload/security` 热轮换；存量数据由 reencrypt/decrypt sweep 收敛，历史任务可经 `GET /open-api/v1/security/reencrypt-sweeps` 翻查。
+- 管理面支持基于 `PathPrefix` 最长匹配的 IP 白名单（`McIPProbe`，先于鉴权），自身故障 fail-open 并暴露 Prometheus 计数，可经 `/reload/access_control` 热加载。
 - 数据面 BFE 输出结构化错误响应与访问日志字段，支撑安全审计、异常检测与计费对账；控制面操作日志持久化记录配置写操作，可经 `GET /open-api/v1/operation-logs` 审计追溯。
 - Redis 中的 Quota Key 与 Rate-Limit Key 在 API-Key / Entity 删除或策略变更时会被主动清理，避免残留数据带来的安全风险。
 - 限流与配额是防止 API-Key 泄露、滥用和成本失控的关键防线，支持 API-Key 与 Entity 多层级继承。

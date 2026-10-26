@@ -56,7 +56,7 @@ The `users` table stores both types of records. Its core fields are as follows:
 | `id` | Primary key |
 | `name` | Username / Token name |
 | `type` | `0`=user, `1`=Token |
-| `password` | User password (currently stored in plaintext) |
+| `password` | User password, stored as a bcrypt hash; the hash cost is controlled by `[Security].PasswordHashCost` (default 10), and legacy plaintext passwords are lazily migrated to bcrypt after a successful validation |
 | `ticket` | Session Key or Token value |
 | `ticket_created_at` | Session Key creation time |
 | `scopes` | Permission scopes, concatenated with commas |
@@ -125,6 +125,7 @@ The global `scope2permission` defines the mapping from Scopes to permissions:
 | Scope | Meaning | Permission Range |
 |-------|------|---------|
 | `System` | System administrator | All Actions for all Features |
+| `SystemReadonly` | System administrator (read-only) | Explicitly lists all 37 Features with `ActionRead`/`ActionReadAll` only; all write endpoints return 403 |
 | `Support` | Export/support Token | Only some Features have `ActionExport` |
 
 `AuthorizeManager.Authorizate` performs the following steps:
@@ -135,7 +136,28 @@ The global `scope2permission` defines the mapping from Scopes to permissions:
 4. Determine whether the required Action is allowed;
 5. If `authorizer.ValidateProduct == true`, additionally call `IsVisitorProductGranted` to validate the product line binding.
 
-> Note: The `Product` Scope has been removed from OpenAPI, user `is_admin` only supports `true`, and the Token `scope` only retains `System` and `Support`. The `user_products` table is kept for future multi-tenant extensions.
+> Note: The `Product` Scope has been removed from OpenAPI, and the `user_products` table is kept for future multi-tenant extensions.
+
+### User Roles
+
+The user resource expresses the role through a `role` field with the values `system_admin` (system administrator) and `system_admin_readonly` (system administrator, read-only); the validation logic is in `ai-gateway-api/lib/validate/validate.go`. Roles are implemented with **zero DDL**: they reuse the `users.scopes` field, where `SystemReadonly` is the read-only value, mapped bidirectionally via `roleToScopes`/`scopesToRole`; records with `scopes='System'` are presented as `system_admin` in responses.
+
+The user resource does not provide an `is_admin` field, and the `/open-api/v1/auth/users/{user_name}/is_admin` path does not exist (returns 404). The sole entry point for role changes is:
+
+```
+PATCH /open-api/v1/auth/users/{user_name}/role
+Body: {"role": "system_admin" | "system_admin_readonly"}
+```
+
+The built-in `admin` user has a fixed `role` of `system_admin`; attempting to downgrade it returns 422. The Token `scope` takes `System`/`SystemReadonly`/`Support`.
+
+In the permission mapping, `scope2permission` has a dedicated entry for `SystemReadonly`: it explicitly lists all 37 Features, granting only `ActionRead`/`ActionReadAll`; all write endpoints (`ActionCreate`/`ActionUpdate`/`ActionDelete`, etc.) return 403. To accompany this role, the OpenAPI v1 response assembly layer (`lib/xmask`, applied only to openapi_v1, leaving InnerAPI exports untouched) masks sensitive fields for the read-only role: `key` of `api-keys`, `keys[].key` of `providers`, and `token` of `tokens`. The login response still returns the caller's own Session Key, while user list/detail responses contain no Session Key (an established contract).
+
+Front-end constraint: Control Plane responses carry no `is_admin`, and the old front-end guard rejects every user, so enabling the read-only role requires the front end and AI Gateway API to be deployed at the same version; the `allowed_roles` of query-type nodes in `conf/nav_tree.toml` include the read-only role so that read-only administrators can see the corresponding menus.
+
+### Username References and the Password Contract
+
+The reserved names `admin`/`root`/`system` are constrained only at user creation; endpoints that reference a user by name (such as `PATCH /open-api/v1/auth/users/{user_name}/passwd`) resolve it via `UserNameRef`, so the built-in `admin` can also change its password through the API. The password contract is consistent between creation and update: **8–72 bytes** (the bcrypt limit), while the constraints "no spaces, not equal to the username or its reverse" still apply.
 
 ---
 
@@ -146,7 +168,7 @@ The global `scope2permission` defines the mapping from Scopes to permissions:
 | Visitor | Dashboard user / third-party integration Token | Conf Agent / BFE Token |
 | Middleware | `McProductProbe` + `McUserProbe` | `McUserProbe` only |
 | Permission Granularity | Feature-Action + product line binding | Usually Feature-Action only |
-| Token Scope | `System` / `Support` | `System` / `Support` |
+| Token Scope | `System` / `SystemReadonly` / `Support` | `System` / `SystemReadonly` / `Support` |
 | Typical Use | Configuration management | Configuration export |
 
 Although InnerAPI export endpoints (such as `/configs/mod-api-key`) also perform authentication and authorization on visitors, Conf Agent usually pulls configurations with a Token of the `Support` Scope, whose permission range is narrow, avoiding exposure of management-plane capabilities.
@@ -192,6 +214,8 @@ This chapter introduced the authentication and authorization design of the Rainw
 - `model/iauth` serves both OpenAPI and InnerAPI; users and Tokens share the `users` table and are unified under the `Visitor` abstraction;
 - There are four authentication methods — Password, Session, Token, and Skip — applicable to login, regular calls, programmatic calls, and debugging scenarios respectively;
 - Authorization adopts the Feature-Action bitmask model; each Endpoint declares its required permissions, and Scopes determine the permission range;
+- User roles are `system_admin`/`system_admin_readonly`, implemented with zero DDL by reusing `users.scopes` (`SystemReadonly` is the read-only value); the user resource carries no `is_admin` field, and role changes go through `PATCH .../role`; Token Scopes are `System`/`SystemReadonly`/`Support`;
+- User passwords are stored with bcrypt (8–72 bytes); reserved-name constraints apply only at creation, and name-referenced endpoints use `UserNameRef`;
 - The authentication and authorization chains differ between OpenAPI and InnerAPI; InnerAPI usually only goes through `McUserProbe`;
 - The `user_products` table is retained in preparation for future multi-tenant extensions.
 

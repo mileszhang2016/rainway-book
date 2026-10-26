@@ -7,7 +7,7 @@ By reading this chapter, you will be able to:
 - Understand what Rainway AI Gateway is and the core problems it solves.
 - Learn about the common pain points enterprises face when using Large Language Models (LLMs) at scale.
 - Understand the core capability boundaries of Rainway AI Gateway, including AI routing, API-Key management, quota and rate limiting, model pricing, and observability.
-- Gain an initial understanding of the five major components of the system: AI Gateway API, Dashboard, BFE, Conf Agent, and Service Controller.
+- Gain an initial understanding of the five major components of the system: AI Gateway API, Dashboard, BFE, Conf Agent, and ai-gateway-controller (formerly Service Controller).
 - Understand the relationship between Rainway AI Gateway and the BFE open source project, and develop an intuitive understanding of typical application scenarios.
 
 This chapter is intended for all readers and does not assume you have deep background in gateways or AI. The English names of technical terms are given when they first appear; later chapters will go into greater depth.
@@ -94,7 +94,7 @@ Rainway AI Gateway consists of five core components working together:
 | **Dashboard** | Management Console | Web-based visual management interface; performs configuration operations via OpenAPI |
 | **BFE** | Data Plane | Handles traffic forwarding, access control, AI routing, quota validation, rate limit enforcement, etc. |
 | **Conf Agent** | Configuration Agent | Pulls the latest configuration from InnerAPI and triggers BFE hot reload without restarting the Data Plane |
-| **Service Controller** | Service Discovery | Discovers and syncs backend service instances in Kubernetes environments; dynamically updates BFE's upstream clusters |
+| **ai-gateway-controller** | Service Discovery | In Kubernetes, reports Ready instances of Services/Endpoints as a K8s pool (InnerAPI `k8s_pools`); the Control Plane fans it out to the Provider mirror and Cluster derived pools, which are exported to BFE via `cluster_table` |
 
 The relationship among these five components is summarized in the following diagram:
 
@@ -109,12 +109,12 @@ flowchart TB
         API["AI Gateway API<br/>Policy/Configuration Management"]
         MySQL[("MySQL / SQLite<br/>Configuration Persistence")]
         Redis[("Redis<br/>Real-time Quota Cache")]
+        SC["ai-gateway-controller<br/>K8s Pool Reporting"]
     end
 
     subgraph Data Plane
         CA["Conf Agent<br/>Config Pull / Hot Reload"]
         BFE["BFE<br/>Traffic Forwarding / Routing / Rate Limiting"]
-        SC["Service Controller<br/>K8s Service Discovery"]
     end
 
     subgraph Downstream
@@ -127,9 +127,9 @@ flowchart TB
     Script -->|OpenAPI| API
     API --> MySQL
     API --> Redis
+    SC -->|InnerAPI k8s_pools| API
     API -->|InnerAPI| CA
     CA -->|Trigger hot reload| BFE
-    BFE -->|Fetch upstream instances| SC
     BFE --> ProviderA
     BFE --> ProviderB
     BFE --> ProviderC
@@ -157,9 +157,9 @@ BFE is a modern open source Layer-7 load balancer from Baidu and the Data Plane 
 
 Conf Agent is deployed on BFE nodes and periodically pulls the latest configuration from the InnerAPI. When it detects a configuration version change, it writes the new configuration locally and notifies BFE to hot reload, updating policies without interrupting traffic.
 
-### Service Controller
+### ai-gateway-controller
 
-In Kubernetes environments, backend model services often scale dynamically as Pods. Service Controller watches K8s Service and Endpoints changes and syncs available instances to BFE, ensuring the Data Plane always has the correct upstream address list.
+ai-gateway-controller is a controller (built on controller-runtime) deployed inside a Kubernetes cluster. It watches Services carrying the `ai-gateway-api-name` label together with their same-named Endpoints, and for each named port reports the Ready backend instances in full via the InnerAPI `PUT /inner-api/v1/k8s_pools/{name}/instances` as a "K8s Pool". The Control Plane then fans the pool members out to the Provider mirror (`k8s_instance_pool`) and the Cluster derived pools of every referencing Provider, and they finally reach BFE through the `cluster_table` export. The controller never connects to the Data Plane directly; BFE still sees only the backend lists exported by the Control Plane.
 
 ## Relationship with the BFE Open Source Project
 
@@ -227,7 +227,7 @@ This chapter introduced Rainway AI Gateway from three dimensions: "what it is," 
 - **Name and background**: "壬远" signifies exploring the distance ahead; Rainway signifies making the path to accessing AI capabilities smoother. The project is built on open source BFE and solves management challenges when enterprises use Large Models from multiple vendors at scale.
 - **Pain points**: Complex multi-vendor integration, chaotic API-Key management, uncontrollable costs, lack of traffic scheduling, security and compliance risks, and insufficient observability.
 - **Core capabilities**: AI routing, API-Key management, quota and rate limiting, model pricing, domain and certificate management, observability, and configuration version control with incremental distribution.
-- **System components**: The Control Plane's AI Gateway API and Dashboard, the Data Plane's BFE, the configuration agent Conf Agent, and service discovery via Service Controller.
+- **System components**: The Control Plane's AI Gateway API and Dashboard, the Data Plane's BFE, the configuration agent Conf Agent, and Kubernetes service discovery via ai-gateway-controller.
 - **Relationship with BFE**: BFE is the foundational engine; Rainway AI Gateway is the complete solution for AI scenarios.
 - **Typical scenarios**: Unified AI access platform, multi-model grayscale release and failover, cost quota management, and private deployment with compliance auditing.
 

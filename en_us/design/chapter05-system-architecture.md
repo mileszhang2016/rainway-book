@@ -5,7 +5,7 @@
 Through this chapter, readers will understand:
 - How the Rainway AI Gateway addresses the core problems enterprises face when integrating LLM services at scale;
 - The overall architecture of the Rainway AI Gateway and the division of responsibilities between the Control Plane and the Data Plane;
-- How the core components (AI Gateway API, Dashboard, BFE, Conf Agent, Service Controller, Log Reader) work together;
+- How the core components (AI Gateway API, Dashboard, BFE, Conf Agent, ai-gateway-controller (formerly Service Controller), Log Reader) work together;
 - The full lifecycle of a configuration from creation to taking effect;
 - Typical deployment topologies.
 
@@ -85,6 +85,7 @@ Before using the Rainway AI Gateway, you need to understand the following key co
 |---|---|---|
 | BFE cluster | BFECluster | Registers Data Plane BFE engine addresses; the Control Plane uses it to know who to deliver configurations to (Server Data, maintained by deployment seed data, no OpenAPI management endpoint) |
 | Model provider | Provider | Describes a model service provider, including protocol type, backend instance pool, model list, and authentication keys |
+| K8s Pool | K8s Pool | A backend instance pool reported to the Control Plane by ai-gateway-controller; a Provider can reference a pool by name instead of maintaining the instance list manually |
 | AI business cluster | Cluster | The backend cluster to which traffic is actually forwarded; declares its upstream capability by referencing a Provider |
 | Organization | Entity | Represents organizational structures such as departments, teams, or projects; the mount point for quota, rate limit, model access control, and routing rules |
 | API credential | API-Key | The credential used by business systems when calling the Data Plane forwarding entry; can be attached to an Entity to inherit policies |
@@ -103,9 +104,23 @@ The "model provider" corresponds to the `/providers` resource of the OpenAPI, an
 - Backend instance pool (`instance_pool`): the real AI service endpoints;
 - Model protocols (`model_protocols`): e.g. `openai`, `anthropic`, `gemini`;
 - Model list (`models`) and the model discovery endpoint;
-- Plaintext service authentication keys (`keys`).
+- Service authentication keys (`keys`) used to access upstream model services; they are stored encrypted at rest in the database (field-level `enc$v1$` envelope for upstream key fields) and are likewise protected by export encryption (see [Chapter 17 Security Design](./chapter17-security-design.md)).
 
 Multiple Clusters can reference the same Provider, enabling reuse of instance pools and keys.
+
+### K8s Pool
+
+The "K8s Pool" corresponds to the pool data maintained by the InnerAPI `/inner-api/v1/k8s_pools`. Its sole writer is the ai-gateway-controller deployed in a Kubernetes environment. A Provider references a K8s Pool by `instance_source=k8s_pool` and the pool name; the instance list is automatically synced and refreshed by the Control Plane, so backend addresses require no manual maintenance.
+
+The conventions between the controller and the cluster are:
+
+- **Filtering**: only Services carrying the `ai-gateway-api-name` label are processed (the label value must equal the `--ai-gateway-api-name` argument, `*` matches any), and only within the namespace list given by `--namespace`.
+- **Ports and instances**: one pool is created per named Service port, unnamed ports are skipped; instances come from the Ready addresses of the same-named Endpoints, `notReadyAddresses` is ignored, and `(addr, port)` is deduplicated before a full-replacement `PUT`, so repeated reporting is idempotent.
+- **Pool naming**: `k8s_<namespace>_<service>_<port>[_<cluster>]`; names longer than 64 characters are folded into the first 55 characters plus `_` and the first 8 hex digits of a sha256 hash. A pool name is 1-64 characters and may contain only letters, digits, `_`, `-`, and `.`.
+- **Empty pools and cleanup**: with no Ready address the controller reports an explicit empty array `[]`, keeping the pool with zero instances; when a port is renamed or removed the stale pools are deleted by set difference; Service deletion is intercepted by the finalizer `k8s.bfenetworks.com/delete-protection`, which deletes the pools before letting the Service go.
+- **Authentication**: the controller calls the InnerAPI with `--ai-gateway-api-token` in the form `Token <identify>`; the Token must belong to the System Scope and hold write permission on the `k8s_pools` domain, otherwise the call returns 402.
+
+Once reported, AI Gateway API fans the pool members out within a single transaction to the read-only Provider mirror `k8s_instance_pool` and to the Cluster derived pools of every referencing Provider, and they finally reach BFE through the `cluster_table` export. From a Provider's perspective, "pool absent" and "pool present with zero instances" are equivalent. For the detailed design, see [Chapter 10: Provider and Cluster Design](./chapter10-provider-and-cluster.md).
 
 ### AI Business Cluster (Cluster)
 
@@ -191,13 +206,13 @@ Conf Agent is a Sidecar component deployed alongside BFE. Its main responsibilit
 
 Thanks to Conf Agent, the Control Plane does not need to connect to the Data Plane directly — configuration delivery is **pull-based**, which naturally suits deployments across network zones.
 
-### Service Controller (Service Discovery)
+### ai-gateway-controller (Service Discovery)
 
-Service Controller is used to discover backend services in Kubernetes environments and synchronize service addresses to AI Gateway API. In this way, backend instances in a Cluster can automatically follow K8s service changes, reducing manual maintenance costs.
+ai-gateway-controller is a controller (built on controller-runtime) deployed inside a Kubernetes cluster. It writes service discovery results into the Control Plane: it watches Services carrying the `ai-gateway-api-name` label together with their same-named Endpoints, and for each named port reports the Ready instances in full via the InnerAPI `PUT /inner-api/v1/k8s_pools/{name}/instances` as a K8s pool. The Control Plane then fans the pool members out to the Provider mirror `k8s_instance_pool` and to the Cluster derived pools, which reach BFE through the `cluster_table` export. The controller never connects to BFE and never modifies Provider or Cluster configuration; referencing a pool from a Provider is declared by operators through the OpenAPI. For implementation and deployment details, see [Chapter 37 ai-gateway-controller Implementation](../implementation/chapter37-controller-implementation.md).
 
 ### Log Reader (Data Plane Log Collection)
 
-Log Reader is the Data Plane log collection component (repository `rainway-ai-gateway/log-reader`). Deployed alongside BFE, it reads the access logs produced by BFE, parses them into structured records of token usage, latency, status codes, and more, and writes them to Kafka or MySQL for report aggregation and observability analysis. See [Chapter 15 Observability Design](./chapter15-observability.md) for details.
+Log Reader is the Data Plane log collection component (repository `rainway-ai-gateway/log-reader`). Deployed alongside BFE, it reads the access logs produced by BFE (the `bfe-access-pb` protocol), parses the registered fields into structured records of token usage, latency, status codes, and more, and writes them — according to the field registration results — to MySQL (the `mod_log_mysql` plugin, 99 columns) or Kafka (the `mod_kafka` plugin, JSON form) for report aggregation and observability analysis. See [Chapter 15 Observability Design](./chapter15-observability.md) for details.
 
 ---
 
@@ -335,7 +350,7 @@ For detailed deployment steps, see [Chapter 18: Installation and Deployment](../
 
 - As a unified access layer, the Rainway AI Gateway solves problems such as multi-provider integration, API-Key management, cost and quota control, high availability, and security auditing.
 - The system adopts a separated Control Plane and Data Plane architecture: the Control Plane manages policies, and the Data Plane forwards requests and enforces policies.
-- Core components include AI Gateway API, Dashboard, BFE, Conf Agent, Service Controller, and Log Reader.
+- Core components include AI Gateway API, Dashboard, BFE, Conf Agent, ai-gateway-controller, and Log Reader.
 - The configuration lifecycle covers six stages: creation, storage, export, pull, hot reload, and taking effect.
 - Multiple topologies are supported, from minimal deployment to multi-zone production deployment.
 

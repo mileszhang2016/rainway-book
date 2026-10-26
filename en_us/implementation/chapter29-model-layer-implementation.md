@@ -31,8 +31,13 @@ model/
 ├── itxn/                 # Transaction abstraction interface
 ├── ibasic/               # Products, BFE clusters, attachment files
 ├── icluster_conf/        # Cluster, SubCluster, Pool
-├── iprovider/            # Provider and model discovery
+├── iprovider/            # Provider, model discovery, and the Effective Instance Pool contract
 ├── imodel_price/         # Model pricing
+├── ai_cache/             # AI cache rules and semantic cache settings
+├── ai_context/           # Context compression rules and global settings
+├── traffic_mirror/       # Traffic mirror rules
+├── iintent_config/       # Intent configuration singleton
+├── ik8s_pool/            # K8s Pool maintenance and fan-out synchronization
 └── ...
 ```
 
@@ -49,7 +54,8 @@ The responsibilities of each subpackage can be summarized as follows:
 - `route_rules`: Manages three-level AI route rules: Global / Entity / API-Key.
 - `shared`: Provides cross-package shared Param, Filter, and Storager interfaces, as well as common structures such as route rules and quota balances.
 - `itxn`: Provides a minimal transaction abstraction, which is the cornerstone of consistency across the entire model layer.
-- `icluster_conf` / `iprovider` / `imodel_price`: Responsible respectively for cluster forwarding policies, Provider integration capabilities, and model pricing — resources closely tied to Data Plane export.
+- `icluster_conf` / `iprovider` / `imodel_price`: Responsible respectively for cluster forwarding policies, Provider integration capabilities, and model pricing — resources closely tied to Data Plane export. Among them, `model/iprovider` also carries the dual-mode instance source (the three fields `instance_source` / `k8s_pool_name` / `k8s_instance_pool`) and the Effective Instance Pool contract `EffectiveInstancePool()` (K8s Pool takes precedence; downstream code consumes instance pools only through this single entry point) — see [Chapter 10: Provider and Cluster Design](../design/chapter10-provider-and-cluster.md).
+- `ai_cache` / `ai_context` / `traffic_mirror` / `iintent_config` / `ik8s_pool`: The five rule-type resource domains of AI cache rules, context compression rules, traffic mirror rules, the intent configuration singleton, and K8s Pools. They follow the same Manager + Storager conventions; the three rule collection domains implement whole-collection replacement inside the Manager with a single-transaction delete-all + insert-all, while the intent configuration and the two global settings use single-row overwrite.
 
 ## The Param / Filter / Storager / Manager Four-Layer Abstraction
 
@@ -650,9 +656,9 @@ _, err = m.planStorager.UpdateQuotaPlan(ctx, &QuotaPlanFilter{
 
 Note that the manual reset path (`QuotaPlanManager.ResetBalance`) still goes through `ResetToQuota` (internally the `IncrBy(delta)` of `SetRemaining`), because a manual reset must bring the remaining amount up to the total quota based on the current value; a periodic reset, by contrast, must "unconditionally zero the balance to the total quota." The two semantics differ, and their implementations are deliberately kept separate.
 
-## Reporting Module: ReportManager and Dual-Backend Storagers
+## Reporting Module: ReportManager and Multi-Backend Storagers
 
-The report queries (`/report/*`) are an application of the Manager + Storager pattern across multiple data sources. The report database (MySQL `bfe_report` or Doris `bfe_observability`) is queried read-only and sits outside the Control Plane database, so it does not go through the `itxn.TxnStorager` transaction system; the model layer defines a query interface directly and the storage layer implements it:
+The report queries (`/report/*`) are an application of the Manager + Storager pattern across multiple data sources. The report database (MySQL `bfe_report`, Doris `bfe_observability`, or the same-named database in ClickHouse / StarRocks) is queried read-only and sits outside the Control Plane database, so it does not go through the `itxn.TxnStorager` transaction system; the model layer defines a query interface directly and the storage layer implements it:
 
 ```go
 // ai-gateway-api/model/ireport/types.go
@@ -665,9 +671,9 @@ type ReportStorager interface {
 }
 ```
 
-`ReportManager` (`model/ireport/manager.go`) has the same responsibilities as other Managers at this layer — parameter binding validation (go-playground/validator convention), enum and window validation (time window ≤7 days), bucket calculation (≤6h→60s, ≤3d→300s, ≤7d→1800s), and metric definition constants (error rate = `error_count/request_count`; TTFT/TPOT aggregated over streaming requests only). It contains no SQL; all queries are delegated to `ReportStorager`. The two backends (`storage/mysqlreport`, `storage/dorisreport`) share the same interface, with SQL dialect differences (time-bucket functions, percentile functions) encapsulated in the respective implementations, so neither the Manager nor the endpoint layer is backend-aware.
+`ReportManager` (`model/ireport/manager.go`) has the same responsibilities as other Managers at this layer — parameter binding validation (go-playground/validator convention), enum and window validation (time window ≤7 days), bucket calculation (≤6h→60s, ≤3d→300s, ≤7d→1800s), and metric definition constants (error rate = `error_count/request_count`; TTFT/TPOT aggregated over streaming requests only). It contains no SQL; all queries are delegated to `ReportStorager`. The four backends (`storage/mysqlreport`, `storage/dorisreport`, `storage/clickhousereport`, `storage/starrocksreport`) share the same interface, with SQL dialect differences (time-bucket functions, percentile functions, etc.) encapsulated in the respective implementations, so neither the Manager nor the endpoint layer is backend-aware.
 
-Assembly is done by `stateful/container/rdb/components.go` based on `[Report].Backend`: with `mysql` it assembles the MySQL implementation and starts the aggregation/partition JOBs; with `doris` it assembles the Doris implementation (aggregation is handled by the existing Doris INSERT JOB, so no JOBs start); when the configuration is absent, `ReportManager` is nil and the interface layer skips registering the `/report/*` routes accordingly (see the conditional assembly in Chapter 28). For authorization, a new `FeatureReport` is added: System scope is granted `ReadAll` (the console is currently administrator-only), and Product scope is granted `Read` as a reservation for tenant self-service usage reports.
+Assembly is done by `stateful/container/rdb/components.go` based on `[Report].Backend`: with `mysql` it assembles the MySQL implementation and starts the aggregation/partition JOBs; with `doris` / `clickhouse` / `starrocks` it assembles the corresponding implementation (aggregation is handled by the Doris INSERT JOB, ClickHouse materialized views, and StarRocks asynchronous materialized views respectively, none of which start local JOBs); when the configuration is absent, `ReportManager` is nil and the interface layer skips registering the `/report/*` routes accordingly (see the conditional assembly in Chapter 28). The authorization feature `FeatureReport`: System scope is granted `ReadAll` (the console is currently administrator-only), and Product scope is granted `Read` as a reservation for tenant self-service usage reports.
 
 ## Key Code Snippets
 

@@ -9,6 +9,8 @@ Through this chapter, readers will understand:
 - The `model-list.yaml` bulk import format and how to use it;
 - The design and implementation of tiered pricing for RMB quota;
 - How the BFE Data Plane performs runtime cost calculation based on pricing data;
+- The discount pricing model for batch tasks and the export expansion rules;
+- The entry-driven billing for image/video and the fallback-to-chat-price rule when a mode has no price entry;
 - The relationship and configuration ownership of model pricing after separating the Provider and Cluster concepts.
 
 ---
@@ -78,12 +80,13 @@ The fields are described as follows:
 | `provider` | Provider / Cluster identifier; serves only as a price grouping identifier and is not required to exist in `/providers` |
 | `model` | Model name, e.g. `deepseek-v3` |
 | `base_model` | Normalized model name, used for price normalization after model mapping |
-| `mode` | Request mode, e.g. `chat`, `completion`, `embedding`, `image_generation`, etc. |
+| `mode` | Request mode, e.g. `chat`, `completion`, `embedding`, `image_generation`, `batch`, etc. |
 | `capabilities` | List of capabilities supported by the model, e.g. `vision`, `reasoning`, `tools` |
 | `supported_parameters` | List of supported request parameters, e.g. `temperature`, `max_tokens` |
 | `limits` | Limits object, including context window, max input/output Tokens, etc. |
 | `prices` | Default price table; used as fallback when no tier matches |
 | `tier_prices` | Tiered price table, keyed by tier name (only `peak` is supported initially) |
+| `batch_discount` | Batch discount factor, `*float64`, in the range `(0, 1]`; semantically defaults to 0.5 (half price) when absent — see "Batch Task Pricing" below |
 | `price_currency` | Price currency; currently fixed to `RMB` |
 | `metadata` | Metadata, including price source, notes, etc. |
 
@@ -166,6 +169,31 @@ models:
 - **merge**: Updates existing `(provider, model, mode)` records and inserts new ones; suitable for incremental maintenance.
 
 The import interface can only be called by administrators. During import, required fields, non-negative `prices`, valid `tier_prices` key names, non-negative integer `limits`, and triple uniqueness are validated.
+
+---
+
+## Batch Task Pricing (batch Discount)
+
+Batch and asynchronous tasks (the OpenAI Batch API; see the batch quota model in [Chapter 12: Quota and Rate Limit Design](./chapter12-quota-and-rate-limit.md)) are settled at prices lower than online calls. The pricing model is expressed through the two fields `mode` and `batch_discount`.
+
+### Mode Whitelist and batch_discount
+
+The `mode` whitelist of `model_prices` includes `batch`, indicating that the price row is explicit pricing for the batch mode. The price row also has a `batch_discount` field:
+
+- The type is `*float64` (nullable pointer), with the value in the range `(0, 1]` (out-of-range values are rejected in `ai-gateway-api/model/imodel_price/validate.go`);
+- Semantically, absence means 0.5, i.e. half price: a chat price row carrying a discount is expanded into a batch price at export time.
+
+### Export Expansion Rules
+
+When the Control Plane exports `AIConf.ModelTable`, explicit `mode=batch` price rows are generated according to the following rules:
+
+1. When a price row carries `batch_discount`, a `mode=batch` price row is expanded from `chat` price × discount factor and delivered to BFE together with the ModelTable;
+2. When an administrator has already maintained a `(provider, model, mode=batch)` price row manually, the manual row takes precedence over coefficient expansion — the export never overwrites explicit configuration with the expanded result;
+3. When a model has no batch pricing configured at all, batch tasks are settled at the chat base price.
+
+### Batch Settlement Base Price
+
+Batch settlement is performed at the batch price for the model when the result file is downloaded. The settled amount follows the base-price formula: `settle_units = usage_in × input_cost_per_token + usage_out × output_cost_per_token`. In this phase, batch settlement only integrates base prices; `tier_prices` time-of-day prices are not integrated into batch settlement. For the Data Plane `mod_ai_batch` reserve-settle-release implementation, see [Chapter 32: Token Authentication and Quota Module Implementation: mod_ai_token_auth](../implementation/chapter32-mod-ai-token-auth.md).
 
 ---
 
@@ -403,6 +431,21 @@ Billing is also defined for two more request modes:
 
 If a tier does not define a specific price key, it automatically falls back to the corresponding key in the default `prices`. Fields in `TokenUsage` such as `CacheReadTokens`, `ImageInputTokens`, and `VideoCount` allow cache hits, image input, and video generation to be priced separately.
 
+#### Entry-Driven Billing for Image/Video
+
+Billing for image_generation and video_generation is driven by the matched price entry, and the discriminator is **whether the price key exists**, not its value (BFE uses `ModelPrice.HasPrice` in `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`):
+
+- When the entry lacks the per-unit price key (`output_cost_per_image` / `output_cost_per_video`), billing falls back to the chat token formula (`calcChatCost`), avoiding completely free calls when the image/video unit price is not configured;
+- When the entry holds both kinds of keys (a mixed entry), per-unit billing applies;
+- An explicit `output_cost_per_image = 0` is still billed per image — that dimension simply costs 0; video is symmetric. This differs semantically from "key missing, fall back to the chat formula": the former means "free for this dimension," while the latter means "not separately priced, billed by Tokens."
+
+#### Fallback Billing When a Mode Has No Price Entry (ai_price_miss)
+
+When the price table has no entry for a given `(model, mode)` (for example, a model used via the `/responses` entry only has a `mode=chat` price), BFE falls back to the same model's chat price instead of billing 0. This behavior comes with observability markers:
+
+- The module counters `PriceFallbackUsed` (fallback billing) and `PriceLookupMiss` (no fallback baseline at all) track the two cases (`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`);
+- The access log carries the `ai_price_miss` field (pb field 763, `bfe-access-pb` ≥ v0.3.14): both kinds of miss set it to true, distinguishing "under-priced/0-billing rows without pricing" from legitimate zero-cost rows. Field details are in [Chapter 32: Token Authentication and Quota Module Implementation: mod_ai_token_auth](../implementation/chapter32-mod-ai-token-auth.md).
+
 ### Backward Compatibility
 
 The tiered pricing design maintains backward compatibility with fixed pricing:
@@ -555,6 +598,9 @@ After the above configuration is exported to BFE, calls to `deepseek-v3` between
 - RMB quota tiered pricing is implemented by combining the Provider time template with Model tier prices; BFE matches tiers such as `peak` based on when the request occurs and falls back to default prices when no tier matches.
 - The BFE Data Plane keeps prices as `float64` after loading (negative values fail loading); at runtime, based on Token usage and the active tier, each line item is converted via `quota.CalcCostUnits` into a 1e-8-RMB fixed-point integer and accumulated, while Redis deduction and the monetary semantics of existing configurations remain unchanged.
 - Chat billing starts from the total input Tokens and splits out cache read/write, image input, audio input, and other dimensions; when no refinement price keys are configured, it falls back to the legacy formula.
+- image_generation / video_generation discriminate by "whether the price key exists" (`ModelPrice.HasPrice`): a missing per-unit price key falls back to the chat token formula, while an explicit zero price is still billed per unit (cost 0).
+- When the price table has no entry for a `(model, mode)`, billing falls back to the same model's chat price, with observability via the counters `PriceFallbackUsed` / `PriceLookupMiss` and the access log field `ai_price_miss`.
+- Batch tasks are priced through `mode=batch` price rows and the `batch_discount` factor: export expands them into explicit batch price rows, manually maintained batch rows take precedence over coefficient expansion, and batch settlement uses the base price `usage_in × input + usage_out × output` (tiered prices are not integrated in this phase).
 - Anthropic usage is normalized at the protocol adapter layer to total-input semantics (`input_tokens + cache_read + cache_creation`), aligning with OpenAI's `prompt_tokens`; Responses API `input_tokens` follows subset semantics that already include `cached_tokens` and are taken directly as `PromptTokens` without additive normalization; two billing modes are supported: `responses` (reusing chat billing) and `video_generation` (billed as `output_cost_per_video` × video count).
 - After the Provider and Cluster concepts were separated, `model-prices.provider` serves only as a price grouping identifier and has a weak reference relationship with `/providers`, making configuration more flexible; `AIConf.ModelTable` is assembled by the Control Plane by provider at export time.
 
@@ -563,6 +609,7 @@ After the above configuration is exported to BFE, calls to `deepseek-v3` between
 ## References
 
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/model-prices.md`
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/batches.md`
 - `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`
 - `ai-gateway-api/design-docs/sys-design/details/provider与cluster概念分离.md`
 - `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`

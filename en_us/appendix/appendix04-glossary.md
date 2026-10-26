@@ -2,6 +2,9 @@
 
 ## A
 
+**ai-gateway-controller (formerly Service Controller)**
+: A controller deployed inside a Kubernetes cluster; it watches Services carrying the `ai-gateway-api-name` label together with their same-named Endpoints, and for each named port reports the Ready instances in full via the InnerAPI `PUT /inner-api/v1/k8s_pools/{name}/instances` as a K8s pool. The Control Plane fans the pool members out to the Provider mirror and Cluster derived pools, which then reach BFE through the `cluster_table` export.
+
 **AI Business Cluster (Cluster)**
 : A logical backend unit that references a Provider and configures forwarding policies, determining how traffic is forwarded, which models are used, and how Key weights are distributed.
 
@@ -33,12 +36,18 @@
 **Operation Log**
 : A read-only audit record of platform write operations, automatically produced by configuration changes, containing the operator, action, resource, result, and a change summary (before/after JSON with sensitive fields masked).
 
+**Context Compression**
+: Compresses oversized context against the target model's token budget in two stages — lossless trimming and rule rewriting — with fail-open behavior.
+
 ## D
 
 **Dashboard**
 : The web administration interface of Rainway AI Gateway, providing operations staff with resource management, consumer management, routing management, user management, and other features.
 
 ## E
+
+**Effective Instance Pool**
+: The set of backend instances actually in effect for a Provider (the K8s pool mirror when in `k8s_pool` mode, otherwise `instance_pool`); the sole consumption contract downstream of the Control Plane.
 
 **Entity (Organization)**
 : A grouping of callers that can represent a department, team, or project. Each Entity can have quota plans, rate limit policies, model allowlists/blocklists, and routing rules attached.
@@ -47,7 +56,7 @@
 : The hierarchical classification definition of an Entity, distinguishing levels via the `level` field; the smaller the value, the higher the level.
 
 **EPP (Endpoint Picker)**
-: A backend scheduler independent of BFE that takes over backend instance selection (load balancing) for Clusters in EPP mode; it is deployed in instance groups (primary/backup) and registered in the EPP instance pool.
+: A backend scheduler independent of BFE that takes over backend instance selection (load balancing) for Clusters in EPP mode; it is deployed in instance groups (exactly 1 instance per group in this release) and registered in the EPP instance pool.
 
 ## F
 
@@ -70,6 +79,9 @@
 **Instance Pool**
 : The set of real backend AI service addresses, ports, and weights defined within a Provider, referenced by Clusters. The Dashboard supports two access modes: IP mode and provider domain mode.
 
+**Intent Classification**
+: Semantic classification of requests (choice/score questions) by the decision service; the routing condition `req_ai_intent_in` splits traffic by classification result; supports explicit intent headers and a confidence threshold.
+
 ## J
 
 **Balance Mode**
@@ -77,10 +89,16 @@
 
 ## K
 
+**K8s Pool (k8s_pool)**
+: The set of backend instances reported and maintained in full by ai-gateway-controller via the InnerAPI `/inner-api/v1/k8s_pools`; that controller is the sole writer of the pool members. A Provider can switch its instance source (`instance_pool` / `k8s_pool`) and the result is delivered under the Effective Instance Pool contract.
+
 **Key Affinity**
-: Session-level Key affinity implemented based on Redis; the same `ClientKeyId` keeps hitting the same Provider Key within a certain period of time.
+: Session-level Key affinity implemented based on Redis; the same `ClientKeyId` keeps hitting the same Provider Key within a certain period of time; the Redis connection is held by the `[AIKeyAffinity]` section of `bfe.conf`.
 
 ## M
+
+**Materialized View**
+: A precomputed table that aggregates detail data in real time on the ClickHouse/StarRocks side; ClickHouse queries must fall back on `GROUP BY` dimensions + `sum(metric)` (SummingMergeTree), and StarRocks asynchronous MVs must be rebuilt when columns are added to the base table.
 
 **Model Mapping**
 : The mechanism in a Cluster that maps the model name in a user's request to the model name actually used by the backend.
@@ -126,6 +144,9 @@
 **Redis as the Single Source of Truth**
 : Runtime state such as quota balances and rate limit counters is read from and written to Redis directly; the management plane no longer maintains a cold database copy when querying balances.
 
+**Routine Load**
+: An import job in Doris/StarRocks that continuously consumes Kafka and writes to a table; the starting offset `OFFSET_BEGINNING` ensures messages produced before the job is created are not lost.
+
 **Route Rule**
 : A single rule in the AI route table, containing a `Cond` matching condition, a `targets` destination list, and an optional `fallbacks` fallback list.
 
@@ -133,6 +154,9 @@
 : The three-tier AI routing rule collection of Global / Entity / API-Key, matched in priority order `apikey > entity > global`.
 
 ## S
+
+**Semantic Cache**
+: A caching form that reuses answers by embedding vector similarity on top of exact-match caching; it depends on the embedding service and the Chroma vector store, with a configurable distance threshold.
 
 **Session Key**
 : The session credential generated by `/auth/session-keys` after Dashboard login, in the format `Authorization: Session {session_key}`.
@@ -152,10 +176,13 @@
 : The price level divided by time dimension in model pricing; only the `peak` (busy hours) tier is supported initially. The busy-hours windows are maintained in the Provider resource (tiered pricing configuration).
 
 **Token**
-: A programmatic access credential created via `/auth/tokens`, with two Scopes: `System` (full management permissions) and `Support` (read-only export permissions).
+: A programmatic access credential created via `/auth/tokens`, with Scopes `System` (full management permissions), `SystemReadonly` (read-only management permissions) and `Support` (read-only export permissions).
 
 **TPM (Tokens Per Minute)**
 : The upper limit of Token consumption per minute, using sliding window counting.
+
+**Traffic Mirror**
+: The capability to asynchronously forward copies of matched AI requests to a shadow cluster, used for version gray release and shadow validation; the main path is not blocked.
 
 **RPM (Requests Per Minute)**
 : The upper limit of requests per minute, using fixed window counting.

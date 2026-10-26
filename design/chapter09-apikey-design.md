@@ -229,6 +229,8 @@ CREATE TABLE entity_types (
 );
 ```
 
+Entity-Type 的 `description` 长度限制为 0–255 字节。
+
 ### `entities` 表
 
 ```sql
@@ -255,7 +257,8 @@ CREATE TABLE entities (
 ```sql
 CREATE TABLE api_keys (
     id VARCHAR(64) PRIMARY KEY,
-    key VARCHAR(128) NOT NULL UNIQUE,
+    key VARCHAR(128) NOT NULL,
+    api_key_hash CHAR(64) NOT NULL COMMENT 'HMAC-SHA256(pepper, key) 的 hex 编码，不可逆',
     description VARCHAR(512) NOT NULL,
     enabled TINYINT NOT NULL DEFAULT 1,
     expired_time BIGINT DEFAULT -1,
@@ -267,9 +270,25 @@ CREATE TABLE api_keys (
     route_rules_id BIGINT DEFAULT NULL,
     entity_id VARCHAR(64) DEFAULT NULL COMMENT '挂载的 Entity ID',
     create_time BIGINT NOT NULL,
-    update_time BIGINT NOT NULL
+    update_time BIGINT NOT NULL,
+    UNIQUE KEY uk_api_key_hash (api_key_hash)
 );
 ```
+
+配合安全设计，`api_keys` 表的存储遵循两项约定：
+
+- **不可逆哈希定位**：`api_key_hash` 列存 `HMAC-SHA256(pepper, key)` 的 hex 编码，唯一键为 `uk_api_key_hash`，数据面校验与查重均走哈希列，库中不存在可用于直接调用的明文索引；
+- **落盘加密**：`api_key` 字段在数据库中加密存储（`enc$v1$` 信封格式），由 `[Security].MasterKeyFile` 开关控制，即使数据库文件泄露也无法直接还原 Key 明文。
+
+### 响应脱敏
+
+OpenAPI v1 响应组装层（`lib/xmask`）对敏感字段统一脱敏，仅作用于 openapi_v1，InnerAPI 导出零改动。脱敏对象为 `api-keys` 的 `key`、`providers` 的 `keys[].key`、`tokens` 的 `token`；触发条件是访问者为只读角色（`system_admin_readonly`），系统管理员仍看到完整明文。算法按字段长度分档：
+
+- 长度 > 8：保留前 4 位 + `********` + 后 4 位；
+- 4 < 长度 ≤ 8：保留前 2 位 + `****` + 后 2 位；
+- 长度 ≤ 4：全部掩码。
+
+登录响应不受脱敏影响，仍返回本人 Session Key；用户列表/详情响应不含 Session Key，该行为已固化为契约。
 
 ---
 
@@ -280,7 +299,8 @@ CREATE TABLE api_keys (
 - **Entity 数据模型**：`entities` 表与 `entity_types` 表共同表达业务组织架构，通过 `parent_id` 与 `level` 约束形成层级树；
 - **模型继承**：Entity 层级中的 `allow_models` 取交集、`block_models` 取并集，最终与 API-Key 自身白名单共同决定可用模型；
 - **Entity 级策略绑定**：每个 Entity 可独立绑定配额计划、限流策略与路由规则，作为 API-Key 继承策略的来源；
-- **API-Key 数据模型**：`api_keys` 表记录 Key 值、启用状态、过期时间、模型白名单、子网限制、挂载 Entity 等关键字段；
+- **API-Key 数据模型**：`api_keys` 表记录 Key 值、启用状态、过期时间、模型白名单、子网限制、挂载 Entity 等关键字段；存储层以 `api_key_hash`（HMAC-SHA256）唯一键定位 Key，`api_key` 列落盘加密（`enc$v1$` 信封）；
+- **响应脱敏**：只读角色（`system_admin_readonly`）经 `lib/xmask` 看到的 `key`、`providers.keys[].key`、`token` 均按长度分档掩码；
 - **生成与校验**：支持外部 Key 导入和后台生成，数据面 BFE 在 `mod_ai_token_auth` 中完成有效性、过期、子网等多维度校验；
 - **生命周期**：通过 OpenAPI 完成创建、查询、更新、删除、配额重置，删除时会级联清理专属配置与 Redis Key；
 - **策略绑定与导出**：API-Key 挂载到 Entity 后，自身策略与 Entity 层级策略合并，形成最终生效的多 Redis Key 配额、多限流策略和多级路由绑定。

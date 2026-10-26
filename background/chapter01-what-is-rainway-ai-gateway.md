@@ -7,7 +7,7 @@
 - 理解什么是壬远 AI 网关（Rainway AI Gateway）以及它要解决的核心问题。
 - 了解企业在规模化使用大语言模型（Large Language Model，LLM）时的常见痛点。
 - 掌握壬远 AI 网关的核心能力边界，包括 AI 路由、API-Key 管理、配额与限流、模型定价、可观测性等。
-- 初步认识系统的五大组成部分：AI Gateway API、Dashboard、BFE、Conf Agent、Service Controller。
+- 初步认识系统的五大组成部分：AI Gateway API、Dashboard、BFE、Conf Agent、ai-gateway-controller（原名 Service Controller）。
 - 理解壬远 AI 网关与 BFE 开源项目的关系，并建立对典型应用场景的直观认知。
 
 本章面向所有读者，不假设你具备深厚的网关或 AI 背景。技术术语首次出现时给出英文原名，后续章节再逐步深入。
@@ -94,7 +94,7 @@ API-Key 是 AI 网关的入口凭证。壬远 AI 网关提供 API-Key 的全生�
 | **Dashboard** | 管理控制台 | 基于 Web 的可视化管理界面，调用 OpenAPI 完成配置操作 |
 | **BFE** | 数据面（Data Plane） | 负责流量转发、接入控制、AI 路由、配额校验、限流执行等 |
 | **Conf Agent** | 配置代理 | 从 InnerAPI 拉取最新配置并触发 BFE 热加载，无需重启数据面 |
-| **Service Controller** | 服务发现 | 在 Kubernetes 环境中发现并同步后端服务实例，动态更新 BFE 的上游集群 |
+| **ai-gateway-controller** | 服务发现 | 在 Kubernetes 环境中把 Service/Endpoints 的 Ready 实例上报为 K8s 实例池（InnerAPI `k8s_pools`），经控制面扇出到 Provider 镜像与 Cluster 派生池，再由 `cluster_table` 导出到 BFE |
 
 这五个组件的关系可以用下图概括：
 
@@ -109,12 +109,12 @@ flowchart TB
         API["AI Gateway API<br/>策略/配置管理"]
         MySQL[("MySQL / SQLite<br/>配置持久化")]
         Redis[("Redis<br/>实时配额缓存")]
+        SC["ai-gateway-controller<br/>K8s 实例池上报"]
     end
 
     subgraph 数据面
         CA["Conf Agent<br/>配置拉取 / 热加载"]
         BFE["BFE<br/>流量转发 / 路由 / 限流"]
-        SC["Service Controller<br/>K8s 服务发现"]
     end
 
     subgraph 下游
@@ -127,9 +127,9 @@ flowchart TB
     Script -->|OpenAPI| API
     API --> MySQL
     API --> Redis
+    SC -->|InnerAPI k8s_pools| API
     API -->|InnerAPI| CA
     CA -->|触发热加载| BFE
-    BFE -->|获取上游实例| SC
     BFE --> ProviderA
     BFE --> ProviderB
     BFE --> ProviderC
@@ -157,9 +157,9 @@ BFE 是百度开源的现代七层负载均衡器，也是壬远 AI 网关的数
 
 Conf Agent 部署在 BFE 节点上，定期向 InnerAPI 拉取最新配置。当检测到配置版本变化时，它将新配置写入本地并通知 BFE 热加载，在不中断流量的情况下更新策略。
 
-### Service Controller
+### ai-gateway-controller
 
-在 Kubernetes 环境中，后端模型服务常以 Pod 形式动态扩缩容。Service Controller 监听 K8s Service 和 Endpoints 变化，将可用实例同步给 BFE，确保数据面拥有正确的上游地址列表。
+ai-gateway-controller 是部署在 Kubernetes 集群内的控制器（基于 controller-runtime）。它监听带有 `ai-gateway-api-name` 标签的 Service 及其同名 Endpoints，按每个具名端口把 Ready 后端实例经 InnerAPI `PUT /inner-api/v1/k8s_pools/{name}/instances` 全量上报为「K8s 实例池」。控制面再把池成员扇出到引用该池的 Provider 镜像（`k8s_instance_pool`）与 Cluster 派生池，最终随 `cluster_table` 导出到 BFE。控制器不直接连接数据面，BFE 看到的仍是控制面导出的后端列表。
 
 ## 与 BFE 开源项目的关系
 
@@ -227,7 +227,7 @@ sequenceDiagram
 - **名称与背景**："壬远"寓意探索远方，Rainway 寓意让 AI 能力的接入之路更通畅；项目基于开源 BFE 构建，解决企业多厂商、大规模使用大模型时的管理难题。
 - **痛点**：多厂商接入复杂、API-Key 管理混乱、成本不可控、流量缺乏调度、安全合规风险、可观测性不足。
 - **核心能力**：AI 路由、API-Key 管理、配额与限流、模型定价、域名与证书管理、可观测性、配置版本控制与增量下发。
-- **系统组成**：控制面 AI Gateway API 与 Dashboard，数据面 BFE，配置代理 Conf Agent，服务发现 Service Controller。
+- **系统组成**：控制面 AI Gateway API 与 Dashboard，数据面 BFE，配置代理 Conf Agent，K8s 服务发现组件 ai-gateway-controller。
 - **与 BFE 的关系**：BFE 是基础引擎，壬远 AI 网关是面向 AI 场景的完整解决方案。
 - **典型场景**：统一 AI 接入中台、多模型灰度与故障转移、成本配额管控、私有部署与合规审计。
 

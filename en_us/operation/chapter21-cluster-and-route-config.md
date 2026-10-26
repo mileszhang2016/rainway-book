@@ -150,6 +150,18 @@ Maps the model name in the client request to the model name used when forwarding
 
 > Key affinity requires a usable Redis in the Data Plane configuration; when Redis is unavailable, it automatically degrades to weighted random.
 
+**Upstream Error Normalization**
+
+The "Upstream Error Normalization" card controls whether upstream error bodies are normalized into the gateway's own error catalog and whether credentials in those bodies are redacted.
+
+| Field | Default | Validation | Description |
+| --- | --- | --- | --- |
+| Enabled | Disabled | — | When on, upstream 4xx/5xx errors are rewritten into a unified error body (OpenAI compatible) and the status code is remapped by the unified mapping (e.g. upstream 401/402/403 → 502 `UPSTREAM_AUTH_ERROR`); when off, upstream errors pass through as-is |
+| Stream Normalization (SSE) | Disabled | — | Independent of the non-stream normalization switch; when on, error events inside the stream have their data payload rewritten into a unified error JSON (the response status stays 200) |
+| Redact Credentials | Enabled | — | Every encoded form (raw / base64 / URL-encoded / JSON-escaped) of this cluster's API-Key appearing in outgoing error content is replaced with the mask `••••••••`; when off, no replacement happens |
+| Unrecognized Error Body Handling | Pass through as-is (`passthrough`) | `passthrough` / `rewrite_generic` only | Shown only when "Enabled" is on; `passthrough` passes the body through as-is (still redacted), `rewrite_generic` rewrites it into the generic `UPSTREAM_UNKNOWN` error; unrecognized events inside a stream always pass through |
+| Error Response Body Read Limit (bytes) | `65536` | Integer from 0 to 4194304 | Shown only when "Enabled" is on; bodies exceeding the limit are treated as unrecognized, and `0` or an omitted value makes BFE use the default 65536 |
+
 **Balance Mode Configuration**
 
 Used to select the backend load balancing mode of the cluster:
@@ -158,28 +170,55 @@ Used to select the backend load balancing mode of the cluster:
 | --- | --- | --- | --- |
 | Load Balancing Mode | No | `WRR (Weighted Round Robin)` | `WRR`: BFE local weighted round robin; `EPP`: backend selection is taken over by the EPP scheduler (for instance allocation see [Chapter 26: EPP Scheduling Operations](./chapter26-epp-scheduling-operation.md)) |
 
-When `EPP` is selected, the following items (`epp_config`) are shown:
+When `EPP` is selected, the following items (`epp_config`) are shown inside the same card:
 
 | Field | Required | Default | Validation | Description |
 | --- | --- | --- | --- | --- |
-| Scheduling Profile | No | `Balanced` | Enum | Latency-first / Balanced / Throughput-first — presets combining scheduling aggressiveness and optimization objective |
-| Cache Affinity | No | `Medium` | Enum | Low / Medium / High; explicitly sets the KV cache affinity strength, overriding the default weight of the scheduling profile |
-| Prefix Cache Affinity | No | Enabled | — | Requests with the same prompt prefix are best-effort converged onto the same backend to improve KV cache reuse (soft affinity; a hit is not guaranteed) |
-| Session Affinity | No | Disabled | — | Requests of the same session are best-effort routed to the same backend; when the bound endpoint is removed, they automatically migrate and re-attach |
-| Session Affinity Header | Conditionally required | Empty | Non-empty header name | Required when session affinity is enabled, e.g. `x-session-id`; the session id is parsed from this header |
+| Instance Load Profile | No | `balanced` | `queue-first` / `balanced` / `kv-first` | Bias when several backends are available: queue-first (usually lower latency) / balanced / KV-idle-first (usually higher throughput); it only adjusts the weights of the two base scorers "queue" and "KV" |
+| Affinity Strength | No | `medium (0.6)` | `off` / `low` / `medium` / `high` | How strongly requests sharing a prefix or a session are pulled toward the same backend: `off` injects no affinity scorer / `low` weight 0.3 / `medium` 0.6 / `high` 1.0 |
+| Prefix Cache Affinity | No | Enabled | Boolean | Requests with the same prompt prefix are best-effort converged onto the same backend via prefix hashing to improve KV cache reuse (soft affinity; a hit is not guaranteed) |
+| Session Affinity | No | Disabled | Boolean | Requests of the same session are best-effort routed to the same backend; when the bound endpoint is removed, they automatically migrate and re-attach |
+| Session Affinity Header | Conditionally required | Empty | Non-empty header name | Required when session affinity is enabled, e.g. `x-session-id`; retained but inactive when disabled |
 | KV Cache Utilization Limit | No | `0.9` | Greater than 0 and ≤ 1 | Endpoints whose KV cache utilization exceeds this value are filtered out |
-| Flow Control | No | See the table below | — | Collapsible card; see the table below |
+| Queue Length Filter Threshold | No | `0` | Number ≥ 0 | Endpoints whose backend queue length exceeds this value are filtered out; `0` disables this filter |
+| In-flight Request Filter Threshold | No | `0` | Number ≥ 0 | Endpoints whose running request count exceeds this value are filtered out; `0` disables this filter |
+| Fallback Dispatch on No Endpoint | No | Disabled | Boolean | Behavior when every endpoint is filtered out: disabled means nothing is dispatched, enabled means falling back to the "least bad" endpoint |
+| Metrics Staleness Eviction Threshold (ms) | No | `200` | Integer greater than 0 | A backend whose metrics have not been updated for longer than this value is evicted from scheduling candidates until scraping recovers |
+| Flow Control | No | See the table below | — | A plain sub-card inside the same card (no collapse interaction); see the table below |
 
 Flow Control (`flow_control`):
 
 | Field | Default | Validation | Description |
 | --- | --- | --- | --- |
-| Max Requests | `Unlimited` | Unlimited / Limited (integer greater than 0) | Global concurrency limit; when "Limited" is selected, an integer greater than 0 must be filled in |
+| Max Requests | `Unlimited` | Unlimited / Limited (integer greater than 0) | Global concurrency limit; selecting "Limited" requires an integer greater than 0, selecting "Unlimited" submits `-1` |
 | Queue TTL (seconds) | `60` | Integer ≥ 0 | Queuing budget when the pool has endpoints; expired requests are rejected with a retryable backpressure error; `0` disables it |
 | No-endpoint Queue TTL (seconds) | Follows Queue TTL | Integer ≥ 0 | Queuing budget when the pool has no endpoints (cold-start scale-out) |
-| Enable Eviction | Disabled | — | When high-priority requests are blocked by saturation, low-priority in-flight requests are terminated to reclaim capacity |
+| Enable Eviction | Disabled | `false` only | The UI is a **disabled read-only switch** with the hint "currently unsupported, keep it off"; submitting `true` is rejected |
 
-> **WRR ↔ EPP switching**: `epp_config` takes effect only in `EPP` mode; when switching back to `WRR`, the configuration is **retained but inactive** (dormant) and takes effect again when switching back to `EPP` — no configuration is lost when switching back and forth.
+**EPP Runtime Parameters**
+
+When `EPP` is selected, the balance mode card also shows the health check and call timeout parameters (`epp_runtime`) that BFE uses to reach the EPP scheduler. When they are not configured, BFE supplies the defaults and the review page shows "Not configured (BFE supplies defaults)". Health check (`check`):
+
+| Field | Default | Validation | Description |
+| --- | --- | --- | --- |
+| Disable Background Health Check | Disabled | Boolean | When on, BFE stops actively health-checking EPP endpoints; not recommended in production |
+| Health Check Interval | `2s` | Valid duration greater than 0 | Interval between two probes |
+| Failure Threshold | `3` | Integer ≥ 1 | The endpoint is deemed unhealthy after this many consecutive failures |
+| Cooldown | `45s` | Valid duration greater than 0 | Cooldown after an endpoint is deemed unhealthy |
+| Success Threshold | `2` | Integer ≥ 1 | Consecutive successful probes needed to mark the endpoint healthy again |
+
+Call timeout (`timeout`):
+
+| Field | Default | Validation | Description |
+| --- | --- | --- | --- |
+| Connect Timeout | `500ms` | Valid duration greater than 0 | Timeout for establishing a connection to EPP |
+| Call Timeout | `3s` | Valid duration greater than 0 | Timeout for a single EPP call |
+
+The duration fields use a "number box + unit dropdown (ms / s / m)" composite control: the health check interval, cooldown, and call timeout default to `s`, while the connect timeout defaults to `ms`; switching the unit converts the number and keeps the physical duration unchanged. Entering `0` is blocked at submission and never silently replaced by the default; clearing the number box means unset, and the default is filled in on submission.
+
+> **Card order**: the LLM configuration step lays out its cards top to bottom as Model Service → Model Redirection → Service Authentication Keys → Key Routing Policy → Key Affinity → Upstream Error Normalization → Balance Mode Configuration (which embeds flow control and the EPP runtime parameters in EPP mode).
+
+> **WRR ↔ EPP switching**: `epp_config` and `epp_runtime` take effect only in `EPP` mode; when switching back to `WRR`, the configuration is **retained but inactive** (dormant) and takes effect again when switching back to `EPP` — no configuration is lost when switching back and forth. On submit, whether these two fields are carried is decided by "currently EPP, or a configuration already existed": a brand-new pure-WRR cluster carries neither field, while a WRR cluster that already had them keeps carrying them (dormant retention).
 
 #### Step 5: Review & Check
 
@@ -188,7 +227,7 @@ Summarizes the configurations of the previous 4 steps; click "Submit" after conf
 - **Basic Configuration**: name, description, protocol, and connection and session stickiness related items;
 - **Timeouts and Retries**: various timeouts and in-cluster retries;
 - **Passive Health Check**: threshold, interval, Host (when empty, shows "when empty, the address of the first instance of the owning Provider is used"), Uri, and status code;
-- **LLM Configuration**: owning Provider, forwarding models, strip prefix, model redirection, Key weights, Key routing policy, Key affinity, and balance mode configuration.
+- **LLM Configuration**: owning Provider, forwarding models, strip prefix, model redirection, Key weights, Key routing policy, Key affinity, upstream error normalization, and balance mode configuration (in EPP mode including flow control and EPP runtime parameters; when `epp_runtime` is not configured it shows "Not configured (BFE supplies defaults)").
 
 ### Viewing, Editing, and Deleting Clusters
 
@@ -370,6 +409,20 @@ Constraints: each `name` must correspond to a name that already exists in the Pr
 
 > Key affinity depends on the Data Plane Redis configuration; when Redis is unavailable, it automatically degrades to weighted random.
 
+### Upstream Error Normalization (`llm_config.normalize_upstream_error`)
+
+`normalize_upstream_error` controls whether BFE normalizes upstream error bodies into the gateway's own error catalog (with credential redaction); it is optional. All fields are optional, and with defaults the normalization stays off so upstream errors pass through as-is. The console offers a form for this group of fields in the "Upstream Error Normalization" card of the cluster wizard's LLM configuration step:
+
+| Field | UI Label | Meaning | Default |
+|------|----------|---------|--------|
+| `enabled` | Enabled | Normalization switch for non-streaming responses | `false` |
+| `stream_enabled` | Stream Normalization (SSE) | Normalization switch for SSE streams, independent of the non-stream switch | `false` |
+| `redact_secrets` | Redact Credentials | Whether to redact credentials in the error body | `true` |
+| `unrecognized_action` | Unrecognized Error Body Handling | Handling of unrecognized error bodies: `passthrough` (pass through as-is) / `rewrite_generic` (rewrite into a generic error); **shown only when "Enabled" is on** | `passthrough` |
+| `max_body_bytes` | Error Response Body Read Limit (bytes) | Upper bound on reading the error body, from 0 to 4194304; bodies exceeding it are treated as unrecognized, and `0` or an omitted value uses the BFE default 65536; **shown only when "Enabled" is on** | `65536` |
+
+For the semantics and the access-log fields, see [Chapter 10 Provider and Cluster Design](../design/chapter10-provider-and-cluster.md). The same group of fields is also available through `llm_config.normalize_upstream_error` in the OpenAPI `POST/PUT /clusters`.
+
 ### Balance Mode (`balance_mode` and `epp_config`)
 
 | Field | Meaning | Default |
@@ -381,16 +434,36 @@ Fields of `epp_config` (corresponding to the wizard's "Balance Mode Configuratio
 
 | Field | Meaning | Default |
 |------|------|--------|
-| `scheduling_profile` | Scheduling profile: `latency-first` / `balanced` / `throughput-first` | `balanced` |
-| `cache_affinity` | Cache affinity: `low` / `medium` / `high`; explicitly sets the KV cache affinity strength, overriding the default weight of the scheduling profile | Unset (follows the scheduling profile) |
+| `load_profile` | Load profile: `queue-first` (queue first) / `balanced` / `kv-first` (KV cache first) | `balanced` |
+| `affinity` | Affinity strength: `off` / `low` / `medium` / `high`, mapped to prefix/session affinity scorer weights 0 / 0.3 / 0.6 / 1.0; when `off`, affinity scorers are not injected | `medium` |
 | `prefix_cache_affinity` | Prefix cache affinity: requests with the same prompt prefix are best-effort converged onto the same backend (soft affinity; a hit is not guaranteed) | `true` |
 | `session_affinity_enabled` | Session affinity: requests of the same session are best-effort routed to the same backend; when the bound endpoint is removed, they automatically migrate and re-attach | `false` |
 | `session_affinity_header` | Source header of the session id (e.g. `x-session-id`); required when session affinity is enabled | Empty |
 | `kv_cache_utilization_max` | KV cache utilization limit; endpoints whose utilization exceeds this value are filtered out; value in `(0,1]` | `0.9` |
+| `waiting_queue_max` | Waiting queue length admission threshold `≥0`; the corresponding filter condition is enabled when greater than 0 | `0` (disabled) |
+| `running_requests_max` | Running requests admission threshold `≥0`; the corresponding filter condition is enabled when greater than 0 | `0` (disabled) |
+| `fallback_on_empty` | Whether to fall back and admit when all endpoints are filtered | `false` |
+| `metrics_staleness_threshold_ms` | Bad-backend eviction threshold (milliseconds, `>0`): backends whose metric scraping fails consecutively and whose data is stale beyond this value are evicted | `200` |
 | `flow_control.max_requests` | Global concurrency limit; unset or `-1` means unlimited | Unlimited |
 | `flow_control.queue_ttl` | Queuing budget in seconds when the pool has endpoints; expired requests are rejected with a retryable backpressure error; `0` disables it | `60` |
 | `flow_control.no_endpoint_queue_ttl` | Queuing budget in seconds when the pool has no endpoints (cold-start scale-out) | Follows `queue_ttl` |
-| `flow_control.enable_eviction` | Demand-driven eviction: when high-priority requests are blocked by saturation, low-priority in-flight requests are terminated to reclaim capacity | `false` |
+| `flow_control.enable_eviction` | Demand-driven eviction: only `false` is accepted (writing `true` returns 422) | `false` |
+
+`epp_runtime`: Cluster-level EPP runtime parameters (optional), affecting the BFE-side EPP health check and call timeouts, layered against the engine-facing `epp_config`. The console offers an "EPP Runtime Parameters" form inside the balance mode card (when `EPP` is selected); when nothing is configured, the review page shows "Not configured (BFE supplies defaults)":
+
+| Field | UI Label | Meaning | Default |
+|------|----------|---------|---------|
+| `check.disabled` | Disable Background Health Check | Whether to disable the EPP address health check | `false` (disabled) |
+| `check.check_interval` | Health Check Interval | Health-check interval (duration string, unit defaults to seconds) | `"2s"` |
+| `check.fail_threshold` | Failure Threshold | Consecutive-failure threshold beyond which the address is considered unavailable | `3` |
+| `check.cooldown` | Cooldown | Cooldown period preventing state flapping | `"45s"` |
+| `check.success_threshold` | Success Threshold | Consecutive successes required to recover an address after the cooldown | `2` |
+| `timeout.connect` | Connect Timeout | EPP gRPC connection timeout (duration string, unit defaults to milliseconds) | `"500ms"` |
+| `timeout.call` | Call Timeout | EPP call timeout (duration string, unit defaults to seconds) | `"3s"` |
+
+The duration fields use a "number box + unit dropdown (ms / s / m)" composite control; switching the unit converts the number and keeps the physical duration unchanged. Entering `0` is blocked at submission, and clearing the field means unset, in which case the default is filled in on submission. An undefined field such as `tls` / `breaker` returns 422 directly (TLS and breaker are fixed by the backend and exposed by no UI control), and durations must be positive.
+
+Whether `epp_config` and `epp_runtime` are carried on submit is decided by "currently EPP, or a configuration already existed": a brand-new pure-WRR cluster carries neither field, while a `balance_mode=WRR` cluster that was configured before keeps carrying them (dormant retention, neither compiled nor distributed) and they take effect again when switching back to `EPP`. For the semantics and hot-reload behavior, see [Chapter 16 EPP Scheduling Design](../design/chapter16-epp-scheduling-design.md); the same group of fields is also available through the OpenAPI `POST/PUT /clusters`.
 
 EPP cluster configuration example:
 
@@ -398,24 +471,44 @@ EPP cluster configuration example:
 {
     "name": "cluster-epp-gpu",
     "description": "EPP 调度集群示例",
+    "basic": {
+        "protocol": "http"
+    },
     "balance_mode": "EPP",
     "epp_config": {
-        "scheduling_profile": "balanced",
-        "cache_affinity": "medium",
+        "load_profile": "balanced",
+        "affinity": "medium",
         "prefix_cache_affinity": true,
         "session_affinity_enabled": true,
         "session_affinity_header": "x-session-id",
         "kv_cache_utilization_max": 0.9,
+        "waiting_queue_max": 32,
+        "running_requests_max": 256,
+        "fallback_on_empty": false,
+        "metrics_staleness_threshold_ms": 200,
         "flow_control": {
             "max_requests": -1,
             "queue_ttl": 60,
-            "no_endpoint_queue_ttl": 60,
-            "enable_eviction": false
+            "no_endpoint_queue_ttl": 60
+        }
+    },
+    "epp_runtime": {
+        "check": {
+            "check_interval": "2s",
+            "fail_threshold": 3
+        },
+        "timeout": {
+            "call": "3s"
         }
     },
     "llm_config": {
         "models": ["deepseek-chat"],
-        "provider": "deepseek"
+        "provider": "deepseek",
+        "normalize_upstream_error": {
+            "enabled": true,
+            "stream_enabled": true,
+            "unrecognized_action": "rewrite_generic"
+        }
     }
 }
 ```
@@ -781,9 +874,9 @@ For the configuration example of a cluster in EPP balance mode, see the earlier 
 
 ## Chapter Summary
 
-- A **Cluster** is the logical backend for BFE forwarding; it references a Provider and declares models, Keys, forwarding policies, etc.; the "Instance Configuration" step in the wizard of version 0.0.7 and earlier has been removed, and the instance pool belongs to the Provider.
+- A **Cluster** is the logical backend for BFE forwarding; it references a Provider and declares models, Keys, forwarding policies, etc.; the instance pool belongs to the Provider, and the cluster wizard has no instance configuration step.
 - The Dashboard creates a cluster through a **5-step wizard**: Basic Configuration → Timeouts and Retries → Passive Health Check → LLM Configuration → Review & Check; timeout defaults are 30000/30000/50000/50000/60000 ms, in-cluster retries 2, health check threshold 3, and interval 1000 ms.
-- LLM configuration covers: forwarding models (a subset of the Provider's models), model redirection (API-Key model access control is judged by the post-redirection target model), service auth Keys (weights sum to 100), Key routing policy (`weighted_random`), Key affinity (depends on the Data Plane Redis and degrades to weighted random when unavailable), and balance mode (`WRR` by default / `EPP`; `epp_config` is retained dormant and no configuration is lost when switching back and forth).
+- LLM configuration lays out its cards in the order Model Service → Model Redirection → Service Authentication Keys → Key Routing Policy → Key Affinity → Upstream Error Normalization → Balance Mode Configuration, and covers: forwarding models (a subset of the Provider's models), model redirection (API-Key model access control is judged by the post-redirection target model), service auth Keys (weights sum to 100), Key routing policy (`weighted_random`), Key affinity (depends on the Data Plane Redis and degrades to weighted random when unavailable), upstream error normalization (off by default; optional stream normalization, credential redaction, unrecognized-body handling, and a body read limit), and balance mode (`WRR` by default / `EPP`; in EPP mode the card embeds flow control and the EPP runtime parameters; `epp_config` / `epp_runtime` are retained dormant and no configuration is lost when switching back and forth).
 - AI route rules are divided into three levels — **Global, Entity, and API-Key** — with priority **API-Key > Entity > Global**; after an API-Key is created, its apikey route table is generated automatically; when a route table is disabled, traffic falls back to the next priority.
 - The Dashboard edit mode has a **two-step save** semantics: "Save Locally" still does not affect production, and only "Submit and Apply" actually delivers the changes; after submission, configuration syncs to the Data Plane via Conf Agent within seconds to tens of seconds; leaving the page with unsubmitted changes shows a loss confirmation prompt.
 - Rule validation includes: target weights summing to 100, no duplicated "cluster + model" combinations, rule names unique within a table, server-side expression syntax validation, and at least 1 target; within a table, rules are matched in order and the first hit wins.

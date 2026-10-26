@@ -129,7 +129,7 @@ AI 场景的可观测需要覆盖模型调用全链路。关键指标包括：
 - **Dashboard**：管理控制台，通过 OpenAPI 完成可视化操作；
 - **BFE**：数据面，负责流量转发、AI 路由、认证、限流和访问日志；
 - **Conf Agent**：配置代理，从 InnerAPI 拉取最新配置并触发 BFE 热加载；
-- **Service Controller**：服务发现组件，同步 Kubernetes 后端服务。
+- **ai-gateway-controller（原名 Service Controller）**：Kubernetes 服务发现组件，把 Service/Endpoints 的 Ready 实例上报为 K8s 实例池（InnerAPI `k8s_pools`），经控制面扇出后由 `cluster_table` 导出到 BFE。
 
 ```mermaid
 graph TD
@@ -138,7 +138,7 @@ graph TD
     D[Dashboard] -->|OpenAPI| E[AI Gateway API 控制面]
     E -->|InnerAPI / 配置下发| F[Conf Agent]
     F -->|热加载| B
-    G[Service Controller] -->|服务发现| E
+    G[ai-gateway-controller] -->|InnerAPI k8s_pools| E
 ```
 
 与 Higress、OmniRoute 等产品相比，壬远 AI 网关在以下方面具有差异化定位：
@@ -168,7 +168,6 @@ graph TD
 - `ai-gateway-api/README.md`
 - `ai-gateway-api/design-docs/sys-design/总体设计文档.md`
 - `bfe/docs/zh_cn/introduction/overview.md`
-- `document-ai-gateway/竞品分析/higress/bfe-vs-higress-ai-gateway-comparison.md`
-- `document-ai-gateway/竞品分析/OmniRoute/OmniRoute-vs-bfe-AI网关能力对比分析.md`
-- `document-ai-gateway/竞品分析/higress/Higress AI网关配额管理功能分析.md`
-- `document-ai-gateway/竞品分析/tokenHub/control-data-plane-analysis.md`
+- [Higress 项目主页](https://github.com/higress-group/higress)
+- [TokenHub 项目主页](https://github.com/astaxie/TokenHub)
+- [OmniRoute 项目主页](https://github.com/diegosouzapw/OmniRoute)

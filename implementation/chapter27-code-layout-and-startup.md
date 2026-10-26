@@ -46,6 +46,7 @@ ai-gateway-api/
 ├── main.go                      # 服务入口：配置加载、初始化、启动 HTTP
 ├── conf/                        # 配置文件（TOML、i18n、AI 模板等）
 ├── data/                        # 数据文件
+├── database/                    # 版本升级脚本与报表 DDL
 ├── docs/                        # 用户文档
 ├── design-docs/                 # 设计文档
 │   ├── api-define/              # 接口定义文档
@@ -73,6 +74,8 @@ ai-gateway-api/
 │   ├── quotacache/              # API-Key/Entity 实时配额缓存抽象
 │   ├── shared/                  # 跨包共享类型与模型
 │   ├── route_rules/             # Global/Entity/API-Key 路由规则业务逻辑
+│   ├── ibatch/                  # 批量与异步任务业务逻辑
+│   ├── keyrotate/               # 密钥轮换收敛任务
 │   └── itxn/                    # 事务抽象接口
 ├── stateful/                    # 配置、数据库、日志、依赖注入容器
 │   └── container/               # 全局组件容器
@@ -89,7 +92,9 @@ ai-gateway-api/
 │   ├── quota/                   # Quota 相关存储实现
 │   ├── route_conf/              # 路由规则存储实现
 │   ├── txn/                     # 事务实现
-│   └── version_control/         # 版本控制存储实现
+│   ├── version_control/         # 版本控制存储实现
+│   ├── batch/                   # 批量任务存储实现
+│   └── keyrotate/               # 密钥轮换收敛任务存储实现
 ├── test/                        # 测试相关
 └── version/                     # 版本信息
 ```
@@ -114,7 +119,7 @@ type Endpoint struct {
 |--------|------|
 | `endpoints/openapi_v1/` | 管理面 OpenAPI，供 Dashboard 和自动化脚本使用，例如 `/api-keys`、`/clusters`、`/providers` 等 |
 | `endpoints/innerapi_v1/` | 数据面 InnerAPI，供 BFE 和 Conf Agent 拉取配置，例如 `/configs/tls_conf/server_data_conf`、`/configs/mod-api-key` 等 |
-| `endpoints/middleware/` | 全局 HTTP 中间件：Recovery、Logger、CORS、Product Probe、User Probe |
+| `endpoints/middleware/` | 全局 HTTP 中间件：Recovery、Logger、CORS、管理面 IP 白名单（McIPProbe，见 [第十七章](../design/chapter17-security-design.md)）、Product Probe、User Probe |
 
 两大接口族在路由前缀、鉴权方式和用途上存在明显差异。OpenAPI v1 以 `/open-api/v1` 为前缀，主要面向人和外部系统，通常需要 Product Probe 与 User Probe 中间件完成产品线与用户身份校验；InnerAPI v1 以 `/inner-api/v1` 为前缀，主要面向 BFE 和 Conf Agent 等机器客户端，强调配置的完整导出与版本增量同步。顶层 `endpoints/router.go` 负责全局 Recovery、Logger、CORS 与静态文件服务，而 `endpoints/openapi_v1/endpoints.go` 与 `endpoints/innerapi_v1/endpoints.go` 分别合并各自子包的 `Endpoint` 切片并完成注册。
 
@@ -142,6 +147,8 @@ type Endpoint struct {
 | `model/route_rules` | Global/Entity/API-Key 路由规则业务逻辑 |
 | `model/imods` | mod-api-key、mod-body-process、AI 路由导出配置组装 |
 | `model/itxn` | 事务抽象接口 `TxnStorager` |
+| `model/ibatch` | 批量与异步任务：任务实体、预留-结算-释放记账、对账 job、Redis 键契约 |
+| `model/keyrotate` | 密钥轮换收敛任务（sweep）：任务编排、锁与失联接管、收敛模式与 dry-run |
 
 `model/itxn/txn.go` 中定义了统一的事务抽象：
 
@@ -179,6 +186,8 @@ type TxnStorager interface {
 | `storage/rdb/route_rules` | `model/shared`、`model/route_rules` | `route_rules` |
 | `storage/rdb/ai_route` | `model/iai_route` | `ai_route_rules` |
 | `storage/rdb/version_control` | `model/iversion_control` | `config_versions` |
+| `storage/rdb/batch` | `model/ibatch` | `batch_tasks`、`batch_files` |
+| `storage/rdb/keyrotate` | `model/keyrotate` | `keyrotate_sweep_tasks`、`keyrotate_sweep_lock` |
 
 DAO 层遵循统一模板：每个表拥有表名常量、结果结构体 `T<Table>`、参数结构体 `T<Table>Param` 以及 `T<Table>One/List/Create/Update/Delete` 函数。Storage 层则在这些 DAO 函数之上实现 `XxxStorager` 接口，负责业务模型与数据库行之间的转换、字段默认值处理以及简单的查询条件组装。所有表均包含 `created_at` 与 `updated_at` 字段，且 DDL 未声明物理 FOREIGN KEY，表间关系由应用层代码维护，便于未来分库分表与灵活变更。
 

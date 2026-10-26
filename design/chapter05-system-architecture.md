@@ -5,7 +5,7 @@
 通过本章，读者将理解：
 - 壬远AI网关如何解决企业接入大模型服务时的核心问题；
 - 壬远AI网关的整体架构，以及控制面与数据面的职责划分；
-- 各核心组件（AI Gateway API、Dashboard、BFE、Conf Agent、Service Controller、Log Reader）如何协同工作；
+- 各核心组件（AI Gateway API、Dashboard、BFE、Conf Agent、ai-gateway-controller（原名 Service Controller）、Log Reader）如何协同工作；
 - 一条配置从创建到生效的完整生命周期；
 - 典型的部署拓扑形态。
 
@@ -84,6 +84,7 @@ OpenAI、DeepSeek、Anthropic、Google Gemini 等模型服务商的 API 协议�
 |---|---|---|
 | BFE 集群 | BFECluster | 登记数据面 BFE 引擎地址，控制面据此知道配置要下发给谁（Server Data，由部署初始化数据维护，无 OpenAPI 管理接口） |
 | 模型服务商 | Provider | 描述一个模型服务提供方，包括协议类型、后端实例池、模型列表与认证密钥 |
+| K8s 实例池 | K8s Pool | 由 ai-gateway-controller 上报到控制面的后端实例池，Provider 可引用池名替代手工维护实例列表 |
 | AI 业务集群 | Cluster | 流量实际转发的后端集群，通过引用 Provider 声明其上游能力 |
 | 组织 | Entity | 表达部门、团队或项目等组织架构，是配额、限流、模型访问控制与路由规则的挂载点 |
 | API 调用凭证 | API-Key | 业务系统调用数据面转发入口时使用的身份凭证，可挂载到 Entity 继承策略 |
@@ -102,9 +103,23 @@ OpenAI、DeepSeek、Anthropic、Google Gemini 等模型服务商的 API 协议�
 - 后端实例池（`instance_pool`）：真实 AI 服务端点；
 - 模型协议（`model_protocols`）：如 `openai`、`anthropic`、`gemini`；
 - 模型列表（`models`）与模型发现端点；
-- 服务鉴权 Key 明文（`keys`）。
+- 服务鉴权 Key（`keys`）：用于访问上游模型服务；在数据库中以上游密钥字段级加密（`enc$v1$` 信封）落盘，导出时同样受导出加密保护（见 [第十七章 安全设计](./chapter17-security-design.md)）。
 
 多个 Cluster 可以引用同一个 Provider，实现实例池与密钥的复用。
+
+### K8s 实例池（K8s Pool）
+
+「K8s 实例池」对应 InnerAPI `/inner-api/v1/k8s_pools` 维护的实例池数据，池成员的唯一写入方是部署在 Kubernetes 环境的控制器 ai-gateway-controller。Provider 通过 `instance_source=k8s_pool` 与池名引用 K8s 实例池，实例列表由控制面自动同步刷新，无需手工维护后端地址。
+
+控制器与集群之间的约定可归纳为以下几点：
+
+- **过滤**：只处理带有 `ai-gateway-api-name` 标签的 Service（标签值等于启动参数 `--ai-gateway-api-name`，`*` 表示任意），并受 `--namespace` 的命名空间列表约束。
+- **端口与实例**：按 Service 的每个具名端口建立一条池，无名端口跳过；实例取自同名 Endpoints 的 Ready 地址，忽略 `notReadyAddresses`，`(addr, port)` 去重后经 `PUT` 全量替换上报，重复上报幂等。
+- **池命名**：`k8s_<namespace>_<service>_<port>[_<cluster>]`；超过 64 字符时折叠为前 55 字符加 `_` 与 sha256 前 8 位，池名须为 1-64 个字符且仅含字母、数字与 `_`、`-`、`.`。
+- **空池与清理**：无 Ready 地址时上报空数组 `[]`，池保留但零实例；端口改名或移除时按差集删除旧池；Service 删除由 finalizer `k8s.bfenetworks.com/delete-protection` 拦截，先删池再放行。
+- **鉴权**：以 `--ai-gateway-api-token` 携带 `Token <identify>` 调用 InnerAPI，Token 需属于 System Scope 并具备 `k8s_pools` 域写权限，否则返回 402。
+
+上报进入控制面后，AI Gateway API 在单个事务内把池成员扇出到引用它的 Provider 只读镜像 `k8s_instance_pool` 与 Cluster 派生池，最终经 `cluster_table` 导出到 BFE；Provider 视角下「池不存在」与「池存在但零实例」等价。详细设计参见 [第十章 Provider 与 Cluster 设计](./chapter10-provider-and-cluster.md)。
 
 ### AI 业务集群（Cluster）
 
@@ -190,13 +205,13 @@ Conf Agent 是部署在 BFE 侧的 Sidecar 组件，主要职责包括：
 
 Conf Agent 的存在使得控制面无需直接连接数据面，配置下发是**拉取式**的，天然适合跨网络区域的部署场景。
 
-### Service Controller（服务发现）
+### ai-gateway-controller（服务发现）
 
-Service Controller 用于在 Kubernetes 环境中发现后端服务，并将服务地址同步到 AI Gateway API。这样，Cluster 中的后端实例可以自动跟随 K8s 服务变化，减少手工维护成本。
+ai-gateway-controller 是部署在 Kubernetes 集群内的控制器（基于 controller-runtime），负责把服务发现结果写入控制面：监听带 `ai-gateway-api-name` 标签的 Service 及其同名 Endpoints，按每个具名端口把 Ready 实例经 InnerAPI `PUT /inner-api/v1/k8s_pools/{name}/instances` 全量上报为 K8s 实例池。池成员的后续流转由控制面完成——扇出到 Provider 的 `k8s_instance_pool` 镜像与 Cluster 派生池，再随 `cluster_table` 导出给 BFE。控制器不直接连接 BFE，也不修改 Provider 或 Cluster 配置；引用池的 Provider 由运维通过 OpenAPI 声明。实现与部署细节见 [第三十七章 ai-gateway-controller实现](../implementation/chapter37-controller-implementation.md)。
 
 ### Log Reader（数据面日志采集）
 
-Log Reader 是数据面日志采集组件（仓库 `rainway-ai-gateway/log-reader`），部署在 BFE 侧，负责读取 BFE 产生的访问日志，解析为结构化的 Token 用量、延迟、状态码等记录，并写入 Kafka 或 MySQL，供报表统计与可观测分析消费。详细设计见 [第十五章 可观测性设计](./chapter15-observability.md)。
+Log Reader 是数据面日志采集组件（仓库 `rainway-ai-gateway/log-reader`），部署在 BFE 侧，负责读取 BFE 产生的访问日志（`bfe-access-pb` 协议），将注册过的字段解析为结构化的 Token 用量、延迟、状态码等记录，并按字段注册结果写入 MySQL（`mod_log_mysql` 插件，99 列）或 Kafka（`mod_kafka` 插件，JSON 形态），供报表统计与可观测分析消费。详细设计见 [第十五章 可观测性设计](./chapter15-observability.md)。
 
 ---
 
@@ -334,7 +349,7 @@ BFE /reload（热加载）
 
 - 壬远AI网关作为统一接入层，解决了多模型提供商接入、API-Key管理、成本与配额控制、高可用、安全审计等问题。
 - 系统采用控制面与数据面分离架构，控制面负责策略管理，数据面负责请求转发与策略执行。
-- 核心组件包括 AI Gateway API、Dashboard、BFE、Conf Agent、Service Controller 和 Log Reader。
+- 核心组件包括 AI Gateway API、Dashboard、BFE、Conf Agent、ai-gateway-controller 和 Log Reader。
 - 配置生命周期涵盖创建、存储、导出、拉取、热加载和生效六个阶段。
 - 支持从最小化部署到多可用区生产部署的多种拓扑。
 

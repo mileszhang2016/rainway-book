@@ -4,9 +4,9 @@
 
 本章介绍如何在 Dashboard 控制台与 AI Gateway API 中创建、绑定并验证限流策略（RateLimitPolicy）。阅读本章后，读者将能够：
 
-- 理解 `RateLimitPolicy` 的数据模型与三种限流维度；
+- 理解 `RateLimitPolicy` 的数据模型与四类限流维度（TPM / RPM / 最大并发 / 批量限流）；
 - 掌握 Dashboard 中「限流配置」区的配置入口与提交约束；
-- 掌握 TPM（滑动窗口）、RPM（固定窗口）与最大并发限制的配置方法与参数语义；
+- 掌握 TPM（滑动窗口）、RPM（固定窗口）、最大并发限制与批量限流的配置方法与参数语义；
 - 理解「适用模型」按转发后的目标模型匹配的机制；
 - 将限流策略绑定到 API-Key 或 Entity，并理解 Entity 层级合并对最终限流效果的影响；
 - 通过 BFE 配置、Redis 计数器与响应行为验证限流是否生效。
@@ -55,6 +55,9 @@
 | `max_concurrency` | int | 最大并发请求数；`-1` 表示不限制，`0` 表示封禁，正整数表示并发上限 |
 | `tpm_configs` | array | TPM（Tokens Per Minute）规则列表 |
 | `rpm_configs` | array | RPM（Requests Per Minute）规则列表 |
+| `batch_limits` | object | 批量任务限流段（可选，可空）：`max_create_rpm`（批量创建 RPM）、`max_active_batches`（活跃批量任务数上限）、`max_file_bytes`（批量文件字节上限）、`max_file_lines`（批量文件行数上限）；省略或 `null` 表示该策略不参与批量限流 |
+
+`batch_limits` 为可选段：仅在策略配置了该段时随导出生成 BFE `ai_rate_limit.data` 的 `rules.batch` 段（设计与结算语义见 [第十二章 配额与限流设计](../design/chapter12-quota-and-rate-limit.md)）。该段在 Dashboard 的 API-Key / Entity「限流配置」卡片中以「批量限流」小节提供（见下文「批量限流」），也可经 OpenAPI 维护：独立策略资源 `POST/PUT /rate-limit-policies`，或 API-Key / Entity 的内联 `rate_limit_policy.rules.batch_limits`。
 
 在业务层，控制面使用 `RateLimitPolicyParam` 承载创建与更新参数，其中 `TpmConfigs` 与 `RpmConfigs` 分别为 `TPMConfig` 和 `RPMConfig` 切片。导出到 BFE 时，这些结构会被转换为 `BfeRateLimitPolicy`，并附带控制面按规则名生成的 `redis_key`。
 
@@ -65,17 +68,18 @@ Dashboard 在 Entity 组织与 API-Key 的创建、编辑表单中均提供「�
 - 消费者管理 → Entity 管理（组织管理）→「创建Entity」或操作列「编辑」；
 - 消费者管理 → API Key 管理 →「创建」或操作列「编辑」。
 
-「启用限流」默认为「否」；选「是」后展开 TPM 规则、RPM 规则与最大并发三个子区域。启用限流后需至少配置一项有效规则，且 TPM 规则、RPM 规则每项最多 3 条。
+「启用限流」默认为「否」；选「是」后展开 TPM 规则、RPM 规则、最大并发与「批量限流」四个子区域。启用限流后需至少配置一项有效规则（TPM / RPM / 最大并发 / 批量限流四者至少其一），且 TPM 规则、RPM 规则每项最多 3 条；四者都未配置时提交被拦截，提示「请添加 TPM/RPM 规则、配置批量限流，或将最大并发设为「封禁」/「限制并发数」」。
 
-三类限制的适用场景如下：
+四类限制的适用场景如下：
 
 | 类型 | 适用场景 |
 |------|----------|
 | TPM | 控制 Token 消耗（长文本、推理成本高的场景） |
 | RPM | 控制请求次数（防刷接口、限制 QPS） |
 | 最大并发 | 控制同时处理的请求数（防止压垮后端） |
+| 批量限流 | 控制批量任务的创建频率、在途任务数与单文件规模（provider 原生 Batch API 场景） |
 
-三类限制的字段语义与 API 表示见下文；配额信息的配置方法见 [第二十二章 API-Key 与配额配置](./chapter22-apikey-and-quota-config.md)。
+四类限制的字段语义与 API 表示见下文；配额信息的配置方法见 [第二十二章 API-Key 与配额配置](./chapter22-apikey-and-quota-config.md)。
 
 ## TPM、RPM、并发限制的配置方法
 
@@ -159,6 +163,31 @@ RPM 与 TPM 的窗口可以独立设置。例如，可配置 1 分钟 RPM 限制
 
 因此「不限制」并非“无效”，而是表示不限并发、让 TPM/RPM 单独发挥作用。对于流式（SSE）场景，并发限制尤为重要，因为流式请求会持续占用连接资源。
 
+## 批量限流
+
+批量任务（provider 原生 Batch API：`/v1/files` + `/v1/batches`）由调用方携带 API Key 直接向 provider 发起，数据面在透传时执行批量限流与金额预留。批量限流不按模型区分，四个维度全部按 API-Key 计：
+
+| 字段 | 界面标签 | 类型 | 说明 |
+|------|----------|------|------|
+| `max_create_rpm` | 批量任务创建RPM | 非负整数 | 每分钟允许创建的批量任务数 |
+| `max_active_batches` | 在途批量任务上限 | 非负整数 | 同时处于非终态的批量任务数上限 |
+| `max_file_bytes` | 单文件字节上限 | 非负整数 | 单个批量输入文件的字节上限 |
+| `max_file_lines` | 单文件行数上限 | 非负整数 | 单个批量输入文件的行数上限 |
+
+**配置位置与提交语义**
+
+- Dashboard 在 API-Key 与 Entity 的「限流配置」卡片中，TPM / RPM / 最大并发之后提供「批量限流」小节，一行 4 个数字输入；两处表单字段与语义完全一致。
+- 留空或 `0` 表示不配置该维度；四个维度全部留空时，提交体不携带 `batch_limits`（等价于该策略不参与批量限流）。
+- 启用限流时，TPM、RPM、最大并发、批量限流四者至少配置其一，否则提交被拦截（提示语见「在 Dashboard 中配置限流策略」）。
+- 输入负数会被拦截（「{标签}不能为负数」）。
+- API-Key 与 Entity 的内联策略、以及独立策略资源 `/rate-limit-policies` 均支持该段；独立策略资源经 OpenAPI `POST/PUT /rate-limit-policies` 维护。
+
+**生效与兜底**
+
+- 仅有配置了该段的策略才随导出生成 BFE `ai_rate_limit.data` 的 `rules.batch` 段。
+- **不配置不代表批量不限流**：未声明四个维度的 API-Key 仍受 BFE `mod_ai_batch.data` 的全局硬顶约束，批量限流段只是在该硬顶之下叠加按 API-Key 的额外限制。
+- 批量任务的执行结果、预留与结算金额可在「消费者管理 → 批量任务」页面查看，见 [第十九章 控制台基础操作](./chapter19-dashboard-basics.md)。
+
 ## 适用模型按转发后的目标模型匹配
 
 TPM/RPM 规则的「适用模型」按**转发后的目标模型**匹配，而非请求体中的原始模型名。目标模型是请求依次经路由「指定模型」覆盖、集群「裁剪前缀」、集群「模型重定向」解析后的最终模型名，与后端实际收到的模型一致。解析顺序如下：
@@ -167,7 +196,7 @@ TPM/RPM 规则的「适用模型」按**转发后的目标模型**匹配，而�
 2. **集群「裁剪前缀」**：按目标集群的配置裁剪模型名前缀；
 3. **集群「模型重定向」**：按目标集群的配置将模型名重定向为另一个模型。
 
-仅当未启用上述机制时，「适用模型」填客户端请求模型名才与旧行为等价；启用重定向、裁剪或目标覆盖后，必须填写转发后的模型名，规则才能正确命中。模型访问控制（允许模型/禁止模型）的校验对象同样是转发后的目标模型。
+未启用上述机制时，目标模型即客户端请求的模型名，「适用模型」填该名称即可；启用重定向、裁剪或目标覆盖后，必须填写转发后的模型名，规则才能正确命中。模型访问控制（允许模型/禁止模型）的校验对象同样是转发后的目标模型。
 
 路由「指定模型」与集群模型映射（裁剪前缀、模型重定向）的配置方法见 [第二十一章 Cluster 与路由配置](./chapter21-cluster-and-route-config.md)。
 
@@ -334,8 +363,9 @@ redis-cli GET default_bfe_rlp-1_RL_RPM_rlp-1_rpm_1min
 
 本章介绍了壬远AI网关限流策略的完整配置方法：
 
-- `RateLimitPolicy` 通过 `tpm_configs`、`rpm_configs` 与 `max_concurrency` 三个维度控制访问速率；
-- 在 Dashboard 的 Entity/API-Key 表单「限流配置」区选「启用限流 = 是」后，需至少配置一项有效规则，TPM/RPM 每项最多 3 条；
+- `RateLimitPolicy` 通过 `tpm_configs`、`rpm_configs`、`max_concurrency` 与 `batch_limits` 四个维度控制访问速率；
+- 在 Dashboard 的 Entity/API-Key 表单「限流配置」区选「启用限流 = 是」后，TPM、RPM、最大并发、批量限流四者至少配置其一，TPM/RPM 每项最多 3 条；
+- `batch_limits` 的四个维度（`max_create_rpm`、`max_active_batches`、`max_file_bytes`、`max_file_lines`）均按 API-Key 计、与模型无关，留空或 0 表示不配置该维度；未配置批量限流时仍受 BFE `mod_ai_batch.data` 全局硬顶约束；
 - TPM 采用滑动窗口（时间窗口 + 滑动步长），RPM 采用固定窗口（无滑动步长）；最大并发取 `-1` 不限制、`0` 封禁、正整数为并发上限；
 - TPM/RPM 规则的「适用模型」按转发后的目标模型匹配，而非请求体原始模型名；
 - 策略可随 API-Key 或 Entity 创建，也可通过更新接口重新绑定；
@@ -347,8 +377,9 @@ redis-cli GET default_bfe_rlp-1_RL_RPM_rlp-1_rpm_1min
 
 ## 参考文档
 
-- `ai-gateway-web/docs/zh-cn/08-entity.md`（Dashboard v0.0.10 用户手册：Entity 组织的限流配置与运行时生效机制）
-- `ai-gateway-web/docs/zh-cn/09-api-key.md`（Dashboard v0.0.10 用户手册：API Key 的限流配置与运行时生效机制）
+- `ai-gateway-web/docs/zh-cn/15-entity.md`（控制台用户手册：Entity 组织的限流配置与运行时生效机制）
+- `ai-gateway-web/docs/zh-cn/12-api-key.md`（控制台用户手册：API Key 的限流配置与运行时生效机制）
+- `ai-gateway-web/docs/zh-cn/13-batch-tasks.md`（控制台用户手册：批量任务的管控与取消）
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/api-keys.md`
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/entities.md`
 - `ai-gateway-api/design-docs/sys-design/details/限流策略与导出.md`

@@ -10,6 +10,7 @@ By the end of this chapter, the reader will understand:
 - How periodic reset is mutually exclusive across instances via a Redis distributed lock, and how atomic SET plus conditional updates keep the reset idempotent;
 - The consistent semantics of `quota=0` (a plan with no balance) on both the Control Plane and the Data Plane;
 - The TPM, RPM, and concurrency limit model of `RateLimitPolicy`, how policies merge upward along the Entity hierarchy, and how they are exported to BFE;
+- The `batch_limits` rate limit section and the reserve-settle-release postpaid quota model for batch and asynchronous tasks;
 - How RMB quotas combine Provider time-of-day templates with Model tiered prices to enable peak/off-peak differentiated billing;
 - Typical quota and rate limit configuration examples.
 
@@ -218,6 +219,7 @@ In addition to per-object resets, the Control Plane provides the Inner API `POST
 - **Token and release**: each instance generates a unique `instanceToken` (UUID) at startup, which is written as the lock value; releasing the lock uses a Lua script that verifies `GET == token` before `DEL`, preventing the lock from being deleted by another instance after the holder crashes, and preventing an old holder from deleting a new holder's lock after expiration.
 - **Watchdog renewal**: while holding the lock, a watchdog goroutine renews it with `EXPIRE` at TTL/3 intervals (about 100 seconds), preventing the lock from expiring early if the reset takes longer than the TTL and another instance grabs it mid-reset.
 - **Idempotency backstop**: even if the lock fails and a duplicate reset occurs within the same period, the atomic SET is inherently idempotent; in addition, `last_reset_at` is updated conditionally (the `QuotaPlanFilter` has a `LastResetAtBefore = period start` field, `ai-gateway-api/model/quota/quota_plan.go`), so a second update within the same period matches zero rows and does not advance the reset watermark.
+- **Claim first, reset second**: the scheduler performs a conditional claim update first (`last_reset_at IS NULL OR last_reset_at < period start`, `TQuotaPlanClaimPeriodReset`) and runs this round's Redis atomic reset only when rows were affected, so a period is reset at most once across all instances; `weekly` / `monthly` plans initialize `last_reset_at` to the creation time (`never` keeps NULL), so SQL three-valued logic (`NULL < x` is never true) cannot put legacy NULL rows into a per-minute reset loop where the claim affects zero rows while still reporting success.
 
 ---
 
@@ -243,6 +245,7 @@ CREATE TABLE rate_limit_policies (
     max_concurrency INT DEFAULT NULL,
     tpm_configs JSON DEFAULT NULL,
     rpm_configs JSON DEFAULT NULL,
+    batch_limits JSON DEFAULT NULL,
     create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     update_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
@@ -285,7 +288,35 @@ TPM and RPM rules are stored as JSON arrays in the `tpm_configs` and `rpm_config
 - `max_concurrency` must be ≥ 0;
 - each rule's `name` is required, non-empty, 1–128 characters, restricted to the character set `[a-zA-Z0-9_-]`;
 - `name` must be unique within a policy; renaming a rule is equivalent to deleting the old rule and adding a new one (see "Redis Key Stability" below);
-- `model` cannot be empty, and `limit` must be ≥ 0.
+- `model` cannot be empty, and `limit` must be ≥ 0;
+- for a policy with `enabled=true`, `rules` must configure at least one of `tpm`, `rpm`, `max_concurrency`, and `batch_limits`; when all four are absent the request returns 422 with a message naming the dimensions to configure;
+- the `limit` of each `tpm` / `rpm` rule, `max_concurrency`, and every numeric field of `batch_limits` must be ≥ 0; 0 is a legal value, and `max_concurrency=0` or a field set to 0 inside `batch_limits` does not enable that dimension on the Data Plane.
+
+### batch_limits: Rate Limit Section for Batch Tasks
+
+To support batch and asynchronous tasks (the `/v1/files` and `/v1/batches` endpoint families, see [Chapter 32: Token Authentication and Quota Module Implementation: mod_ai_token_auth](../implementation/chapter32-mod-ai-token-auth.md)), the policy `rules` carry an optional `batch_limits` section. The section belongs to the shared `RateLimitPolicy` type and appears both on the `/rate-limit-policies` resource and in the inline `rate_limit_policy.rules` of API-Keys and Entities:
+
+```json
+{
+  "batch_limits": {
+    "max_create_rpm": 60,
+    "max_active_batches": 10,
+    "max_file_bytes": 104857600,
+    "max_file_lines": 1000000
+  }
+}
+```
+
+| Field | Description |
+|------|------|
+| `max_create_rpm` | Maximum number of batches that may be created per minute (create-operation RPM) |
+| `max_active_batches` | Maximum number of batches in the active (non-terminal) state per API-Key |
+| `max_file_bytes` | Hard ceiling on uploaded file size in bytes |
+| `max_file_lines` | Hard ceiling on uploaded file line count |
+
+Omitting `batch_limits` or setting it to `null` means the policy does not participate in batch rate limiting. During export, the Control Plane writes this section into the `rules.batch` section of BFE's `ai_rate_limit.data`; on the BFE side, `mod_ai_rate_limit` checks the create RPM, active batch count, and file byte/line hard ceilings according to the operation type (classified by `bfe_basic.ClassifyBatchOp` into create / upload, etc.): exceeding the create RPM or the active batch count returns 429, while exceeding a file ceiling returns 413 `BATCH_FILE_TOO_LARGE`. The file byte/line ceilings are also merged with the global hard ceilings in `mod_ai_batch.data` by taking the minimum as the effective value; even an API-Key bound to no rate limit policy is still subject to the global hard ceilings (implementation details in [Chapter 33: Rate Limit Module Implementation: mod_ai_rate_limit](../implementation/chapter33-mod-ai-rate-limit.md)).
+
+`batch_limits` is configured through the same entry points as TPM/RPM/concurrency: the standalone policy resource (`POST/PUT /rate-limit-policies`) and the inline `rate_limit_policy` of API-Keys / Entities use the same `RateLimitPolicy` structure and the same `validate.RateLimitPolicy` validation (`endpoints/openapi_v1/api_key/checker.go`, `endpoints/openapi_v1/entity/validator.go`), and an inline policy is persisted to a `rate_limit_policies` row as well. Each dimension is counted per API-Key (`max_active_batches` compares against that `ClientKeyId`'s active batch count) and merges up the Entity hierarchy: the API-Key policy and every ancestor Entity policy all participate, with the same dimension combined by AND (equivalent to taking the minimum), and the file byte/line ceilings then take the minimum with the `mod_ai_batch.data` global hard ceilings. The console currently offers no form for this section; configure it through the OpenAPI.
 
 ---
 
@@ -374,6 +405,16 @@ After receiving the configuration, BFE:
 3. After a rule matches, builds the Redis counter key from the rule's `redis_key` and performs the rate limit check;
 4. Also checks `max_concurrency`;
 5. Returns 429 Too Many Requests when any limit is exceeded.
+
+## Upstream Key Exhaustion: 429 NO_AVAILABLE_KEY
+
+A 429 from rate limiting means "the caller is over limit", whereas `NO_AVAILABLE_KEY` means "the gateway has no usable upstream credential". Both are 429 but with different attribution:
+
+- When every candidate Key in the cluster is in its penalty window (429 penalties last 60s, 401/402/403 penalties last 3600s, and penalties are written only when session-affinity penalty is enabled), Key selection returns an empty candidate set and the forwarding loop synthesizes 429 `NO_AVAILABLE_KEY` (type `rate_limit_error`, message `no available upstream api key for this cluster`), carrying `Retry-After` and `error.details.retry_after_seconds`, both fixed at 60s;
+- The Key penalty filter skips `Weight=0` Keys: they never participate in selection and are not counted as candidates;
+- An empty candidate set acts as a circuit breaker for that cluster: the current attempt stops rotating Keys and falls back per the fallback rules; Keys become available again automatically when the TTL expires, with no manual intervention.
+
+This error consumes no QuotaPlan balance and is not counted against RateLimitPolicy limits. When troubleshooting, check the upstream Provider's credential validity and the cluster's Key pool size rather than adjusting rate-limit policies.
 
 ---
 
@@ -476,6 +517,38 @@ When a tier is matched and that tier has the corresponding price key configured,
 
 ---
 
+## Postpaid Quota for Batch Tasks: Reserve-Settle-Release
+
+Billing for batch and asynchronous tasks (the OpenAI Batch API, `/v1/files` + `/v1/batches`) differs fundamentally from ordinary requests: the final Token usage is unknown when a batch is created, the result file is downloaded by the customer on demand after the asynchronous task completes, and the fee cannot be settled at request end. The system therefore introduces a three-state reserve-settle-release reconciliation model:
+
+1. **Reserve**: `POST /v1/batches` performs a quota pre-check and reserves quota at creation time (on the Data Plane, `mod_ai_batch` establishes batch-level key affinity on a first-come-first-served basis via Redis `SETNX`, so subsequent operations of the same batch are routed to the same Data Plane instance);
+2. **Settle**: when the result file is downloaded, the actual fee is settled at the batch price for the model;
+3. **Release**: when a batch is cancelled or reaches a terminal state, the reserved quota is released.
+
+Idempotency is guaranteed by two Redis markers, `BATCH_RESERVE_BATCH:<batch_id>` (reservation bookkeeping) and `BATCH_SETTLED` (settlement deduplication SETNX lock): duplicate settlement, duplicate release, and 404-then-retry paths all converge to the same terminal state. The settled amount is computed at base prices: `settle_units = usage_in × input_cost_per_token + usage_out × output_cost_per_token` (batch prices and discounts are defined in [Chapter 13: Model Pricing and Cost Accounting Design](./chapter13-model-pricing.md); tiered time-of-day prices are not integrated into batch settlement in this phase).
+
+### Control Plane Data and Reconciliation
+
+The Control Plane carries batch task data in two tables:
+
+- `batch_files`: uploaded file entities (including direction, line count, byte count, and other metadata);
+- `batch_tasks`: batch task entities, carrying the OpenAI batch state machine (`validating` / `in_progress` / `completed` / `failed` / `cancelled`, etc.) plus the reserve-settle-release three-state reconciliation status.
+
+Redis key contract (`ai-gateway-api/model/ibatch/redis_keys.go`):
+
+| Redis Key | Description |
+|-----------|------|
+| `BATCH_FILE:<cluster>:<file_id>` | File entity (fields such as dir) |
+| `BATCH_TASK:<batch_id>` (hash) | Task entity and status |
+| `BATCH_RESERVE_BATCH:<batch_id>` | Reservation bookkeeping; released on cancel/terminal state |
+| `BATCH_SETTLED:<batch_id>` | Settlement deduplication marker (SETNX lock) |
+
+Reconciliation is performed by a Control Plane batch reconcile job: mutual exclusion across multiple AI Gateway API instances is coordinated via a MySQL named lock, and a Redis `SCAN` iterates the task keys to sync task entities, advance states, and perform backstop settlement (for example, settlement residue caused by a crashed Data Plane instance). The job is disabled by default and is enabled by setting `[BatchJob] Enable=true` in the configuration (`BatchJobConfig` in `ai-gateway-api/stateful/config.go`).
+
+For Data Plane implementation details of the `mod_ai_batch` module (upload line/byte counting, large-file streaming forwarding, key affinity, settlement at batch prices), see [Chapter 32: Token Authentication and Quota Module Implementation: mod_ai_token_auth](../implementation/chapter32-mod-ai-token-auth.md); for the `batch_limits` implementation, see [Chapter 33: Rate Limit Module Implementation: mod_ai_rate_limit](../implementation/chapter33-mod-ai-rate-limit.md).
+
+---
+
 ## Quota and Rate Limit Configuration Examples
 
 ### QuotaPlan Example
@@ -557,7 +630,13 @@ Below is a policy that limits TPM/RPM for the gpt-4 model and sets the maximum c
           "burst": 1
         }
       ],
-      "max_concurrency": 50
+      "max_concurrency": 50,
+      "batch_limits": {
+        "max_create_rpm": 60,
+        "max_active_batches": 10,
+        "max_file_bytes": 104857600,
+        "max_file_lines": 1000000
+      }
     }
   }
 }
@@ -616,6 +695,8 @@ Model price:
 - `quota=0` means a plan with no balance: the Control Plane computes and syncs the balance normally, while the Data Plane treats it as a valid configuration — requests hitting it receive 429 QuotaExhausted, and a missing Redis balance key is treated as exhausted rather than a 500.
 - `RateLimitPolicy` provides three types of limits — TPM, RPM, and concurrency — and rules support exact model names or the `*` default match; during export, policies merge upward along the Entity hierarchy, producing `rate_limit_policies.json` and `api_key_rl_policy_bindings.json`.
 - The Control Plane generates a Redis Key from the rule name for each TPM/RPM rule (e.g. `default_bfe_rlp-<id>_RL_TPM_rlp-<id>_<name>`): renaming a rule is equivalent to deleting the old rule and adding a new one (counter reset to zero), while modifying other fields such as `model` does not reset the counter.
+- `rate_limit_policies` has a nullable `batch_limits` section (create RPM, active batch count, file byte/line hard ceilings); omitting it means no batch rate limiting. After export it produces the `rules.batch` section of BFE's `ai_rate_limit.data`; the file ceilings are merged with the global hard ceilings in `mod_ai_batch.data` by taking the minimum, and API-Keys bound to no policy are still constrained by the global hard ceilings.
+- Batch tasks use a reserve-settle-release three-state postpaid quota model: reserve at create time after a pre-check, settle at batch prices when the result file is downloaded, and release on cancel/terminal state; the Control Plane carries them in the `batch_files` / `batch_tasks` tables and the `BATCH_FILE` / `BATCH_TASK` / `BATCH_RESERVE_BATCH` / `BATCH_SETTLED` Redis key contract, and the reconcile job — enabled by `[BatchJob] Enable=true` — coordinates multiple instances via a MySQL named lock.
 - RMB quotas support tiered pricing by time of day: the Provider maintains `time_zone` and `tiers`, the Model maintains `tier_prices`, and after export BFE matches the tier based on the request time and selects the corresponding price, falling back to the default price when no tier matches.
 
 ---
@@ -640,3 +721,7 @@ Model price:
 - `ai-gateway-api/model/rate_limit_policy/rate_limit_policy_manager.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/data_load.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/policy_limiter.go`
+- `bfe/bfe_modules/mod_ai_rate_limit/batch_check.go`
+- `ai-gateway-api/model/ibatch/redis_keys.go`
+- `ai-gateway-api/stateful/config.go`
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/batches.md`

@@ -113,6 +113,10 @@ Different configuration topics correspond to different BFE reload interfaces. Ty
 | `mod_body_process` | `mod_body_process` | `/reload/mod_body_process` |
 | `mod_ai_rate_limit` | `mod_ai_rate_limit` | `/reload/mod_ai_rate_limit` |
 | `ai_route` | `mod_ai_route` | `/reload/mod_ai_route` |
+| `ai_cache_rule` | `mod_ai_cache` | `/reload/mod_ai_cache` |
+| `traffic_mirror_rule` | `mod_traffic_mirror` | `/reload/mod_traffic_mirror` |
+| `intent_config` | `mod_ai_intent` | `/reload/mod_ai_intent` |
+| `ai_context_rule` | `mod_ai_context` | `/reload/mod_ai_context` |
 
 These mappings are explicitly configured via the `BFEReloadAPI` field in the `[Reloaders.xxx]` section of `conf-agent/conf/conf-agent.toml`:
 
@@ -245,6 +249,124 @@ ALTER TABLE entities ADD COLUMN description VARCHAR(255) NOT NULL DEFAULT '';
 ALTER TABLE providers ADD COLUMN protocol_paths JSON;
 ```
 
+When upgrading to v0.0.11, the control-plane database needs 7 new tables (AI cache rules, semantic cache global settings, context compression rules and global settings, intent configuration, traffic mirror rules, and K8s instance pools), plus instance-supply-related columns added to the `providers` table:
+
+```sql
+-- Control-plane database (see ai-gateway-api/db_ddl.sql for the full definitions)
+CREATE TABLE `k8s_pools` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(255) NOT NULL,
+  `instances` JSON NOT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY `uk_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='K8s instance pool table';
+
+CREATE TABLE `ai_cache_rules` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(128) NOT NULL,
+  `cond` TEXT NOT NULL,
+  `cache_key_strategy` VARCHAR(32) NOT NULL DEFAULT 'lastQuestion',
+  `cache_ttl` INT NOT NULL DEFAULT 0,
+  `max_body_bytes` BIGINT NOT NULL DEFAULT 1048576,
+  `max_value_bytes` BIGINT NOT NULL DEFAULT 1048576,
+  `enable_semantic_cache` TINYINT(1) NOT NULL DEFAULT 0,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY `uk_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI cache rule table';
+
+CREATE TABLE `ai_cache_semantic_settings` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `top_k` INT NOT NULL DEFAULT 1,
+  `threshold` DOUBLE NOT NULL DEFAULT 0.15,
+  `threshold_relation` VARCHAR(8) NOT NULL DEFAULT 'lt',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI cache semantic global settings table (single row)';
+
+CREATE TABLE `ai_context_rules` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `cond` VARCHAR(1024) NOT NULL,
+  `mode` VARCHAR(16) NOT NULL,
+  `max_context_tokens` INT NOT NULL DEFAULT 0,
+  `reserve_tokens` INT NOT NULL DEFAULT 0,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI context compression rule table';
+
+CREATE TABLE `ai_context_settings` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `trigger_ratio` DOUBLE NOT NULL DEFAULT 0.7,
+  `keep_latest_images` INT NOT NULL DEFAULT 2,
+  `tool_result_max_chars` INT NOT NULL DEFAULT 2000,
+  `thinking_policy` VARCHAR(32) NOT NULL DEFAULT 'trim-all-but-last',
+  `chars_per_token` INT NOT NULL DEFAULT 4,
+  `image_token_estimate` INT NOT NULL DEFAULT 1200,
+  `rewrite_strength` VARCHAR(8) NOT NULL DEFAULT 'lite',
+  `rewrite_protected_survival_rate` DOUBLE NOT NULL DEFAULT 0.95,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI context compression global settings table (single row)';
+
+CREATE TABLE `traffic_mirror_rules` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(128) NOT NULL,
+  `cond` TEXT,
+  `mirror_cluster` VARCHAR(128) NOT NULL,
+  `percentage` INT NOT NULL DEFAULT 100,
+  `remove_headers` TEXT,
+  `set_headers` TEXT,
+  `body_rewrites` TEXT,
+  `path_rewrite` VARCHAR(1024),
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY `uk_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Traffic mirror rule table';
+
+CREATE TABLE `intent_config` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `version` VARCHAR(32) NOT NULL,
+  `min_confidence` DECIMAL(4,3) NOT NULL DEFAULT 0.600,
+  `questions` TEXT NOT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI intent configuration table (single-row overwrite storage)';
+
+ALTER TABLE providers
+  ADD COLUMN `instance_source` VARCHAR(32) NOT NULL DEFAULT 'instance_pool' AFTER `instance_pool`,
+  ADD COLUMN `k8s_pool_name` VARCHAR(255) NULL AFTER `instance_source`,
+  ADD COLUMN `k8s_instance_pool` JSON NULL AFTER `k8s_pool_name`;
+
+-- Existing databases that created ai_cache_rules in the first phase (without the semantic cache column) add the phase-2 column
+ALTER TABLE ai_cache_rules
+  ADD COLUMN `enable_semantic_cache` TINYINT(1) NOT NULL DEFAULT 0 AFTER `max_value_bytes`;
+```
+
+The reporting database (MySQL form) needs 10 columns added to the detail table `bfe_ai_request_log` and 3 columns added to the aggregate table `bfe_ai_metrics_1m` (cache-hit, traffic-mirror, and intent-related fields); ready-made statements are available at the top of `ai-gateway-api/db_ddl_report_mysql.sql`:
+
+```sql
+ALTER TABLE bfe_ai_request_log
+  ADD COLUMN ai_cache_status VARCHAR(16) NOT NULL DEFAULT '' AFTER ai_auth_hit_quota_plans,
+  ADD COLUMN mirror_hit TINYINT NOT NULL DEFAULT 0 AFTER ai_cache_status,
+  ADD COLUMN mirror_cluster VARCHAR(128) NOT NULL DEFAULT '' AFTER mirror_hit,
+  ADD COLUMN ai_intent_question VARCHAR(64) NOT NULL DEFAULT '' AFTER mirror_cluster,
+  ADD COLUMN ai_intent_answer VARCHAR(64) NOT NULL DEFAULT '' AFTER ai_intent_question,
+  ADD COLUMN ai_intent_confidence DOUBLE DEFAULT NULL AFTER ai_intent_answer,
+  ADD COLUMN ai_intent_source VARCHAR(32) NOT NULL DEFAULT '' AFTER ai_intent_confidence,
+  ADD COLUMN ai_intent_latency_us BIGINT DEFAULT NULL AFTER ai_intent_source,
+  ADD COLUMN ai_intent_cache_hit TINYINT DEFAULT NULL AFTER ai_intent_latency_us,
+  ADD COLUMN ai_intent_questions_version VARCHAR(32) NOT NULL DEFAULT '' AFTER ai_intent_cache_hit;
+
+ALTER TABLE bfe_ai_metrics_1m
+  ADD COLUMN ai_cache_status VARCHAR(16) NOT NULL DEFAULT '' AFTER ai_auth_reject_quota_plans_slot5,
+  ADD COLUMN mirror_hit TINYINT NOT NULL DEFAULT 0 AFTER ai_cache_status,
+  ADD COLUMN ai_intent_answer VARCHAR(64) NOT NULL DEFAULT '' AFTER mirror_hit;
+```
+
+For upgrades from v0.0.10.x to v0.0.11, a ready-made incremental script is available: `database/db_ddl_upgrade_to_0.0.11.sql` (archived in the `database/` directory and shipped with the release package). It covers the schema differences between the two versions (such as `clusters.epp_runtime`, the enlarged `api_keys.api_key` column with the `api_key_hash` lookup-hash column, and `model_prices.batch_discount`; `epp_assignments` no longer has the `primary_instance_id` column, as EPP assignment granularity converges to instance groups, with a rollback `ADD COLUMN` attached). The `api_key_hash` column must be backfilled by the application (HMAC-SHA256, which SQL cannot compute) before the unique key is switched following the manual steps at the end of the script.
+
 Before upgrading, be sure to:
 
 - Make a full backup of the production database;
@@ -268,6 +390,36 @@ After upgrading, check the following:
 - Whether `ConfTaskHeaders` and `ExtraFileTaskHeaders` in `conf-agent.toml` are consistent with the authentication method of AI Gateway API;
 - Whether the `Reloader` for newly added modules is configured correctly;
 - Whether BFE supports the hot reload interface for the new modules.
+- When upgrading to v0.0.11, whether `conf-agent.toml` already contains the four Reloaders `mod_ai_cache`, `mod_traffic_mirror`, `mod_ai_intent`, and `mod_ai_context` (the default configuration file of Conf Agent v0.0.8 already includes them; deployments reusing an old configuration file must compare and fill them in manually); otherwise the configurations of the corresponding modules will not be delivered.
+
+### BFE Upgrade and the [AIKeyAffinity] Section
+
+AI Key session affinity (Key Affinity, i.e. session→key binding and key penalty state) is part of BFE's core forwarding logic. Its Redis client is owned by bfe_server (`initAIKeyAffinityRedis` in `bfe_server/bfe_server.go`), and the configuration entry is the `[AIKeyAffinity]` section of `bfe.conf` (definition in `bfe_config/bfe_conf/conf_ai_key_affinity.go`); it does not depend on any module's Redis configuration. The full key set of this section is as follows:
+
+| Key | Meaning | Default |
+|----|------|--------|
+| `Disabled` | Whether to disable AI Key session affinity | `true` |
+| `ServiceConf` | Redis bns name or weighted bns list, resolved via `name_conf.data` | None (required when enabled) |
+| `MaxIdle` | Maximum idle connections in the pool (must be > 0) | `10` |
+| `MaxActive` | Maximum active connections in the pool (0 means unlimited) | `20` |
+| `ConnectTimeoutMs` / `ReadTimeoutMs` / `WriteTimeoutMs` | Connect and read/write timeouts, in milliseconds (must be > 0) | `1000` |
+| `Password` | Redis password; can be ignored when unset | None |
+
+When `Disabled` is `true` (the default), no client is created: even if a cluster configures `SessionAffinity=true`, session affinity does not take effect, and BFE reports no error — it is silently disabled (fail-open). A client creation failure likewise only outputs a WARN log and keeps the client nil (fail-open), and does not block startup.
+
+**Upgrade pitfall**: when upgrading from v1.8.8, if an existing deployment has Key Affinity enabled (cluster configuration `SessionAffinity=true`), you must add the `[AIKeyAffinity]` section to `bfe.conf` before upgrading (at least setting `Disabled=false` and `ServiceConf`); otherwise session affinity is silently disabled after the upgrade: no error, no alarm, and all session→key bindings and key penalty states become invalid. Reference configuration:
+
+```toml
+[AIKeyAffinity]
+Disabled         = false
+ServiceConf      = "redis_bns"
+MaxIdle          = 10
+MaxActive        = 20
+ConnectTimeoutMs = 1000
+ReadTimeoutMs    = 1000
+WriteTimeoutMs   = 1000
+#Password         = ""
+```
 
 ### Component Version Compatibility
 
@@ -277,6 +429,14 @@ According to `upgrade.md`, the v0.0.2 upgrade requires:
 - Dashboard upgraded to v0.0.2;
 - Conf Agent kept at v0.0.1 or a newer version.
 
+Taking the upgrade to v0.0.11 as another example, the matching requirements are:
+
+- AI Gateway API upgraded to v0.0.11;
+- Dashboard upgraded to v0.0.11;
+- Conf Agent upgraded to v0.0.8, with confirmation that the four Reloaders `mod_ai_cache`, `mod_traffic_mirror`, `mod_ai_intent`, and `mod_ai_context` are configured;
+- BFE upgraded to v1.8.9, and evaluate as described in the previous section whether `bfe.conf` needs the `[AIKeyAffinity]` section added;
+- ai-gateway-epp and the frontend released in lockstep with AI Gateway API (the EPP-related components are mutually incompatible; a mixed deployment results in all-no-match EPP matching with an explicit alert).
+
 The recommended upgrade order is:
 
 1. Back up the database;
@@ -285,6 +445,18 @@ The recommended upgrade order is:
 4. Upgrade the Dashboard;
 5. Upgrade Conf Agent as needed and check its configuration;
 6. Observe the Conf Agent logs and BFE monitoring metrics to confirm that configurations are synchronizing normally.
+
+### EPP Components Must Be Released in Lockstep
+
+The EPP (endpoint pool) related components — ai-gateway-epp, ai-gateway-api (including the database schema upgrade), and the frontend — must be released in lockstep at the same version; old and new versions are mutually incompatible. During a mixed deployment, EPP matching returns all no-match and raises an explicit alert about the version mismatch, avoiding a silent degradation to plain routing.
+
+### Hard Ordering Constraint: Upgrade BFE Before Enabling Encrypted Exports
+
+Once the Control Plane supports encrypted configuration exports with enc$v1$ (`[Security].EncryptExports`), older BFE versions cannot parse the encrypted configuration. Therefore, all BFE instances must be fully upgraded first, and only after the Data Plane is confirmed ready should encrypted configuration export be enabled on the Control Plane; reversing the order causes unupgraded BFE instances to fail when pulling configurations.
+
+### User Password Upgrade
+
+For the user password storage upgrade (plaintext → bcrypt hash), the code must be upgraded first — never rewrite the data first: existing plaintext passwords are migrated lazily, being re-hashed and persisted on the first successful login. Bulk-rewriting password data ahead of the code upgrade would leave the old code unable to verify passwords and lock users out.
 
 ---
 
@@ -348,13 +520,18 @@ ls -l mod_ai_token_auth
 - BFE completes hot reload through the `/reload/{module}` interface on the monitoring port, and each module has an independent hot reload path; `TLSConfReload` relocates the client CA/CRL base directories into the `?path=` versioned directory so that the self-contained version-directory validation can pass.
 - The active version can be checked via the Conf Agent log, the symlink target, or the `version` field in the configuration file; the summary ERROR `reload keeps failing` (with the stage field) emitted every 10 consecutive reload failures is the signal for recognizing a stuck reload loop.
 - Version rollback can use the historical version directories retained by Conf Agent: manually switch the symlink and reload, without restarting BFE.
-- When upgrading, perform database migration, AI Gateway API replacement, Dashboard upgrade, and Conf Agent configuration checks in order, and pay attention to the compatibility of authentication headers and configuration fields.
+- When upgrading, perform database migration, AI Gateway API replacement, Dashboard upgrade, and Conf Agent configuration checks in order, and pay attention to the compatibility of authentication headers, database DDL, and configuration fields (such as the `[AIKeyAffinity]` section of BFE `bfe.conf` and the `Reloader`s of new Conf Agent modules).
+- The v0.0.10.x → v0.0.11 upgrade ships a ready-made incremental script `database/db_ddl_upgrade_to_0.0.11.sql` (including dropping `primary_instance_id` from `epp_assignments` and adding the `api_key_hash` column to `api_keys`); the EPP-related components (ai-gateway-epp, ai-gateway-api, schema, frontend) must be released in lockstep at the same version, and a mixed deployment produces all-no-match EPP matching with an explicit alert.
+- Hard ordering constraints: upgrade all BFE instances before enabling encrypted configuration export enc$v1$ (`[Security].EncryptExports`) on the Control Plane; for the user password upgrade, upgrade the code first and never rewrite the data first — existing plaintext passwords are re-hashed lazily on the first successful login.
 
 ---
 
 ## References
 
 - `ai-gateway-api/docs/zh_cn/upgrade.md`
+- `ai-gateway-api/database/db_ddl_upgrade_to_0.0.11.sql`: incremental upgrade script for the Control Plane database from v0.0.10 to v0.0.11
+- `ai-gateway-api/db_ddl.sql`
+- `ai-gateway-api/db_ddl_report_mysql.sql`
 - `conf-agent/AGENTS.md`
 - `ai-gateway-api/design-docs/sys-design/details/InnerAPI配置导出与版本控制.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/00-overview.md`

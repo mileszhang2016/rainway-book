@@ -1,4 +1,4 @@
-# Chapter 37: How to Extend the Rainway AI Gateway
+# Chapter 38: How to Extend the Rainway AI Gateway
 
 ## Chapter Goals
 

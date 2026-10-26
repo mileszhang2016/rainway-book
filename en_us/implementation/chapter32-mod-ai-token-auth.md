@@ -10,6 +10,9 @@ Through this chapter, readers will understand the complete implementation of the
 - How to deduct quota at request end based on actual Token usage or RMB cost;
 - The reliability semantics of deduction idempotency, no billing on client abort, and `/count_tokens` skipping billing;
 - How RMB quota achieves differentiated billing by combining Provider time-period templates with time-period model prices;
+- The fallback billing rules: entry-driven billing for image/video and falling back to the chat price when a mode has no price entry;
+- Billing observability: access log fields such as `ai_usage_source` / `ai_zero_cost_reason` / `ai_price_miss` and the usage-presence recognition semantics;
+- Batch and asynchronous task support (phase 1): endpoint detection, key affinity, and reserve-settle-release billing in `mod_ai_batch`;
 - How `mod_ai_token_auth` cooperates with `mod_body_process` in streaming and non-streaming responses.
 
 ## Responsibilities of mod_ai_token_auth
@@ -123,10 +126,12 @@ func (m *ModuleAITokenAuth) tokenFoundProductHandler(req *bfe_basic.Request) (in
 The actual validation logic is in `ValidateUserTokenByReq` in `bfe/bfe_modules/mod_ai_token_auth/token_rule_table.go`, executed in the following order:
 
 1. **Extract the API-Key**: call `bfe_basic.GetApiKey(req)`; if empty, return `CodeNoApiKey`.
-2. **Look up the Token**: search by `product + key` in the rule table `TokenRuleTable`; if not found, return `CodeInvalidApiKey`. Before a validation failure occurs, the module writes `KeyId` into `AiBasicInfo` as early as possible, so that even if the request is later rejected, the access log can be correlated to the specific Key.
+2. **Look up the Token**: search by `product + key` in the rule table `TokenRuleTable`; if not found, return `CodeInvalidApiKey`. Before a validation failure occurs, the module writes `KeyId` and `ApikeyTags` into `AiBasicInfo` as early as possible, so that even if the request is later rejected, the access log can be correlated to the specific Key and attributed to an Entity.
 3. **State validation**: check `Enabled` and `ExpiredTime`; a disabled or expired Key returns `CodeKeyDisabled` or `CodeKeyExpired` respectively.
 4. **Quota pre-check**: iterate over `token.QuotaPlans`, skipping `Unlimited` and `PassNoQuota` plans; for finite plans, call `plan.HasBalance` to query Redis — insufficient balance returns `CodeQuotaExhausted`, and an expired plan returns `CodeQuotaExpired`. Multiple quota plans are checked in sequence, and the request is allowed only if all of them pass.
 5. **IP subnet validation**: if `Subnet` is configured, check whether `ClientAddr` or `RemoteAddr` is within the allowed subnets; if not, return `CodeSubnetNotAllowed`. Subnets support CIDR notation, and multiple can be configured.
+
+Note in particular that all rejection paths above — the quota pre-check rejection (429 `QUOTA_EXHAUSTED`) and `KEY_DISABLED` / `KEY_EXPIRED` / `QUOTA_EXPIRED` / `SUBNET_NOT_ALLOWED` — preserve the API-Key's tags and write them into the access log field `ai_apikeytags` (pb field 702) along with `ClientKeyId`: rejected rows can also be attributed to Entities for cost and usage accounting, not just allowed requests.
 
 The model allowlist/blocklist is not part of the authentication-stage list above; it is checked against the final target model at the forwarding stage, detailed in the next section.
 
@@ -190,6 +195,36 @@ On rejection, `targetModelCheckFilter` returns `BfeHandlerFinish` with a locally
 Firing per attempt means cluster-level fallback re-validates the target model resolved for each attempt: when the primary target is rejected by the allowlist, the request carries the `RejectReason` into the backup cluster attempt, and if a later attempt succeeds, `ServeHTTPForAI()` clears the stale `RejectReason` (and `RejectQuotaPlans`) when breaking out of the forwarding loop, so the access log of a successful request does not carry an old rejection reason. Consequently the route target model override and the API-Key model allowlist compose in a "redirect first, validate second" manner: the allowlist constrains the post-forwarding target model, not the raw model in the client request body.
 
 For native Gemini paths (of the form `/v1beta/models/<model>:<action>`, in contrast to `:publishers/.../models/<model>:generateContent`), the model name is taken from the URL path (`ExtractModelFromPath` in `bfe_model_protocol/gemini`); it enters the same `TargetModel` resolution chain, so the allowlist check applies to it as well.
+
+## Upstream Key Selection, Penalty, and Credential Header Injection
+
+Before a single forwarding attempt, `aiClusterInvoke()` (`bfe/bfe_server/reverseproxy.go`) selects an upstream Key from the cluster's `AIConf.Keys`. Selection and failure handling follow these rules.
+
+### Key Penalty and Weight=0
+
+- Every selection skips Keys with `Weight=0`: a zero weight means the Key is not eligible for selection, and the penalty filter does not count it as a candidate either;
+- On upstream 429, the current Key is marked used and rotated within this request; when session-affinity penalty is enabled (`SessionAffinity` and `SessionAffinityPenaltyEnable`), a 60s penalty mark is also written;
+- On upstream 401/402/403, the current Key is marked dead within this request; when session-affinity penalty is enabled, a 3600s penalty mark is written;
+- On upstream 5xx or a connection error, the current Key is kept for retry; other 4xx responses (e.g. 400) stop Key rotation without penalizing. A batch/file 404 is the exception — the batch bindings are cleared and a 60s penalty is written for the current Key (when session-affinity penalty is enabled), so subsequent operations rebind to the Key that holds the resource;
+- When the penalty filter leaves an empty candidate set, the circuit breaker trips: there is no fallback to the original Key list, and penalized Keys recover only when their TTL expires.
+
+### 429 NO_AVAILABLE_KEY
+
+When the candidate set is empty, `aiClusterInvoke()` synthesizes a 429 response instead of returning an opaque 5xx:
+
+- `error.code=NO_AVAILABLE_KEY`, `error.type=rate_limit_error`, message `no available upstream api key for this cluster`;
+- the response carries `Retry-After: 60`, and `error.details.retry_after_seconds=60` in the body; the value is fixed and does not vary with the penalty type that caused the exhaustion (429 or 401/402/403);
+- the response is marked as gateway-generated (`X-Bfe-Gw-Error: 1`), so error normalization does not rewrite it to a 502;
+- the error code deliberately does not reuse `ErrAiRateLimit`: a local rate limit short-circuits cluster fallback, whereas key exhaustion must still allow the fallback cluster to be tried; without a fallback the caller receives a retryable 429.
+
+### Mutual Exclusion of Outbound Credential Headers
+
+Before injecting an upstream credential, `doSingleAIForward()` sanitizes the outbound request's credential headers (`sanitizeOutboundCredentials`):
+
+- the adapter's `InjectAuth` writes the single credential header for the selected attempt (`Authorization` for openai, `x-api-key` for anthropic, `x-goog-api-key` for gemini);
+- every other credential header in the registry (the union from `modelprotocol.CredentialHeaderNames()`) is deleted from the outbound request. Upstreams pick a credential by their own priority (e.g. preferring `x-api-key` over `Authorization` when both exist), so a residual client credential silently overrides the injected one and the resulting 401 is wrongly charged as a penalty against that Key;
+- the header map is `Clone()`d before deletion: outbound headers share the underlying map with the inbound request, and deleting in place would break inbound authentication, billing, log masking, and the key-affinity session identifier;
+- when the cluster has no `Keys` configured (`len(AIConf.Keys)==0`), Key selection and injection are skipped entirely — neither sanitizing nor injecting — and client credentials reach the upstream with passthrough semantics.
 
 ## Quota Plan Binding and Balance Query (Redis)
 
@@ -348,9 +383,9 @@ func isClientAbortErr(err error) bool {
 
 ### No Billing on Client Abort and Estimation Reliability Semantics
 
-Estimating Tokens from content length (`EstimateToken`: `Content-Length/4` of the request body for input, response body length for output) is only a fallback and is allowed to participate in billing only when the response completed normally. For this purpose, `bfe_basic.AiBasicInfo` maintains two sets of state marks:
+Estimating Tokens from content length (`EstimateToken`: `Content-Length/4` of the request body for input, response body length for output) is only a fallback and is allowed to participate in billing only when the response completed normally. `EstimateToken` defaults to `true` out of the box. Usage recognition works by presence (rather than by value): a response that explicitly reports an all-zero usage object (e.g. `prompt_tokens=0, completion_tokens=0`) is not misjudged as "no usage"; `EstimateToken` only backstops requests from which no usage object was ever collected. For this purpose, `bfe_basic.AiBasicInfo` maintains two sets of state marks:
 
-- `MarkResponseCompleted` / `IsResponseCompleted`: set when the response finishes normally. In streaming scenarios, `mod_body_process` sets it when a termination event is seen (Anthropic `message_stop`, OpenAI `[DONE]`, Responses API `response.completed`); in non-streaming scenarios, `tokenReadResponseHandler` sets it after the full response body is read.
+- `MarkResponseCompleted` / `IsResponseCompleted`: set when the response finishes normally. In streaming scenarios, `mod_body_process` sets it when a termination event is seen (Anthropic `message_stop`, OpenAI `[DONE]`, Responses API `response.completed`); in non-streaming scenarios, `tokenReadResponseHandler` sets it after the full response body is read. In addition, an SSE response that omits the termination event and ends with a clean EOF without usage is also treated as complete (the clean-EOF completion marker is set only when `copyResponse` succeeds, the status is 200, and the mode is not file/batch), so the `EstimateToken` fallback can bill such responses.
 - `MarkFinalUsageSeen` / `IsFinalUsageSeen`: set when the final usage is parsed from the response. In streaming scenarios, `QuotaUsageProcessor` sets it when the final usage event arrives (such as Anthropic `message_delta`, Responses API `response.completed`, or an event carrying `image_count` / `video_count`); in non-streaming scenarios, it is set after a non-zero `UsedQuota` is parsed. The initial usage of Anthropic `message_start` (`output_tokens = 0`) does not count as final usage.
 
 The settlement rules are:
@@ -417,6 +452,8 @@ func (q *QuotaPlan) deductRMB(client redis_client.Client, amount int64) (int64, 
 ### Non-200 Requests Are Not Billed
 
 `tokenRequestFinishHandler` returns immediately when `res.StatusCode != 200`, preventing requests that fail at the backend, time out, or are rejected by authentication from incorrectly consuming quota. This is consistent with the behavior of `NewQuotaUsageProcessor` in `mod_body_process`, which also returns `nil` immediately when `res.StatusCode != 200`.
+
+Non-2xx responses also clear any `EstimateToken` estimation residue, preventing estimated values from entering the metering of failed rows. On the access log side, the three token fields (`ai_input_tokens` / `ai_output_tokens` / `ai_total_tokens`) are emitted according to `usageDisposition`: when the disposition is `none` (non-2xx), all three fields are absent, distinguishing "no usage" from "usage of 0" in the logs. Meanwhile, `ai_cost_value` is now written for every observed 2xx row (including zero-cost rows) — for billing reconciliation, "not billed" can no longer be determined by `ai_cost_value IS NULL`; use `ai_cost_value = 0` together with `ai_zero_cost_reason` for attribution instead.
 
 ## RMB Quota and Time-Period Pricing
 
@@ -514,7 +551,55 @@ One prerequisite of the cache split deserves emphasis: `PromptTokens` must be th
 
 `calcResponsesCost` directly reuses chat billing; `calcVideoGenerationCost` bills `VideoCount × output_cost_per_video`, where `VideoCount` is taken from `usage.video_count` in the response, falling back to `data.#`; `calcImageGenerationCost` bills `ImageCount × output_cost_per_image + ImageInputTokens × input_cost_per_image_token`.
 
+Billing for image_generation / video_generation is entry-driven, and the discriminator is **whether the price key exists** (`ModelPrice.HasPrice`, `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`), not its value: when the matched entry lacks the per-unit price key (`output_cost_per_image` / `output_cost_per_video`), billing falls back to the chat token formula (`calcChatCost`); a mixed entry (holding both kinds of keys) is billed per unit; an explicit `output_cost_per_image = 0` is still billed per image with a cost of 0 (video is symmetric) — "zero price" differs semantically from "key missing."
+
+In addition, when the price table has no entry for the current `(model, mode)` (for example, a model with only a `mode=chat` price is called via the `/responses` entry), `calcCostUnits` falls back to the same model's chat price instead of billing 0, and marks observability signals: the counter `PriceFallbackUsed` records fallback billing, `PriceLookupMiss` records cases with no fallback baseline at all, and both kinds of miss set the access log field `ai_price_miss` (pb field 763, `bfe-access-pb` ≥ v0.3.14) to true. Traffic in the `ModeFile` / `ModeBatch` modes of the files/batches endpoints is handled by `mod_ai_batch` (see "Batch and Asynchronous Task Support" below) and never enters the chat billing paths above.
+
 For how the Control Plane generates and delivers time-period configurations, see `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`.
+
+## Batch and Asynchronous Task Support (Phase 1): mod_ai_batch
+
+Beyond per-request billing, `mod_ai_token_auth` cooperates with the dedicated `mod_ai_batch` module (`bfe/bfe_modules/mod_ai_batch/`) to provide phase-1 support for the OpenAI Batch API (the `/v1/files` and `/v1/batches` endpoint families). The design background (the reserve-settle-release model, the `batch_files` / `batch_tasks` tables, the Redis key contract, and the reconcile job) is covered in [Chapter 12: Quota and Rate Limit Design](../design/chapter12-quota-and-rate-limit.md); this section focuses on the Data Plane implementation.
+
+### Endpoint Detection and Traffic Isolation
+
+`bfe_basic.DetectModeFromPath` recognizes dedicated modes `ModeFile` / `ModeBatch` for the files/batches endpoint families, and `mod_ai_batch` only acts on requests in these two modes. Batch traffic therefore no longer falls into the chat billing path: the files/batches management endpoints never become billable model calls, and their zero cost is by design rather than an anomaly.
+
+### Upload Counting and Streaming Forwarding
+
+File uploads are counted for lines and bytes while being forwarded (the counting reader in `file_counter.go`), and large files are forwarded in a streaming manner with no retry buffering — when an upload is interrupted by the client or fails upstream, the already-streamed content is not cached, and the client re-uploads. Chunked uploads without `Content-Length` are enforced mid-stream by the `mod_ai_batch` counting reader against the effective ceilings (`AiBasicInfo.BatchEffMaxFileBytes` / `BatchEffMaxFileLines`).
+
+### Batch-Level Key Affinity
+
+The create / retrieve / cancel / result-download operations of a batch task must land on the same Data Plane instance (the task entity is maintained in-instance). `mod_ai_batch` establishes batch-level key affinity on a first-come-first-served basis via Redis `SETNX`: the instance that wins the affinity at creation handles all subsequent operations of the batch, keeping the four steps (upload → create → retrieve → download) on the same API-Key.
+
+### Cancel Requests to keyless Providers
+
+A cluster whose Provider is keyless (`AIConf.Keys` empty) skips Key selection and credential injection entirely (the `len(cluster.AIConf.Keys)==0` branch in `aiClusterInvoke()`), so a batch cancel passed through the Data Plane carries no gateway-side authentication header; that branch also skips outbound credential sanitizing, and client-supplied credential headers are forwarded unchanged under passthrough semantics. Cancellation state and idempotency are maintained by the Control Plane (a request hitting `cancelling` returns 200 and re-sends the upstream cancel); see [Appendix 1: OpenAPI Quick Reference](../appendix/appendix01-openapi-quick-reference.md).
+
+### Postpaid Quota: Reserve-Settle-Release
+
+The final usage of a batch is unknown at creation time, so billing adopts a postpaid reserve-settle-release model:
+
+1. **Reserve on create with a pre-check**: `POST /v1/batches` first performs a quota pre-check and reserves quota;
+2. **Settle on result download**: when the result file is downloaded, the fee is settled per model at batch prices (the `mode=batch` price rows; see [Chapter 13: Model Pricing and Cost Accounting Design](../design/chapter13-model-pricing.md)), grouped by the model in each line;
+3. **Release on cancel/terminal state**: the reservation is released when the batch is cancelled or reaches a terminal state.
+
+Idempotency is guaranteed by `BATCH_RESERVE_BATCH:<batch_id>` (reservation bookkeeping) and `BATCH_SETTLED` (settlement deduplication SETNX lock); the Control Plane additionally runs a reconcile job as a backstop.
+
+### Access Log Batch Fields
+
+`bfe-access-pb` ≥ v0.3.13 provides 7 access log fields for batch scenarios (pb 901-907), read from `AiBasicInfo` by `mod_access_pb3`:
+
+| Field | pb No. | Description |
+|------|---------|------|
+| `ai_batch_id` | 901 | Batch task ID |
+| `ai_file_id` | 902 | File ID |
+| `ai_batch_op` | 903 | Batch operation type (create / upload / retrieve / cancel / download, etc.) |
+| `ai_file_lines` | 904 | Uploaded file line count |
+| `ai_file_bytes` | 905 | Uploaded file byte count |
+| `ai_batch_status` | 906 | Batch status |
+| `ai_batch_settle` | 907 | Settlement status/result marker |
 
 ## Cooperation with mod_body_process
 
@@ -587,9 +672,60 @@ sequenceDiagram
 
 This division of labor guarantees that, whether streaming or non-streaming, `TokenUsage` is already available at the `HandleRequestFinish` stage, and `mod_ai_token_auth` only needs to execute the unified deduction logic.
 
+## Billing Observability: Usage Source and Zero-Cost Attribution
+
+To make "zero billing / skipped billing" explainable and queryable in reconciliation, the billing path emits a set of attribution fields to the access log (written by `bfe_modules/mod_access_pb3`; `bfe/docs/zh_cn/sys_design/ai_access_log_fields.md` is the complete field manual).
+
+### Usage Source Marker ai_usage_source
+
+`ai_usage_source` (string, pb field 764, `bfe-access-pb` ≥ v0.3.15) marks the usage source of the current billing, taking one of the following values:
+
+| Value | Meaning |
+|----|------|
+| `parsed` | Billed with the upstream real usage (including responses that explicitly report an all-zero usage object) |
+| `estimated` | The upstream returned no usage and the `EstimateToken` estimate was approved for billing |
+| `unrecognized` | Usage not recognized; billing skipped |
+| `aborted` | Client disconnected early; billing skipped |
+
+Non-2xx rows do not carry this field. It is set at the same point as the billing decision, so billing bypasses can be queried directly in reconciliation.
+
+### Zero-Cost Attribution ai_zero_cost_reason
+
+`ai_zero_cost_reason` (string, pb field 765, `bfe-access-pb` ≥ v0.3.16) explains why a "2xx, RMB quota plan bound, yet zero billing" occurred. Possible values: `unrecognized` / `aborted` / `cache_hit` / `batch_release` / `price_miss` / `price_zero` / `model_table_missing` / `config_missing` / `no_usage_tokens` / `cost_zero`. Rows that were billed, rows without an RMB plan, and non-2xx rows do not carry this field; neither do the batch and files management endpoints (with mode `file`/`batch`) nor requests without a resolved `target_model` — they never became billable model calls, and their zero cost is by design. AI cache hits only write the `cache_hit` marker and are not counted by the `BillingZeroCost` counter.
+
+### Automatic Final-Usage Injection
+
+To let streaming responses carry real usage as often as possible, BFE provides the `Server.InjectStreamUsage` configuration (`bfe.conf`, enabled by default): when an OpenAI streaming chat/completions request does not explicitly set `stream_options.include_usage`, `stream_options.include_usage=true` is injected before forwarding (`maybeInjectStreamUsage` in `bfe_server/reverseproxy.go`), so the real final usage chunk is obtained from the upstream, reducing the proportion of estimated billing.
+
+### Billing Copy vs. Log View
+
+Sanitization such as estimate clearing and backstop filling acts only on the billing copy; the access log view preserves observed values. For example, a row interrupted by the client is billed 0, but the log still shows the Tokens observed before the interruption, making it easy to investigate "why was this row not billed."
+
+### Kimi Nested Usage Parsing
+
+Some OpenAI-compatible implementations (e.g. Kimi) nest usage under `choices[i].usage` of the streaming finish chunk instead of the top level. `ParseOpenAIUsageFields` (`bfe/bfe_model_protocol/utils/usage_parse.go`) falls back to parsing this nested shape and maps the nested cache field `cached_tokens` to cache-read Tokens, so Kimi streaming billing statistics are not zeroed. At the access log exit, a negative `CompletionTokens` sentinel is clamped to 0, preventing abnormal values from entering the logs and reconciliation.
+
+### Usage Collection for Non-Streaming gzip Responses
+
+gzip responses whose `Content-Type` carries a charset parameter (e.g. `application/json; charset=utf-8`) are likewise recognized as compressed bodies, and usage collection decompresses only the parsing copy, leaving the original response forwarded to the client untouched.
+
+### Module Counters
+
+The module counters that accompany billing observability (defined in `mod_ai_token_auth`, exported through BFE's web monitoring interface):
+
+| Counter | Description |
+|--------|------|
+| `UsageUnrecognized` | Requests whose upstream usage was not recognized and whose billing was skipped (semantics narrowed to "unrecognized" only) |
+| `AbortBillingSkipped` | Requests aborted by the client and skipped with zero billing |
+| `BillingZeroCost` | Billable 2xx requests whose cost was 0 (AI cache hits are marked but not counted) |
+| `DeductFailed` | Requests whose quota deduction failed |
+| `AiUsageSuppressed` | Times usage was suppressed (e.g. recognition fix for explicit all-zero usage) |
+| `PriceFallbackUsed` / `PriceLookupMiss` | Fallback-to-chat-price billing / no price baseline (see "Cost Calculation" above) |
+| `AiUsageInconsistent` | Usage inconsistency detection |
+
 ## Monitoring Metrics
 
-`mod_ai_token_auth` exposes three core counters in `ModuleAITokenAuthState` (defined in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`):
+`mod_ai_token_auth` exposes the core request-volume counters in `ModuleAITokenAuthState` (defined in `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`):
 
 | Metric Name | Type | Description |
 | ----------- | ---- | ----------- |
@@ -597,7 +733,7 @@ This division of labor guarantees that, whether streaming or non-streaming, `Tok
 | `REQ_AUTH` | Counter | Number of requests hitting an authentication rule and triggering validation |
 | `REQ_AUTH_FAIL` | Counter | Number of requests failing authentication or the quota pre-check |
 
-These metrics are output through BFE's built-in web monitoring interface. Operators can use them to compute the authentication failure rate, break down failure reasons by product and Key dimensions, and set alert thresholds. For example, a spike in `REQ_AUTH_FAIL` may indicate a large number of requests with invalid Keys, or that some quota plan has been exhausted.
+In addition, the counters listed under "Billing Observability" above — `UsageUnrecognized`, `AbortBillingSkipped`, `BillingZeroCost`, `DeductFailed`, `AiUsageSuppressed`, `PriceFallbackUsed`, `PriceLookupMiss`, etc. — serve billing quality observability. These metrics are output through BFE's built-in web monitoring interface. Operators can use them to compute the authentication failure rate, break down failure reasons by product and Key dimensions, and set alert thresholds. For example, a spike in `REQ_AUTH_FAIL` may indicate a large number of requests with invalid Keys or that some quota plan has been exhausted; a spike in `DeductFailed` calls for checking the Redis quota path.
 
 ## Key Code Snippets
 
@@ -766,8 +902,14 @@ type TokenAuthContext struct {
 - Through four callbacks — `HandleFoundProduct`, `HandleAfterAITargetModel`, `HandleReadResponse`, and `HandleRequestFinish` — it completes authentication, target model validation, usage parsing, and quota deduction respectively.
 - The API-Key is extracted from `Authorization: Bearer <api-key>`; authentication-stage validation items include existence, enabled state, expiration time, source subnets, and the Redis balance of each `QuotaPlan`; the model allowlist/blocklist is validated at the forwarding stage against the final target model (`ValidateTargetModel`), and a mismatch returns 400 and ends that attempt.
 - `QuotaPlan.RedisKey` is generated and delivered by the Control Plane and used directly by BFE, avoiding counter resets caused by renames; the `total_token` and `RMB` units use different Lua scripts for deduction.
-- RMB quota computes cost based on model prices and the current time-period tier in `AIConf.ModelTable`; model prices are `float64` values, and each billing line item is converted via `quota.CalcCostUnits` into a 1e-8-RMB fixed-point integer before accumulation and deduction. Chat billing splits cache read/write and image/audio input dimensions out of the total input, falling back to the legacy formula when none are configured; `responses` reuses chat billing, and `video_generation` is billed as `output_cost_per_video` × video count.
+- RMB quota computes cost based on model prices and the current time-period tier in `AIConf.ModelTable`; model prices are `float64` values, and each billing line item is converted via `quota.CalcCostUnits` into a 1e-8-RMB fixed-point integer before accumulation and deduction. Chat billing splits cache read/write and image/audio input dimensions out of the total input, falling back to the legacy formula when none are configured; `responses` reuses chat billing.
+- image/video billing discriminates by whether the price key exists (`ModelPrice.HasPrice`): a missing per-unit price key falls back to the chat token formula, while an explicit zero price is still billed per unit; when the price table has no entry for `(model, mode)`, billing falls back to the same model's chat price, with observability via the counters `PriceFallbackUsed` / `PriceLookupMiss` and the log field `ai_price_miss`.
+- Billing reliability is supported by the two sets of marks on `AiBasicInfo` — `MarkResponseCompleted` / `MarkFinalUsageSeen`: usage recognition is by presence rather than value (an explicit all-zero usage is no longer misjudged as no usage), `EstimateToken` defaults to true and only backstops requests that never collected a usage object, and a streaming response ending with a clean EOF counts as complete; no billing when the client aborts without a final usage, and estimates are usable only when the response completes normally; `TokenAuthContext.deducted` makes deduction idempotent; `/count_tokens` endpoints skip billing.
+- Billing observability: the access log carries `ai_usage_source` (764: parsed/estimated/unrecognized/aborted), `ai_zero_cost_reason` (765: ten zero-cost attributions), and `ai_price_miss` (763); `Server.InjectStreamUsage` injects `include_usage` into OpenAI streaming requests by default; clearing/backstop acts only on the billing copy while the log view preserves observed values; Kimi's nested `choices[N].usage` participates in parsing, and usage collection for non-streaming gzip (with charset) works on the decompressed copy; `ai_cost_value` is written for every observed 2xx row (including 0), so reconciliation must use `= 0` instead of `IS NULL`.
+- The quota pre-check rejection (429) and rejection paths such as `KEY_DISABLED` / `KEY_EXPIRED` / `QUOTA_EXPIRED` / `SUBNET_NOT_ALLOWED` preserve the API-Key tags and write them into the access log `ai_apikeytags` (702) and `ClientKeyId`, so rejected rows can also be attributed to Entities.
+- Batch and asynchronous tasks are supported by `mod_ai_batch`: `/v1/files` and `/v1/batches` are recognized as `ModeFile` / `ModeBatch` (batch traffic does not fall into chat billing), uploads are counted by lines/bytes and forwarded as streams (no retry buffering), batch-level key affinity is established on a first-come-first-served basis via SETNX, postpaid quota follows reserve-settle-release (`BATCH_RESERVE_BATCH` / `BATCH_SETTLED` idempotency), and the access log carries the 901-907 batch fields.
 - Billing reliability is supported by the two sets of marks on `AiBasicInfo` — `MarkResponseCompleted` / `MarkFinalUsageSeen`: no billing when the client aborts without a final usage, and estimates are usable only when the response completes normally; `TokenAuthContext.deducted` makes deduction idempotent; `/count_tokens` endpoints skip billing.
+- Upstream Keys are selected by weight from `AIConf.Keys`, skipping `Weight=0`; 429 and 401/402/403 trigger Key rotation, writing 60s / 3600s penalties respectively when session-affinity penalty is enabled, and an empty candidate set synthesizes 429 `NO_AVAILABLE_KEY` (with `Retry-After` and `error.details.retry_after_seconds=60`); before injecting an upstream credential the client credential headers are removed, keeping only the injected one, while a keyless cluster skips selection and injection entirely.
 - A `total_token` quota is allowed to be 0 (a no-balance plan whose bound requests are rejected with 429), and a missing Redis balance key is treated as no balance rather than an internal error.
 - Token usage of streaming responses is parsed and accumulated by `mod_body_process` (`message_delta` retains the prompt/cache fields from `message_start`), while non-streaming responses are parsed directly by `mod_ai_token_auth`; usage extraction is uniformly delegated to the `bfe_model_protocol` protocol adapter layer, and deduction is unified in `HandleRequestFinish`.
 
@@ -780,14 +922,19 @@ Understanding the implementation of `mod_ai_token_auth` helps troubleshoot probl
 - `bfe/bfe_modules/mod_ai_token_auth/token_rule_table.go`
 - `bfe/bfe_modules/mod_ai_token_auth/token_rule_load.go`
 - `bfe/bfe_modules/mod_ai_token_auth/conf_mod_ai_token_auth.go`
+- `bfe/bfe_modules/mod_ai_batch/mod_ai_batch.go`
+- `bfe/bfe_modules/mod_ai_batch/file_counter.go`
 - `bfe/bfe_modules/mod_body_process/content_quota_usage.go`
 - `bfe/bfe_modules/mod_body_process/mod_body_process.go`
+- `bfe/bfe_modules/mod_access_pb3/request_log.go`
+- `bfe/bfe_server/reverseproxy.go`
 - `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`
 - `bfe/bfe_basic/request_ai_basic.go`
 - `bfe/bfe_model_protocol/utils/usage_parse.go`
 - `bfe/bfe_modules/bfe_modules.go`
 - `bfe/docs/zh_cn/modules/mod_ai_token_auth/mod_ai_token_auth.md`
 - `bfe/docs/zh_cn/sys_design/ai_rate_limit_redis_key.md`
+- `bfe/docs/zh_cn/sys_design/ai_access_log_fields.md`
 - `ai-gateway-api/design-docs/sys-design/details/配额余额同步机制.md`
 - `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`
 - [Chapter 21: Quota and Rate Limit Design](../design/chapter12-quota-and-rate-limit.md)

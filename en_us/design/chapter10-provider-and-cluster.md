@@ -9,6 +9,8 @@ In the Control Plane of Rainway AI Gateway, the model Provider and the forwardin
 - Understand how the Control Plane generates the `AIConf` required by the BFE Data Plane from Provider + Cluster.
 - Learn about key mechanisms such as model discovery, Key references and weights, Key Policy, and Key Affinity.
 - Understand the semantics, validation rules, and Data Plane execution of `protocol_paths` protocol path rewriting.
+- Understand the configuration semantics and default conventions of `llm_config.normalize_upstream_error` upstream error normalization.
+- Understand the K8s pool provisioning mechanism and the Effective Instance Pool contract.
 - Write practical configurations that conform to the specification.
 
 ## Provider Design Goals and Data Model
@@ -19,7 +21,7 @@ A Provider answers the questions "who is the downstream, which models can be acc
 
 - **Identity and capability declaration**: A Provider holds metadata such as name, description, supported model list, model access protocols (`model_protocols`), and model discovery endpoint (`model_endpoint`).
 - **Authentication consolidation**: A Provider is the sole holder of API-Key plaintext; clusters reference it only by `name` and no longer expose key content.
-- **Backend instance consolidation**: A Provider maintains an `instance_pool`, allowing multiple clusters to reuse the same set of backend addresses.
+- **Backend instance consolidation**: A Provider maintains an `instance_pool` (or a pool supplied by the K8s discovery component), allowing multiple clusters to reuse the same set of backend addresses.
 - **Independent lifecycle**: A Provider can be created, updated, and deleted independently; before deletion, the Control Plane checks whether any cluster references it.
 
 ### Data Model
@@ -63,8 +65,11 @@ Key field descriptions:
 - `name`: The unique identifier of a Provider, globally unique.
 - `model_endpoint`: The model discovery endpoint, defaulting to `{schema: "https", uri: "/v1/models"}`.
 - `models`: The list of models supported by this provider; it can be maintained manually or backfilled by the model discovery interface.
-- `keys`: A list of API-Keys, each containing a `name` and the plaintext `key`. The `name` is used for cluster references.
-- `instance_pool`: The backend instance pool, containing at least one instance, and at least one instance must have `weight > 0`.
+- `keys`: A list of API-Keys, each containing a `name` and a `key` (key material). The `name` is used for cluster references. In the database the column holding this field, `providers.api_keys`, is `MEDIUMTEXT`, with the entire key pool serialized into a single `enc$v1$` envelope ciphertext (not per-field encryption). When `[Security].MasterKeyFile` is configured, the Control Plane self-checks that column type at startup and refuses to start if it is still a JSON type; the read path returns 500 for an undecryptable value (see [Chapter 17 Security Design](./chapter17-security-design.md)). Keys in distributed configuration files travel in envelope form as well, and only the Data Plane uses them in plaintext after loading.
+- `instance_pool`: The backend instance pool. When the instance source is manual maintenance (the default), it must contain at least one instance, and at least one instance must have `weight > 0`; when the instance source is a K8s Pool, this field is not validated — see "K8s Pool Provisioning" below.
+- `instance_source`: The instance provisioning mode: `instance_pool` (manual maintenance, the default) or `k8s_pool` (maintained by the K8s discovery component).
+- `k8s_pool_name`: Required when `instance_source=k8s_pool`; references a K8s Pool by name.
+- `k8s_instance_pool`: A read-only mirror of the K8s Pool, synced by the Control Plane from the `k8s_pools` table; a request body carrying this field is rejected with 422.
 - `model_protocols`: The supported model access protocols; the current enum values are `openai`, `anthropic`, and `gemini`, with at least one required.
 - `protocol_paths`: Optional. A declarative mapping of protocol -> upstream base path, used to rewrite the standard entry `/v1/...` to the provider's native prefix; see "Protocol Path Rewriting" below.
 - `time_zone` / `tiers`: Used for peak/off-peak price matching; only the `peak` tier is supported initially.
@@ -124,6 +129,13 @@ The JSON representation of a Cluster is as follows (see `ai-gateway-api/design-d
             "redis_prefix": "bfe:ai:key_affinity",
             "penalty_enable": true
         },
+        "normalize_upstream_error": {
+            "enabled": true,
+            "stream_enabled": true,
+            "unrecognized_action": "rewrite_generic",
+            "max_body_bytes": 65536,
+            "redact_secrets": true
+        },
         "provider": "deepseek",
         "match_prefix": "deepseek/",
         "strip_prefix": true
@@ -141,6 +153,7 @@ Key field descriptions:
 - `llm_config.keys`: Only `name` and `weight` are kept; `name` must reference an existing key in the provider.
 - `llm_config.key_policy`: Multi-Key selection policy and retry backoff; currently `strategy` only supports `weighted_random`.
 - `llm_config.key_affinity`: Session-level Key affinity based on Redis + `ClientKeyId`.
+- `llm_config.normalize_upstream_error`: Optional upstream error normalization configuration; see "Upstream Error Normalization" below.
 
 ## Why Provider and Cluster Are Decoupled, and the Benefits
 
@@ -174,7 +187,7 @@ In this architecture:
 
 - A Provider is the "capability provider"; a Cluster is the "forwarding policy."
 - A Cluster strongly references a Provider via `llm_config.provider`.
-- When the Control Plane creates a Cluster, it automatically generates instance pools and sub-clusters from the Provider's `instance_pool` and binds them to the cluster.
+- When the Control Plane creates a Cluster, it automatically generates instance pools and sub-clusters from the Provider's effective instance pool (`EffectiveInstancePool()`) and binds them to the cluster.
 - `model-prices` associates with a Provider by name only as a weak reference, which does not block deletion.
 
 ### Core Benefits
@@ -214,6 +227,47 @@ When deleting a cluster, the system first checks whether the cluster is referenc
 
 For both `PATCH /providers/{provider_name}` and `PATCH /clusters/{cluster_name}`, the request body must not contain the `name` field. The name is uniquely specified by the URI path parameter; if the request body carries `name`, the API returns `422 Unprocessable Entity`.
 
+## K8s Pool Provisioning
+
+In addition to the manually maintained `instance_pool`, a Provider's instance source can also be a K8s Pool: the ai-gateway-controller (formerly Service Controller) deployed in a Kubernetes environment reports the Ready instances of Services/Endpoints carrying the `ai-gateway-api-name` label to the Control Plane in full via the InnerAPI `k8s_pools`. By referencing a pool name, a Provider obtains a dynamic backend list whose instances grow and shrink automatically with K8s service changes, without manual maintenance; the pool members reach BFE indirectly through `cluster_table`.
+
+### Dual-Mode Instance Source
+
+The `providers` table expresses the dual-mode instance source with three fields:
+
+| Field | Type | Description |
+|------|------|------|
+| `instance_source` | `VARCHAR(32)`, default `instance_pool` | Instance provisioning mode: `instance_pool` means the instance list is maintained manually; `k8s_pool` means instances are supplied by the K8s discovery component |
+| `k8s_pool_name` | `VARCHAR(255)`, nullable | Required when `instance_source=k8s_pool`; the name of the referenced K8s Pool |
+| `k8s_instance_pool` | JSON, nullable | Read-only mirror of the K8s Pool, synced and written by the Control Plane from the `k8s_pools` table; an OpenAPI request body carrying this field is rejected with 422 |
+
+The naming rule for `k8s_pool_name` is 1-64 characters, allowing only letters, digits, and `_`, `-`, `.`, and it must not start or end with `.`, `-`, or `_`. The referenced pool does not need to exist in advance: a missing pool is equivalent to zero instances, and instances appear automatically once the discovery component performs its first sync.
+
+### Effective Instance Pool Contract
+
+`EffectiveInstancePool()` in `model/iprovider/provider.go` defines the Effective Instance Pool contract, which is the single entry point through which downstream code consumes an instance pool:
+
+```text
+EffectiveInstancePool(p) = p.instance_source == "k8s_pool" ? p.k8s_instance_pool : p.instance_pool
+```
+
+- Cluster instance snapshot creation, instance pool synchronization, and change detection all read the effective pool through this contract; they never touch the raw `instance_pool` / `k8s_instance_pool` fields directly.
+- When the merged `instance_source` being written resolves to `instance_pool`, the `k8s_instance_pool` mirror is forcibly cleared — under `instance_pool` mode the mirror is always empty.
+- A legitimate empty pool can only occur in `k8s_pool` mode: when the effective pool is empty, clusters referencing this provider are delivered with an empty entry, BFE accepts the load, and requests to that cluster return 500 (`BK_NO_BACKEND`, message `no available backend for this request`), which must be paired with alerting; a sub-cluster missing from `cluster_table` is likewise treated as having no backend, and the same error appears after a hot reload releases old instances. The non-empty validations under `instance_pool` mode (at least one instance, (addr, port) deduplication, at least one `weight > 0`) remain unchanged.
+
+### The k8s_pools Table and Maintenance Endpoints
+
+The `k8s_pools` table registers all K8s Pools (`name` unique, `instances` JSON, `created_at` / `updated_at`). Its sole writer is the K8s discovery component, which maintains it via the InnerAPI (authorized by `FeatureK8sPool`):
+
+| Endpoint | Description |
+|------|------|
+| `PUT /inner-api/v1/k8s_pools/{name}/instances` | Full-replacement of the instance list; the request body is a bare JSON array. Instance `addr` is required, `port` ranges 1-65535, `weight` ranges [0,100] and defaults to 100, and the (addr, port) combination must be unique within the pool; an empty array is valid and equivalent to zero instances |
+| `GET /inner-api/v1/k8s_pools` | Pool list, including `instance_count` / `last_sync_time` |
+| `GET /inner-api/v1/k8s_pools/{name}` | Query a single pool; returns 404 when the pool does not exist |
+| `DELETE /inner-api/v1/k8s_pools/{name}` | Deleting a pool has no reference protection; the mirrors of providers referencing this pool are cleared accordingly |
+
+After a successful write, the Control Plane completes the fan-out in a single transaction (`K8sPoolManager.ReplaceInstances` / `DeletePool` in `model/ik8s_pool/k8s_pool.go`): it refreshes the `k8s_instance_pool` mirrors of all providers referencing the pool and synchronously updates the derived instance pools of referencing clusters; empty pools also participate in the sync, i.e. clear semantics. If any step of the fan-out fails, the entire write is rolled back, keeping the pool record, the provider mirrors, and the cluster derived pools consistent.
+
 ## AIConf Generation
 
 The configuration structure consumed by the BFE Data Plane remains consistent with the pre-refactoring structure. The Control Plane merges the data of Providers and Clusters via `model/icluster_conf/exporter.go` to generate the final `AIConf`. The diagram below shows the generation process:
@@ -221,7 +275,7 @@ The configuration structure consumed by the BFE Data Plane remains consistent wi
 ```mermaid
 flowchart LR
     subgraph Provider
-        P1[instance_pool]
+        P1[Effective Instance Pool]
         P2[keys plaintext]
         P3[model_protocols]
         P4[models]
@@ -261,7 +315,7 @@ The generation sources of each field are as follows:
 
 | BFE Configuration Item | Source (New Model) |
 |------------------------|--------------------|
-| Instance pool / sub-cluster / cluster | Cluster + Provider.instance_pool |
+| Instance pool / sub-cluster / cluster | Cluster + Provider effective instance pool (`EffectiveInstancePool()`) |
 | `AIConf.Models` | `cluster.llm_config.models` |
 | `AIConf.ModelMappings` | `cluster.llm_config.model_mappings` |
 | `AIConf.Keys` | `provider.keys` (key plaintext) joined by name with `cluster.llm_config.keys` (weight) |
@@ -270,6 +324,7 @@ The generation sources of each field are as follows:
 | `AIConf.MatchPrefix` / `StripPrefix` | `cluster.llm_config.match_prefix` / `strip_prefix` |
 | `AIConf.ModelProtocols` | `provider.model_protocols` passed through by the cluster's provider reference |
 | `AIConf.ProtocolPaths` | `provider.protocol_paths` passed through by the cluster's provider reference |
+| `AIConf.NormalizeUpstreamError` | `cluster.llm_config.normalize_upstream_error` |
 | `AIConf.ModelTable` | Auto-populated by querying `model-prices` from the provider |
 
 ### Automatic Population of ModelTable
@@ -315,6 +370,47 @@ Reference values for common providers:
 Two caveats: on some providers the path carries billing semantics (Volcano `/api/v3` pay-as-you-go vs `/api/coding` subscription), so a subscription Key mistakenly configured with a pay-as-you-go prefix will be billed incorrectly — verify the Key type against the path when configuring; and the model discovery endpoint (`model_endpoint`) is not derived from `protocol_paths` — for example, Anthropic-protocol model discovery on Bailian requires manually configuring `/apps/anthropic/v1/models`.
 
 The execution details and fallback recomputation semantics are covered in [Chapter 7: Data Plane Forwarding Design: BFE](./chapter07-data-plane-design.md).
+
+## Upstream Error Normalization (normalize_upstream_error)
+
+Error responses vary widely across providers (status codes, error codes, and error body field names all differ), and pass-through makes failures hard for clients to handle uniformly. For this reason, the Cluster's `llm_config` offers an optional `normalize_upstream_error` object: when enabled, BFE maps upstream errors to an internal `UPSTREAM_*` error catalog through the `openai` / `anthropic` / `gemini` protocol adapters, then rewrites the response in the protocol style of the downstream request.
+
+### Data Plane Behavior
+
+The corresponding BFE configuration item is `AIConf.NormalizeUpstreamError` (`Enabled` / `StreamEnabled` / `UnrecognizedAction` / `MaxBodyBytes` / `RedactSecrets`). Its main behaviors include:
+
+- Non-streaming responses are normalized when `enabled` is on; SSE streams are normalized when `stream_enabled` is on. Error frames inside a stream are rewritten (recorded as `ai_stream_error_rewritten` in the access log), and abnormally truncated streams are recorded as `ai_stream_truncated`;
+- Normalized gateway responses carry an `X-Bfe-Gw-Error` marker header, so clients can tell the response was produced by gateway normalization rather than passed through verbatim from upstream;
+- Normalization redacts credentials, covering common forms such as raw / base64 / URL / JSON-escaped, so an upstream error body cannot carry API-Key plaintext back to the client;
+- `unrecognized_action` controls the handling of unrecognized error bodies: `passthrough` forwards them unchanged, and `rewrite_generic` rewrites them into a generic error format.
+
+The access log contains the following fields (defined as pb fields 810-815 in bfe-access-pb, requiring bfe-access-pb >= v0.3.12): `ai_upstream_status`, `ai_upstream_err_code`, `ai_err_normalized`, `ai_err_normalize_miss`, `ai_stream_error_rewritten`, `ai_stream_truncated`.
+
+### Control Plane Configuration
+
+`normalize_upstream_error` reuses the `clusters.llm_config` JSON column for storage, without a separate DDL. All fields are optional pointers; when absent, the behavior is equivalent to BFE having normalization disabled (preserving the historical pass-through behavior):
+
+| Field | Type | Description |
+|------|------|------|
+| `enabled` | `*bool` | Non-streaming response normalization switch; defaults to `false`. |
+| `stream_enabled` | `*bool` | SSE stream normalization switch; defaults to `false`. |
+| `unrecognized_action` | `*string` | Handling of unrecognized error bodies; enum: `passthrough` / `rewrite_generic`. |
+| `max_body_bytes` | `*int64` | Error body read limit; when `<=0` or unset, the BFE default of 65536 is used. |
+| `redact_secrets` | `*bool` | Credential redaction switch; `nil` uses the BFE default `true`, and an explicit `false` disables redaction. |
+
+For export, the InnerAPI `server_data_conf` maps `cluster.llm_config.normalize_upstream_error` to BFE `AIConf.NormalizeUpstreamError`. Default values are not delivered; they are synthesized by BFE `Effective()` at load time, avoiding redundant delivery. Control Plane validation rules align one by one with BFE `AIConfCheck` (e.g., the `unrecognized_action` enum and numeric ranges), and illegal configurations are rejected with 422 at save time.
+
+Configuration example:
+
+```json
+"normalize_upstream_error": {
+    "enabled": true,
+    "stream_enabled": true,
+    "unrecognized_action": "rewrite_generic",
+    "max_body_bytes": 65536,
+    "redact_secrets": true
+}
+```
 
 ## Model Discovery
 
@@ -472,6 +568,13 @@ curl -X POST "http://api-server:8183/api/v1/clusters" \
             "redis_prefix": "bfe:ai:key_affinity",
             "penalty_enable": true
         },
+        "normalize_upstream_error": {
+            "enabled": true,
+            "stream_enabled": true,
+            "unrecognized_action": "rewrite_generic",
+            "max_body_bytes": 65536,
+            "redact_secrets": true
+        },
         "provider": "deepseek",
         "match_prefix": "deepseek/",
         "strip_prefix": true
@@ -515,7 +618,9 @@ This chapter detailed the design of Provider and Cluster in Rainway AI Gateway.
 - **Decoupling benefits**: clearer responsibilities, less duplicate configuration, clusters no longer expose key plaintext, transparent to BFE, and weak references between model-prices and provider.
 - **AIConf generation**: The Control Plane joins the data of Providers and Clusters by name to generate the instance pools, sub-clusters, `AIConf.Keys`, `AIConf.ModelTable`, `AIConf.ModelProtocols`, and other fields required by BFE.
 - **Model discovery**: Probes the third-party model list via `/providers/tools/discover-models` and then backfills it into the Provider.
+- **K8s Pool provisioning**: `instance_source` dual mode (manual `instance_pool` / `k8s_pool` maintained by the K8s discovery component); `EffectiveInstancePool()` is the single consumption entry for downstream code; K8s Pools are written exclusively by the discovery component via the InnerAPI, and after each write a single transaction fans out to refresh the provider mirrors and the derived instance pools of referencing clusters.
 - **Key mechanisms**: A Cluster references the Provider's keys by `name` and sets weights; `key_policy` controls the selection policy and retry backoff; `key_affinity` provides Redis-based session-level Key affinity.
+- **Upstream error normalization**: `llm_config.normalize_upstream_error` maps upstream errors to a unified `UPSTREAM_*` error catalog through the protocol adapters; all fields are optional and default to the historical pass-through behavior; it is exported as `AIConf.NormalizeUpstreamError`, with defaults synthesized by BFE at load time.
 
 Understanding the boundary between Provider and Cluster is the foundation for correctly configuring Rainway AI Gateway and achieving flexible scheduling across multiple model providers.
 
@@ -526,6 +631,7 @@ Understanding the boundary between Provider and Cluster is the foundation for co
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/clusters.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/cluster-table.md`
 - `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/ai-route.md`
+- `ai-gateway-api/design-docs/api-define/InnerAPI接口定义/k8s-pools.md`
 - [Chapter 6: Control Plane Core Design: AI Gateway API](./chapter06-control-plane-design.md)
 - [Chapter 20: Provider Configuration](../operation/chapter20-provider-and-model-config.md)
 - [Chapter 21: Cluster Configuration](../operation/chapter21-cluster-and-route-config.md)

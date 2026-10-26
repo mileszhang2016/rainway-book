@@ -47,6 +47,7 @@ ai-gateway-api/
 ├── main.go                      # Service entry: config loading, initialization, HTTP startup
 ├── conf/                        # Configuration files (TOML, i18n, AI templates, etc.)
 ├── data/                        # Data files
+├── database/                    # Version upgrade scripts and report DDL
 ├── docs/                        # User documentation
 ├── design-docs/                 # Design documents
 │   ├── api-define/              # API definition documents
@@ -74,6 +75,8 @@ ai-gateway-api/
 │   ├── quotacache/              # API-Key/Entity real-time quota cache abstraction
 │   ├── shared/                  # Types and models shared across packages
 │   ├── route_rules/             # Global/Entity/API-Key route rule business logic
+│   ├── ibatch/                  # Batch and asynchronous task business logic
+│   ├── keyrotate/               # Key-rotation convergence tasks
 │   └── itxn/                    # Transaction abstraction interface
 ├── stateful/                    # Configuration, database, logging, DI container
 │   └── container/               # Global component container
@@ -90,7 +93,9 @@ ai-gateway-api/
 │   ├── quota/                   # Quota-related storage
 │   ├── route_conf/              # Route rule storage
 │   ├── txn/                     # Transaction implementation
-│   └── version_control/         # Version control storage
+│   ├── version_control/         # Version control storage
+│   ├── batch/                   # Batch task storage
+│   └── keyrotate/               # Key-rotation convergence task storage
 ├── test/                        # Test-related
 └── version/                     # Version information
 ```
@@ -115,7 +120,7 @@ type Endpoint struct {
 |--------------|----------------|
 | `endpoints/openapi_v1/` | Management-plane OpenAPI, used by the Dashboard and automation scripts, e.g. `/api-keys`, `/clusters`, `/providers` |
 | `endpoints/innerapi_v1/` | Data-plane InnerAPI, used by BFE and Conf Agent to pull configuration, e.g. `/configs/tls_conf/server_data_conf`, `/configs/mod-api-key` |
-| `endpoints/middleware/` | Global HTTP middleware: Recovery, Logger, CORS, Product Probe, User Probe |
+| `endpoints/middleware/` | Global HTTP middleware: Recovery, Logger, CORS, management-plane IP allowlist (McIPProbe, see [Chapter 17](../design/chapter17-security-design.md)), Product Probe, User Probe |
 
 The two interface families differ significantly in route prefix, authentication method, and purpose. OpenAPI v1 uses the `/open-api/v1` prefix and is aimed at humans and external systems; it typically requires the Product Probe and User Probe middleware to validate the product line and user identity. InnerAPI v1 uses the `/inner-api/v1` prefix and is aimed at machine clients such as BFE and Conf Agent, emphasizing complete configuration export and version-based incremental sync. The top-level `endpoints/router.go` handles global Recovery, Logger, CORS, and static file serving, while `endpoints/openapi_v1/endpoints.go` and `endpoints/innerapi_v1/endpoints.go` each merge the `Endpoint` slices from their sub-packages and complete registration.
 
@@ -143,6 +148,8 @@ Key model packages and their responsibilities:
 | `model/route_rules` | Global/Entity/API-Key route rule business logic |
 | `model/imods` | Assembly of mod-api-key, mod-body-process, and AI route export configurations |
 | `model/itxn` | Transaction abstraction interface `TxnStorager` |
+| `model/ibatch` | Batch and asynchronous tasks: task entities, reserve-settle-release accounting, the reconciliation job, Redis key contracts |
+| `model/keyrotate` | Key-rotation convergence tasks (sweeps): task orchestration, locking and lost-instance takeover, convergence modes and dry-run |
 
 The unified transaction abstraction is defined in `model/itxn/txn.go`:
 
@@ -180,6 +187,8 @@ The correspondence between the storage layer and the model layer is as follows:
 | `storage/rdb/route_rules` | `model/shared`, `model/route_rules` | `route_rules` |
 | `storage/rdb/ai_route` | `model/iai_route` | `ai_route_rules` |
 | `storage/rdb/version_control` | `model/iversion_control` | `config_versions` |
+| `storage/rdb/batch` | `model/ibatch` | `batch_tasks`, `batch_files` |
+| `storage/rdb/keyrotate` | `model/keyrotate` | `keyrotate_sweep_tasks`, `keyrotate_sweep_lock` |
 
 The DAO layer follows a uniform template: each table has a table-name constant, a result struct `T<Table>`, a parameter struct `T<Table>Param`, and the `T<Table>One/List/Create/Update/Delete` functions. On top of these DAO functions, the Storage layer implements the `XxxStorager` interfaces, handling conversion between business models and database rows, default value processing, and simple query-condition assembly. All tables include `created_at` and `updated_at` fields, and the DDL declares no physical FOREIGN KEYs; inter-table relationships are maintained by application-layer code, making future database/table sharding and flexible schema changes easier.
 

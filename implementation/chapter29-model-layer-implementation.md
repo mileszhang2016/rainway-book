@@ -31,8 +31,13 @@ model/
 ├── itxn/                 # 事务抽象接口
 ├── ibasic/               # 产品、BFE 集群、附加文件
 ├── icluster_conf/        # Cluster、SubCluster、Pool
-├── iprovider/            # Provider 与模型发现
+├── iprovider/            # Provider、模型发现与有效实例池契约
 ├── imodel_price/         # 模型定价
+├── ai_cache/             # AI 缓存规则与语义缓存设置
+├── ai_context/           # 上下文压缩规则与全局设置
+├── traffic_mirror/       # 流量镜像规则
+├── iintent_config/       # 意图配置单例
+├── ik8s_pool/            # K8s 实例池维护与扇出同步
 └── ...
 ```
 
@@ -49,7 +54,8 @@ model/
 - `route_rules`：管理 Global / Entity / API-Key 三级 AI 路由规则。
 - `shared`：提供跨包共享的 Param、Filter、Storager 接口，以及路由规则、配额余额等通用结构。
 - `itxn`：提供最小化的事务抽象，是整个模型层一致性的基石。
-- `icluster_conf` / `iprovider` / `imodel_price`：分别负责集群转发策略、Provider 接入能力、模型定价等与数据面导出密切相关的资源。
+- `icluster_conf` / `iprovider` / `imodel_price`：分别负责集群转发策略、Provider 接入能力、模型定价等与数据面导出密切相关的资源。其中 `model/iprovider` 还承载实例来源双模式（`instance_source` / `k8s_pool_name` / `k8s_instance_pool` 三字段）与有效实例池契约 `EffectiveInstancePool()`（K8s 池优先，下游经此唯一入口消费实例池），详见 [第十章 Provider 与 Cluster 设计](../design/chapter10-provider-and-cluster.md)。
+- `ai_cache` / `ai_context` / `traffic_mirror` / `iintent_config` / `ik8s_pool`：AI 缓存规则、上下文压缩规则、流量镜像规则、意图配置单例与 K8s 实例池五个规则类资源域，沿用同一套 Manager + Storager 惯例；三个规则集合域在 Manager 内以单事务 delete-all + insert-all 实现集合整体替换，意图配置与两个全局设置为单行覆盖。
 
 ## Param / Filter / Storager / Manager 四层抽象
 
@@ -650,9 +656,9 @@ _, err = m.planStorager.UpdateQuotaPlan(ctx, &QuotaPlanFilter{
 
 需要注意，手动重置路径（`QuotaPlanManager.ResetBalance`）仍走 `ResetToQuota`（内部即 `SetRemaining` 的 `IncrBy(delta)`），因为手动重置要求把剩余量补到配额总量、需要基于当前值算差额；周期重置则要求“无条件归零到配额总量”，两者语义不同，实现也刻意分开。
 
-## 报表模块：ReportManager 与双后端 Storager
+## 报表模块：ReportManager 与多后端 Storager
 
-报表查询（`/report/*`）是 Manager + Storager 模式在多数据源下的应用。控制面库之外的报表库（MySQL `bfe_report` 或 Doris `bfe_observability`）只读查询，不走 `itxn.TxnStorager` 事务体系，因此模型层直接定义查询接口并由存储层实现：
+报表查询（`/report/*`）是 Manager + Storager 模式在多数据源下的应用。控制面库之外的报表库（MySQL `bfe_report`、Doris `bfe_observability` 或 ClickHouse / StarRocks 中同名库）只读查询，不走 `itxn.TxnStorager` 事务体系，因此模型层直接定义查询接口并由存储层实现：
 
 ```go
 // ai-gateway-api/model/ireport/types.go
@@ -665,9 +671,9 @@ type ReportStorager interface {
 }
 ```
 
-`ReportManager`（`model/ireport/manager.go`）的职责与同层其他 Manager 一致——参数绑定校验（go-playground/validator 惯例）、枚举与窗口校验（时间窗 ≤7 天）、bucket 计算（≤6h→60s、≤3d→300s、≤7d→1800s）与指标口径常量（错误率 = `error_count/request_count`、TTFT/TPOT 仅聚合流式请求等），自身不含 SQL，查询全部委托 `ReportStorager`。双后端（`storage/mysqlreport`、`storage/dorisreport`）共享同一接口，方言差异（时间桶函数、分位数函数）封在各自实现内，Manager 与接口层对后端无感知。
+`ReportManager`（`model/ireport/manager.go`）的职责与同层其他 Manager 一致——参数绑定校验（go-playground/validator 惯例）、枚举与窗口校验（时间窗 ≤7 天）、bucket 计算（≤6h→60s、≤3d→300s、≤7d→1800s）与指标口径常量（错误率 = `error_count/request_count`、TTFT/TPOT 仅聚合流式请求等），自身不含 SQL，查询全部委托 `ReportStorager`。四个后端（`storage/mysqlreport`、`storage/dorisreport`、`storage/clickhousereport`、`storage/starrocksreport`）共享同一接口，方言差异（时间桶函数、分位数函数等）封在各自实现内，Manager 与接口层对后端无感知。
 
-装配由 `stateful/container/rdb/components.go` 按 `[Report].Backend` 完成：配置为 `mysql` 时装配 MySQL 实现并启动聚合/分区 JOB；为 `doris` 时装配 Doris 实现（聚合由 Doris 侧既有 INSERT JOB 完成，不启动 JOB）；配置缺省则 `ReportManager` 为 nil，接口层据此不注册 `/report/*` 路由（见第二十八章的条件装配）。鉴权上新增 `FeatureReport`：System scope 授予 `ReadAll`（当前控制台仅管理员），Product scope 授予 `Read` 为租户自助用量报表预留。
+装配由 `stateful/container/rdb/components.go` 按 `[Report].Backend` 完成：配置为 `mysql` 时装配 MySQL 实现并启动聚合/分区 JOB；为 `doris` / `clickhouse` / `starrocks` 时装配对应实现（聚合分别由 Doris INSERT JOB、ClickHouse 物化视图、StarRocks 异步物化视图完成，均不启动本地 JOB）；配置缺省则 `ReportManager` 为 nil，接口层据此不注册 `/report/*` 路由（见第二十八章的条件装配）。鉴权项 `FeatureReport`：System scope 授予 `ReadAll`（当前控制台仅管理员），Product scope 授予 `Read` 为租户自助用量报表预留。
 
 ## 关键代码片段
 

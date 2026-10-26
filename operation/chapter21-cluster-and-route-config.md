@@ -31,7 +31,7 @@ graph LR
 2. 若 Cluster 需要使用 API-Key，必须先在 Provider 的 `keys` 中定义好 Key，并记录每个 Key 的 `name`；集群侧只引用 Key 名称，不填写明文。
 3. 明确该 Cluster 需要对外暴露哪些模型，以及是否需要模型重定向、多 Key 分流、Key 亲和性、EPP 均衡等高级能力。
 
-> **版本变化**：0.0.7 及更早版本的集群向导包含「实例配置」步骤，现已移除；实例池改在**模型服务商**模块维护，集群向导中选择「所属服务商」即引用其全部实例。
+> **实例池归属**：实例池在**模型服务商**模块维护，集群向导中选择「所属服务商」即引用其全部实例，向导本身不包含实例配置步骤。
 
 准备工作完成后，可以通过 Dashboard 可视化向导或 OpenAPI 直接提交配置。
 
@@ -150,6 +150,18 @@ AI 场景通常无需会话保持，保持默认停用即可。
 
 > Key 亲和性需数据面配置可用 Redis；Redis 不可用时自动降级为加权随机。
 
+**上游错误归一**
+
+「上游错误归一」卡片控制是否把上游错误体归一化为网关自身的错误目录，并对错误体中的凭证脱敏。
+
+| 字段 | 默认值 | 校验规则 | 说明 |
+| --- | --- | --- | --- |
+| 是否启用 | 停用 | — | 开启后上游 4xx/5xx 错误重写为统一错误体（OpenAI 兼容），状态码按统一映射表重映射（如上游 401/402/403 → 502 `UPSTREAM_AUTH_ERROR`）；关闭时上游错误原样透传 |
+| 流式归一（SSE） | 停用 | — | 独立于非流式归一开关；开启后流内错误事件 data 载荷改写为统一错误 JSON（响应状态保持 200） |
+| 凭证脱敏 | 启用 | — | 外发错误内容中出现本集群 API-Key 的各编码形态（原文 / base64 / URL 编码 / JSON 转义）替换为掩码 `••••••••`；关闭后不替换 |
+| 未识别错误体处理 | 原样透传（`passthrough`） | 仅 `passthrough` / `rewrite_generic` | 仅「是否启用」开启时显示；`passthrough` 原样透传（仍做脱敏），`rewrite_generic` 重写为 `UPSTREAM_UNKNOWN` 通用错误；流式未识别事件始终透传 |
+| 错误响应体读取上限（字节） | `65536` | 0-4194304 的整数 | 仅「是否启用」开启时显示；超出上限的错误体按未识别处理，`0` 或缺省时由 BFE 使用默认 65536 |
+
 **均衡模式配置**
 
 用于选择集群的后端负载均衡模式：
@@ -158,28 +170,55 @@ AI 场景通常无需会话保持，保持默认停用即可。
 | --- | --- | --- | --- |
 | 负载均衡模式 | 否 | `WRR（加权轮询）` | `WRR`：BFE 本地加权轮询；`EPP`：由 EPP 调度器接管后端选择（实例分配见 [第二十六章 EPP 调度运维](./chapter26-epp-scheduling-operation.md)） |
 
-选择 `EPP` 时展示以下配置项（`epp_config`）：
+选择 `EPP` 时在同一卡片内展示以下配置项（`epp_config`）：
 
 | 字段 | 必填 | 默认值 | 校验规则 | 说明 |
 | --- | --- | --- | --- | --- |
-| 调度策略 | 否 | `平衡（balanced）` | 枚举 | 延迟优先（latency-first）/ 平衡（balanced）/ 吞吐优先（throughput-first），预设的调度激进程度与优化目标组合 |
-| 缓存亲和性 | 否 | `中（medium）` | 枚举 | 低 / 中 / 高；显式指定 KV cache 亲和强度，覆盖调度策略的默认权重 |
-| 前缀缓存亲和性 | 否 | 启用 | — | 相同 prompt 前缀的请求尽力收敛到同一后端，提升 KV cache 复用（软亲和，不保证命中） |
-| 会话亲和性 | 否 | 停用 | — | 同一会话的请求尽力路由到同一后端；绑定端点摘除后自动迁移重粘 |
-| 会话亲和性 Header | 条件必填 | 空 | 非空 Header 名 | 启用会话亲和性时必填，如 `x-session-id`；从该 Header 解析 session id |
+| 实例负载画像 | 否 | `balanced（均衡）` | `queue-first` / `balanced` / `kv-first` | 多个后端都可用时的偏向：排队优先（通常更低延迟）/ 均衡 / KV 空闲优先（通常更高吞吐）；只调节「排队」与「KV」两个基础 scorer 的权重 |
+| 亲和强度 | 否 | `medium（0.6）` | `off` / `low` / `medium` / `high` | 把相同前缀 / 同一会话的请求往同一后端聚的力度：`off` 不注入亲和 scorer / `low` 权重 0.3 / `medium` 0.6 / `high` 1.0 |
+| 前缀缓存亲和性 | 否 | 启用 | 布尔 | 相同 prompt 前缀的请求经前缀哈希匹配尽力收敛到同一后端，提升 KV cache 复用（软亲和，不保证命中） |
+| 会话亲和性 | 否 | 停用 | 布尔 | 同一会话的请求尽力路由到同一后端；绑定端点摘除后自动迁移重粘 |
+| 会话亲和性 Header | 条件必填 | 空 | 非空 Header 名 | 启用会话亲和性时必填，如 `x-session-id`；关闭时保留但不生效 |
 | KV 缓存利用率上限 | 否 | `0.9` | 大于 0 且 ≤ 1 | KV cache 利用率超过该值的端点被过滤 |
-| 流控配置 | 否 | 见下表 | — | 可折叠卡片，见下表 |
+| 排队长度过滤阈值 | 否 | `0` | ≥ 0 的数 | 后端排队长度超过该值的端点被过滤；`0` 表示不启用该项过滤 |
+| 在飞请求数过滤阈值 | 否 | `0` | ≥ 0 的数 | 后端运行中请求数超过该值的端点被过滤；`0` 表示不启用该项过滤 |
+| 无端点时回退派发 | 否 | 停用 | 布尔 | 所有端点都被过滤时的行为：关闭则不派发，开启则回退派给「最不差」的端点 |
+| 指标失效剔除阈值（ms） | 否 | `200` | 大于 0 的整数 | 后端指标超过该时长未更新即从调度候选剔除，直到恢复抓取 |
+| 流控配置 | 否 | 见下表 | — | 同一卡片内的普通子卡片（无折叠交互），见下表 |
 
 流控配置（`flow_control`）：
 
 | 字段 | 默认值 | 校验规则 | 说明 |
 | --- | --- | --- | --- |
-| 最大请求数 | `不限` | 不限 / 限制（大于 0 的整数） | 全局并发上限；选「限制」后须填写大于 0 的整数 |
+| 最大请求数 | `不限` | 不限 / 限制（大于 0 的整数） | 全局并发上限；选「限制」后须填写大于 0 的整数，选「不限」按 `-1` 提交 |
 | 队列 TTL（秒） | `60` | ≥ 0 的整数 | 池有端点时的排队预算，超期以可重试背压错误拒绝；`0` 为禁用 |
 | 无端点队列 TTL（秒） | 跟随队列 TTL | ≥ 0 的整数 | 池无端点（冷启动扩容）时的排队预算 |
-| 启用驱逐 | 停用 | — | 高优先级请求被饱和阻塞时终止低优先级在飞请求，回收容量 |
+| 启用驱逐 | 停用 | 仅允许 `false` | 界面为**禁用态只读开关**并提示「当前不支持开启，保持关闭」；提交 `true` 被拒绝 |
 
-> **WRR ↔ EPP 切换**：`epp_config` 仅在 `EPP` 模式下生效；切回 `WRR` 时配置**保留但不生效**（休眠），再切回 `EPP` 继续生效，来回切换不丢配置。
+**EPP 运行时参数**
+
+选择 `EPP` 时，均衡模式配置卡片内还会展示 BFE 访问 EPP 调度器的健康检查与调用超时参数（`epp_runtime`）；不配置时由 BFE 补默认值，复查页对应显示「未配置（BFE 补默认）」。健康检查（`check`）：
+
+| 字段 | 默认值 | 校验规则 | 说明 |
+| --- | --- | --- | --- |
+| 关闭后台健康检查 | 停用 | 布尔 | 开启后 BFE 不再对 EPP 端点做主动健康检查；不建议生产关闭 |
+| 健康检查间隔 | `2s` | 合法且大于 0 的时长 | 两次探测的间隔 |
+| 失败次数阈值 | `3` | 整数且 ≥ 1 | 连续失败达到该值判定端点不健康 |
+| 冷却时长 | `45s` | 合法且大于 0 的时长 | 端点被判定不健康后的冷却时间 |
+| 成功次数阈值 | `2` | 整数且 ≥ 1 | 连续探测成功达到该值恢复为健康 |
+
+调用超时（`timeout`）：
+
+| 字段 | 默认值 | 校验规则 | 说明 |
+| --- | --- | --- | --- |
+| 连接超时 | `500ms` | 合法且大于 0 的时长 | 与 EPP 建连超时 |
+| 调用超时 | `3s` | 合法且大于 0 的时长 | 单次调用 EPP 的超时 |
+
+时长字段使用「数字框 + 单位下拉（ms / s / m）」复合控件：健康检查间隔、冷却时长、调用超时默认单位为 `s`，连接超时默认单位为 `ms`；切换单位会换算数值、保持物理时长不变。填 `0` 会在提交时被拦截，不会静默回落为默认值；清空数字框表示未设置，提交时按默认值补齐。
+
+> **卡片顺序**：大模型配置步骤的卡片自上而下为 模型服务 → 模型重定向 → 服务鉴权 Keys → Key 路由策略 → Key 亲和性 → 上游错误归一 → 均衡模式配置（EPP 模式下内嵌流控配置与 EPP 运行时参数）。
+
+> **WRR ↔ EPP 切换**：`epp_config` 与 `epp_runtime` 仅在 `EPP` 模式下生效；切回 `WRR` 时配置**保留但不生效**（休眠），再切回 `EPP` 继续生效，来回切换不丢配置。提交时按「当前为 EPP 或原本已有配置」决定是否携带：纯 WRR 的新集群不携带这两个字段；WRR 但历史上有配置的集群继续携带（休眠保留）。
 
 #### 步骤 5：复查&检查
 
@@ -188,7 +227,7 @@ AI 场景通常无需会话保持，保持默认停用即可。
 - **基础配置**：名称、说明、协议、连接与会话保持相关项；
 - **超时和重传**：各项超时与集群内重试；
 - **被动健康检查**：阈值、间隔、Host（为空时展示「为空时使用所属服务商首个实例地址」）、Uri、状态码；
-- **大模型配置**：所属服务商、转发模型、裁剪前缀、模型重定向、Keys 权重、Key 路由策略、Key 亲和性、均衡模式配置。
+- **大模型配置**：所属服务商、转发模型、裁剪前缀、模型重定向、Keys 权重、Key 路由策略、Key 亲和性、上游错误归一、均衡模式配置（EPP 模式含流控配置与 EPP 运行时参数，`epp_runtime` 未配置时显示「未配置（BFE 补默认）」）。
 
 ### 查看、编辑与删除集群
 
@@ -370,6 +409,20 @@ AI 场景通常无需会话保持，保持默认关闭即可。
 
 > Key 亲和性依赖数据面 Redis 配置；Redis 不可用时自动降级为加权随机。
 
+### 上游错误归一化（`llm_config.normalize_upstream_error`）
+
+`normalize_upstream_error` 控制 BFE 是否把上游错误体归一化为网关自身的错误目录（并做凭证脱敏），可选。字段全部可选，缺省即关闭归一、上游错误原样透传。控制台在集群向导「大模型配置」步骤的「上游错误归一」卡片提供该组字段的表单：
+
+| 字段 | 界面标签 | 含义 | 默认 |
+|------|----------|------|------|
+| `enabled` | 是否启用 | 非流式响应归一开关 | `false` |
+| `stream_enabled` | 流式归一(SSE) | SSE 流式归一开关，独立于非流式开关 | `false` |
+| `redact_secrets` | 凭证脱敏 | 是否对错误体中的凭证脱敏 | `true` |
+| `unrecognized_action` | 未识别错误体处理 | 未识别错误体的处理：`passthrough`（原样透传）/ `rewrite_generic`（重写为通用错误）；**仅「是否启用」开启时显示** | `passthrough` |
+| `max_body_bytes` | 错误响应体读取上限(字节) | 错误体读取上限，取值 0-4194304，超限按未识别处理，`0` 或缺省时用 BFE 默认 65536；**仅「是否启用」开启时显示** | `65536` |
+
+语义与访问日志字段见 [第十章 Provider与Cluster设计](../design/chapter10-provider-and-cluster.md)。同一组字段也可经 OpenAPI `POST/PUT /clusters` 的 `llm_config.normalize_upstream_error` 维护。
+
 ### 均衡模式（`balance_mode` 与 `epp_config`）
 
 | 字段 | 含义 | 默认值 |
@@ -381,16 +434,36 @@ AI 场景通常无需会话保持，保持默认关闭即可。
 
 | 字段 | 含义 | 默认值 |
 |------|------|--------|
-| `scheduling_profile` | 调度策略档位：`latency-first`（延迟优先）/ `balanced`（平衡）/ `throughput-first`（吞吐优先） | `balanced` |
-| `cache_affinity` | 缓存亲和性：`low` / `medium` / `high`，显式指定 KV cache 亲和强度，覆盖调度策略的默认权重 | 缺省（跟随调度策略） |
+| `load_profile` | 负载画像：`queue-first`（队列优先）/ `balanced`（均衡）/ `kv-first`（KV cache 优先） | `balanced` |
+| `affinity` | 亲和强度：`off` / `low` / `medium` / `high`，映射为前缀/会话亲和 scorer 权重 0 / 0.3 / 0.6 / 1.0；取 `off` 时不注入亲和 scorer | `medium` |
 | `prefix_cache_affinity` | 前缀缓存亲和：相同 prompt 前缀的请求尽力收敛到同一后端（软亲和，不保证命中） | `true` |
 | `session_affinity_enabled` | 会话亲和：同一会话的请求尽力路由到同一后端；绑定端点摘除后自动迁移重粘 | `false` |
 | `session_affinity_header` | session id 来源 Header（如 `x-session-id`），启用会话亲和时必填 | 空 |
 | `kv_cache_utilization_max` | KV 缓存利用率上限，利用率超过该值的端点被过滤，取值 `(0,1]` | `0.9` |
+| `waiting_queue_max` | 等待队列长度准入阈值 `≥0`，大于 0 时启用对应过滤条件 | `0`（不启用） |
+| `running_requests_max` | 在跑请求数准入阈值 `≥0`，大于 0 时启用对应过滤条件 | `0`（不启用） |
+| `fallback_on_empty` | 全部端点被过滤时是否回退放行 | `false` |
+| `metrics_staleness_threshold_ms` | 坏后端剔除阈值（毫秒 `>0`）：指标抓取连续失败、数据过期超过该值的后端被剔除 | `200` |
 | `flow_control.max_requests` | 全局并发上限；缺省或 `-1` 表示不限 | 不限 |
 | `flow_control.queue_ttl` | 池有端点时的排队预算（秒），超期以可重试背压错误拒绝；`0` 为禁用 | `60` |
 | `flow_control.no_endpoint_queue_ttl` | 池无端点（冷启动扩容）时的排队预算（秒） | 跟随 `queue_ttl` |
-| `flow_control.enable_eviction` | 需求驱动驱逐：高优先级请求被饱和阻塞时终止低优先级在飞请求，回收容量 | `false` |
+| `flow_control.enable_eviction` | 需求驱动驱逐：仅接受 `false`（写入 `true` 返回 422） | `false` |
+
+`epp_runtime`：Cluster 级的 EPP 运行时参数（可选），作用于 BFE 侧的 EPP 健康检查与调用超时，与面向调度引擎的 `epp_config` 分层。控制台在均衡模式配置卡片内（选择 `EPP` 时）提供「EPP 运行时参数」表单，未配置时复查页显示「未配置（BFE 补默认）」：
+
+| 字段 | 界面标签 | 含义 | 默认值 |
+|------|----------|------|--------|
+| `check.disabled` | 关闭后台健康检查 | 是否禁用 EPP 地址健康检查 | `false`（停用） |
+| `check.check_interval` | 健康检查间隔 | 健康检查间隔（duration 字符串，默认单位秒） | `"2s"` |
+| `check.fail_threshold` | 失败次数阈值 | 连续失败阈值，超过即视为地址不可用 | `3` |
+| `check.cooldown` | 冷却时长 | 冷却期，防止状态抖动 | `"45s"` |
+| `check.success_threshold` | 成功次数阈值 | 冷却期后地址恢复所需连续成功次数 | `2` |
+| `timeout.connect` | 连接超时 | EPP gRPC 连接超时（duration 字符串，默认单位毫秒） | `"500ms"` |
+| `timeout.call` | 调用超时 | EPP 调用超时（duration 字符串，默认单位秒） | `"3s"` |
+
+时长字段使用「数字框 + 单位下拉（ms / s / m）」复合控件，切换单位会换算数值并保持物理时长不变；填 `0` 会在提交时被拦截，清空表示未设置、提交时按默认值补齐。出现 `tls` / `breaker` 等未定义字段直接返回 422（TLS 与熔断由后端固定下发，界面不提供配置入口），duration 必须为正。
+
+`epp_config` 与 `epp_runtime` 的提交语义按「当前为 EPP 或原本已有配置」判定：纯 `WRR` 的新集群不携带这两个字段；`balance_mode=WRR` 但历史上已配置过的集群继续携带（休眠保留、不编译不下发），再切回 `EPP` 时生效。语义与热更新行为见 [第十六章 EPP智能调度设计](../design/chapter16-epp-scheduling-design.md)；同一组字段也可经 OpenAPI `POST/PUT /clusters` 维护。
 
 EPP 集群配置示例：
 
@@ -398,24 +471,44 @@ EPP 集群配置示例：
 {
     "name": "cluster-epp-gpu",
     "description": "EPP 调度集群示例",
+    "basic": {
+        "protocol": "http"
+    },
     "balance_mode": "EPP",
     "epp_config": {
-        "scheduling_profile": "balanced",
-        "cache_affinity": "medium",
+        "load_profile": "balanced",
+        "affinity": "medium",
         "prefix_cache_affinity": true,
         "session_affinity_enabled": true,
         "session_affinity_header": "x-session-id",
         "kv_cache_utilization_max": 0.9,
+        "waiting_queue_max": 32,
+        "running_requests_max": 256,
+        "fallback_on_empty": false,
+        "metrics_staleness_threshold_ms": 200,
         "flow_control": {
             "max_requests": -1,
             "queue_ttl": 60,
-            "no_endpoint_queue_ttl": 60,
-            "enable_eviction": false
+            "no_endpoint_queue_ttl": 60
+        }
+    },
+    "epp_runtime": {
+        "check": {
+            "check_interval": "2s",
+            "fail_threshold": 3
+        },
+        "timeout": {
+            "call": "3s"
         }
     },
     "llm_config": {
         "models": ["deepseek-chat"],
-        "provider": "deepseek"
+        "provider": "deepseek",
+        "normalize_upstream_error": {
+            "enabled": true,
+            "stream_enabled": true,
+            "unrecognized_action": "rewrite_generic"
+        }
     }
 }
 ```
@@ -781,9 +874,9 @@ EPP 均衡模式集群的配置示例见前文「均衡模式（`balance_mode` �
 
 ## 本章小结
 
-- **Cluster** 是 BFE 转发的逻辑后端，引用 Provider（模型服务商）并声明模型、Key、转发策略等；0.0.7 及更早版本向导中的「实例配置」步骤已移除，实例池归属模型服务商。
+- **Cluster** 是 BFE 转发的逻辑后端，引用 Provider（模型服务商）并声明模型、Key、转发策略等；实例池归属模型服务商，集群向导不含实例配置步骤。
 - Dashboard 通过 **5 步向导**创建集群：基础配置 → 超时和重传 → 被动健康检查 → 大模型配置 → 复查&检查；超时默认值 30000/30000/50000/50000/60000ms、集群内重试 2 次，健康检查阈值 3、间隔 1000ms。
-- 大模型配置涵盖：转发模型（服务商模型子集）、模型重定向（API-Key 模型访问控制按重定向后目标模型判定）、服务鉴权 Keys（权重和 = 100）、Key 路由策略（`weighted_random`）、Key 亲和性（依赖数据面 Redis，不可用时降级加权随机）以及均衡模式（`WRR` 默认 / `EPP`，`epp_config` 休眠保留、来回切换不丢配置）。
+- 大模型配置的卡片顺序为 模型服务 → 模型重定向 → 服务鉴权 Keys → Key 路由策略 → Key 亲和性 → 上游错误归一 → 均衡模式配置，涵盖：转发模型（服务商模型子集）、模型重定向（API-Key 模型访问控制按重定向后目标模型判定）、服务鉴权 Keys（权重和 = 100）、Key 路由策略（`weighted_random`）、Key 亲和性（依赖数据面 Redis，不可用时降级加权随机）、上游错误归一（默认关闭，可选流式归一、凭证脱敏、未识别错误体处理与错误体读取上限）以及均衡模式（`WRR` 默认 / `EPP`，EPP 模式下内嵌流控配置与 EPP 运行时参数；`epp_config` / `epp_runtime` 休眠保留、来回切换不丢配置）。
 - AI 路由规则分为 **Global、Entity、API-Key** 三级，优先级 **API-Key > Entity > Global**；API-Key 创建后自动生成其 apikey 路由表，路由表停用后流量回落下一优先级。
 - Dashboard 编辑模式有**两步保存**语义：「本地保存」仍不影响线上，「提交并生效」才真正下发，提交后数秒到数十秒经 Conf Agent 同步到数据面；未提交离开页面有丢失确认提示。
 - 规则校验包括：目标权重和 = 100、「集群 + 模型」组合不重复、规则名称表内唯一、表达式服务端语法校验、至少 1 项目标；同表内规则按顺序匹配，命中第一条即停止。

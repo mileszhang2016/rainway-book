@@ -9,6 +9,7 @@ This chapter focuses on the `mod_body_process` module in the BFE Data Plane, exp
 - Understand how token usage is aggregated into the `TokenUsage` context in both streaming and non-streaming scenarios.
 - Learn how RMB quota time-based pricing interacts with response body processing.
 - Understand how content moderation (`textfilter`) shares the same event-processing framework with token extraction.
+- Learn the implementation essentials of the co-pipeline modules `mod_ai_context` (context compression) and `mod_traffic_mirror` (traffic mirroring).
 
 ## mod_body_process Module Responsibilities
 
@@ -38,14 +39,18 @@ type BodyProcessor struct {
 
 ## Position in the BFE Module Chain
 
-`mod_body_process` is registered in `bfe/bfe_modules/bfe_modules.go:156`, after `mod_ai_route` and before `mod_ai_rate_limit`. The registration order is as follows:
+`mod_body_process` is registered in `moduleList` in `bfe/bfe_modules/bfe_modules.go`, after `mod_ai_route` and before `mod_ai_rate_limit`. The registration order of the AI-related modules is as follows:
 
 ```go
 // bfe/bfe_modules/bfe_modules.go
-mod_ai_token_auth.NewModuleAITokenAuth(), // API Key validation and QuotaPlan binding
-mod_ai_route.NewModuleAiRoute(),          // model/cluster selection
-mod_body_process.NewModuleBodyProcess(),  // response body parsing and token extraction
-mod_ai_rate_limit.NewModuleAiRateLimit(), // rate limiting based on token calculation results
+mod_ai_token_auth.NewModuleAITokenAuth(),    // API Key validation and QuotaPlan binding
+mod_ai_cache.NewModuleAiCache(),             // cache lookup, short-circuit on hit
+mod_ai_route.NewModuleAiRoute(),             // model/cluster selection
+mod_ai_intent.NewModuleAiIntent(),           // intent lazy resolution injection, no request callbacks
+mod_traffic_mirror.NewModuleTrafficMirror(), // registers HandleForward only
+mod_body_process.NewModuleBodyProcess(),     // response body parsing and token extraction
+mod_ai_rate_limit.NewModuleAiRateLimit(),    // rate limiting based on token calculation results
+mod_ai_context.NewModuleAiContext(),         // HandleAfterAITargetModel compression
 ```
 
 `mod_body_process` registers three hooks with the BFE callback chain:
@@ -450,10 +455,67 @@ func (d *SSEEventDecoder) Decode() ([]Event, error) {
 ```go
 // bfe/bfe_modules/bfe_modules.go
 mod_ai_token_auth.NewModuleAITokenAuth(),
+mod_ai_cache.NewModuleAiCache(),
 mod_ai_route.NewModuleAiRoute(),
+mod_ai_intent.NewModuleAiIntent(),
+mod_traffic_mirror.NewModuleTrafficMirror(),
 mod_body_process.NewModuleBodyProcess(),
 mod_ai_rate_limit.NewModuleAiRateLimit(),
+mod_ai_context.NewModuleAiContext(),
 ```
+
+## Context Compression Implementation Essentials (mod_ai_context)
+
+`mod_ai_context` (`bfe/bfe_modules/mod_ai_context/`) compresses the request context against the token budget of the target model before forwarding. It is registered after `mod_ai_rate_limit` and before `mod_access_pb3`, hooking two callback points:
+
+| Callback Point | Function | Purpose |
+|---|---|---|
+| `HandleAfterAITargetModel` | `contextCompressHandler` (`handler.go`) | Executes compression after the target model is resolved and before forwarding; triggered on every fallback attempt, but with `AiBasicInfo.ContextCompressStatus` as the idempotency guard — the entire request is compressed only once |
+| `HandleReadResponse` | `responseAnnotationHandler` (`handler.go`) | Injects the `x-ai-context-compression: tokens=%d->%d; mode=%s` annotation header into compressed responses |
+
+Budget and triggering (`handler.go`, `estimate.go`):
+
+- The context window is heuristically determined by the target model name (`modelContextWindow`): gemini 1M, claude 200k, codex 400k, default 128k tokens;
+- budget = window − output reserve; when `reserveTokens` is 0 (auto), it takes `clamp(window×15%, 256, 16000)`; rules may override `maxContextTokens`/`reserveTokens`;
+- compression triggers only when the estimated token count exceeds `budget × triggerRatio` (default 0.7); otherwise it records `skip_under_threshold`.
+
+Degradation pipeline (`pipeline.go`, executed in order, stopping as soon as the previous layer suffices):
+
+1. L1 tool-result truncation (`toolResultMaxChars` default 2000 characters);
+2. L1.5 keeps only the latest `keepLatestImages` inline images (default 2);
+3. L2 thinking-block deletion (`thinkingPolicy=trim-all-but-last|keep`);
+4. the `conservative` mode stops here, recording `trim`; `balanced`/`aggressive` enter P2 rule-based rewriting (`rewrite.go`, `strength=lite|full`);
+5. fidelity gate (`fidelity.go`): when the protected-token survival rate is below `protectedSurvivalRate` (default 0.95), the rewrite product is discarded and the result falls back to the trim snapshot;
+6. `repairMessages` (`repair.go`) corrects tool-call pairing, rolling back to the original text when invalid (`repair_rollback`).
+
+Compression only rewrites the forwarding `OutRequest`; the original request is untouched — access logs and billing are still computed against the original request; any exception fails open and passes the original text. The state machine has 8 values (`context_state.go`): `skip_no_rule`, `skip_protocol`, `skip_body_incomplete`, `skip_parse_err`, `skip_under_threshold`, `trim`, `rewrite`, `repair_rollback`, corresponding to access log fields 793-796 (`ai_context_*`). The module conf is only bootstrap configuration (`ProductRulePath`); all business tuning lives in the top-level `Defaults` block of the rule file and hot reloads with it.
+
+## Traffic Mirroring Implementation Essentials (mod_traffic_mirror)
+
+`mod_traffic_mirror` (`bfe/bfe_modules/mod_traffic_mirror/`) asynchronously mirrors requests matching the rules to shadow clusters, registering only the `HandleForward` callback (`mirrorHandler` in `mod_traffic_mirror.go`), inside the forwarding loop and off the main path; matching, snapshotting, and submission all run asynchronously and never block main-path forwarding. The `CtxMirrored` once marker in `Request.Context` ensures that when an AI fallback retry re-enters `HandleForward`, the request is not mirrored again.
+
+Mirror rule (`mirror_rule_load.go`) fields:
+
+| Field | Description |
+|------|------|
+| `cond` | Match condition; a special case in this module — empty means matching all requests |
+| `percentage` | 0-100 sampling percentage |
+| `removeHeaders` / `setHeaders` | Sensitive header stripping / injected headers |
+| `bodyRewrites` | Phase 1 supports only `path="model"` (rewriting the model field) |
+| `pathRewrite` | Mirror request path rewrite |
+
+Mirrored requests carry the `X-Bfe-Mirror: true` marker header by default. Mirror backend selection uses `bfe_balance.BalanceGslb.PickBackend()` (`mirror_sender.go`) — a side-effect-free selection entry point provided by bfe_balance: it neither reads nor modifies the request and has no session-affinity or retry side effects; `bfe_server` registers the balance table process-wide via `SetGlobalBalTable` (`bfe_server/bfe_server.go`) at startup.
+
+Asynchronous submission is driven by a bounded queue + semaphore (`mirror_sender.go`). Key conf keys (`conf_mod_traffic_mirror.go`):
+
+| Config Key | Default | Description |
+|--------|--------|------|
+| `ConnectTimeoutMs` / `TTFBTimeoutMs` / `TotalTimeoutMs` | 2000 / 30000 / 600000 | Three-stage timeouts for mirror requests (ms) |
+| `MaxMirrorBodyBytes` / `MaxResponseBodyBytes` | 2MB / 16MB | Mirror request body and response body limits |
+| `MaxConcurrent` / `QueueCapacity` | 1024 / 4096 | Module-level concurrency semaphore and submission queue capacity |
+| `CircuitBreakerFailThreshold` / `CircuitBreakerCooldownSec` | 50 / 30 | Circuit breaker: consecutive failure threshold and cooldown (seconds) |
+
+Mirror results (usage / error / finish_reason parsing) are written only to the module's private Prometheus registry, not to the access log; the access log records only `mirror_hit` (842) and `mirror_cluster` (843) synchronously.
 
 ## Chapter Summary
 
@@ -464,6 +526,7 @@ mod_ai_rate_limit.NewModuleAiRateLimit(),
 - `QuotaUsageProcessor` is injected into the response processing chain by default, responsible for extracting usage information such as `input_tokens`, `output_tokens`, and `total_tokens` from SSE events or non-streaming JSON, and writing it into the `TokenUsage` context.
 - RMB quota deduction is still completed by `mod_ai_token_auth` at the end of the request; `mod_body_process` only provides accurate token usage data, and the two are decoupled through the request context.
 - Tier matching for time-based pricing is done on the BFE side via `ModelTable.ActiveTierName`, and costs are converted per line item via `quota.CalcCostUnits` into fixed-point integers before accumulation, avoiding floating-point errors.
+- The co-pipeline module `mod_ai_context` compresses the request context against the target model's token budget at `HandleAfterAITargetModel` (the idempotency guard ensures fallback compresses only once), and `mod_traffic_mirror` mirrors traffic asynchronously at `HandleForward`; both only affect the forwarding `OutRequest` or side-band traffic and do not change the usage extraction and quota pipeline of `mod_body_process`.
 
 Understanding the implementation of `mod_body_process` helps keep Data Plane code clear and maintainable when extending new model protocols, new content moderation policies, or new billing dimensions. Later, if support for a new response format (e.g., protobuf streams, multipart) is needed, a new `EventDecoder` implementation can be added in `body_process.go` and wired into the dispatch logic of `ContentTypeDecoder`; if a new body-processing policy (e.g., PII masking, keyword replacement) is needed, one only needs to implement an `EventProcessor` and register it in the rule configuration.
 
@@ -471,6 +534,8 @@ Understanding the implementation of `mod_body_process` helps keep Data Plane cod
 
 - `bfe/bfe_modules/mod_body_process/` — complete module source code.
 - `bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go` — API Key validation, RMB cost calculation, and quota deduction.
+- `bfe/bfe_modules/mod_ai_context/` — context compression module (`handler.go`, `pipeline.go`, `context_state.go`).
+- `bfe/bfe_modules/mod_traffic_mirror/` — traffic mirroring module (`mod_traffic_mirror.go`, `mirror_sender.go`, `mirror_rule_load.go`).
 - `bfe/bfe_modules/bfe_modules.go` — BFE module registration order.
 - `bfe/bfe_basic/request_ai_basic.go` — definitions of `TokenUsage` and `TokenTimeInfo`.
 - `bfe/AGENTS.md` — BFE module change guide (AI gateway module changes section).
