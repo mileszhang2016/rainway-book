@@ -535,6 +535,16 @@ func ValidateRouteTable(table *RouteTable) error {
 
 这些校验保证了错误配置在启动或热加载阶段即可暴露，而不是在请求处理时才失败。
 
+### 时间条件原语 time_weekday_in
+
+规则 `Cond` 除请求特征原语外，还可以引用系统时间条件原语 `time_weekday_in`，例如 `time_weekday_in("0|6", "H")` 命中周末。该原语由 `bfe/bfe_basic/condition` 的 `WeekdayMatcher` 实现，注册于 `funcProtos` 与 `optionalLastArgProtos`（后者提供可省略的 `zone` 参数），关键点在于把全部校验下沉到配置加载期：
+
+- `weekday_list` 为 `|` 分隔的星期编号枚举，遵循 Go `time.Weekday` 约定（`0` 为周日 …… `6` 为周六，与 cluster 定价 `TimeRange.Weekdays` 字段一致），加载期编译为 `uint8` 位掩码并校验取值（`"7"` 等非法值直接报错）；不支持区间写法（`"1-5"` 报错），元素允许重复、允许两侧空白；
+- 可选的 `zone` 参数为军事时区字母（`bfe_util.TimeZoneMap`，`"H"` = UTC+8），加载期解析为 `time.Location`；省略时按 UTC（`"Z"`）判定——北京时间周一 00:00 时 UTC 仍是周日，国内部署应显式传 `"H"`；
+- 运行时按进程时钟取当前星期（请求携带 `X-Bfe-Debug-Time` 头时取该头），只对位掩码做一次测试，单次求值开销可忽略。
+
+由于条件编译统一走 `condition.Build`，上述校验在 `ValidateRouteTable()` 阶段一并完成：非法表达式与非法原语取值都会在启动或热加载时报错，不会流入运行期。原语的完整语义与控制面入口见[第十一章 AI 路由规则设计](../design/chapter11-ai-route-rules.md)的"时间条件原语 time_weekday_in"一节。
+
 ## Fallback 处理
 
 `mod_ai_route` 只负责把 `Fallbacks` 列表写入 `AiRouteResult`，真正的降级逻辑在 `bfe/bfe_server/reverseproxy.go` 的 `ServeHTTPForAI()` 中执行。
@@ -650,12 +660,25 @@ mod_ai_token_auth（鉴权 / 配额绑定）
 
 ### 命中短路对路由与下游的影响
 
-命中请求不再执行 `mod_ai_route`，由此产生以下可观测语义：
+命中请求以 `BfeHandlerFinish` 结束在 `HandleFoundProduct` 阶段，不进入 `ServeHTTPForAI()` 的 attempt 循环，因此以下环节整体不执行：
+
+- `mod_ai_route` 的规则求值与意图懒解析；
+- `mod_ai_token_auth` 在 `HandleAfterAITargetModel` 上的目标模型白名单/黑名单校验；
+- `mod_ai_rate_limit` 的 TPM/RPM/并发检查；
+- 上游转发、usage 解析与 `HandleRequestFinish` 的配额扣减。
+
+由此产生以下可观测语义：
 
 - 请求上下文中不存在 `AiRouteResult`，访问日志中的路由命中字段（`ai_route_rule_hits`、`ai_target_model`）为空；
 - 下游报表判定缓存命中改用访问日志字段 `ai_cache_status=hit`（精确命中）/`hit_semantic`（语义命中），而不是路由字段；
+- 命中不调用上游、不产生 token、不计费：`ai_zero_cost_reason=cache_hit`，且 `ai_rate_limit_hits` 为空；
 - `mod_ai_token_auth` 依据 `AiBasicInfo.AiCacheHit` 跳过 `HandleRequestFinish` 阶段的配额结算；
+- 缓存策略与规则的调整对已缓存条目的生效时机是条目 TTL 到期（`cacheTTL` 或 `DefaultCacheTTL`），而不是规则加载时刻；
 - 缓存规则 `cond` 引用 `req_ai_intent_in` 时，加载期仅输出 WARN 不拒绝（`bfe/bfe_modules/mod_ai_cache/cache_rule_load.go`）：缓存查找先于路由执行，意图条件只在未命中路径参与求值，命中时懒解析不触发，引用意图条件会削弱缓存前移的收益。
+
+### 缓存规则文件的集合约束
+
+控制面 `/open-api/v1/ai-cache-rules` 在写入时校验 `rules[].cond` 在集合内唯一（逐字节比较），出现重复返回 422 `duplicate ai cache rule cond`。该约束直接对应 BFE 侧的加载行为：`mod_ai_cache` 解析 `ai_cache.data` 时，同一产品线内重复的 `cond` 使模块无法确定请求应命中哪条规则，整份文件被拒载，而不是跳过重复项。因此唯一性在控制面写入期拦截，数据面只在整份文件合法时加载。
 
 ### 意图懒解析时序
 
@@ -837,8 +860,10 @@ flowchart TD
 `mod_ai_route` 是壬远 AI 网关数据面中承上启下的路由模块：
 
 - 它注册在 `HandleFoundProduct` 回调点，依赖 `mod_ai_token_auth` 写入的 `ClientApiKey` 进行路由查找；
-- `mod_ai_cache` 位于鉴权与路由之间，缓存命中即短路返回，命中请求不执行路由查找，`ai_route_rule_hits`/`ai_target_model` 日志字段为空，报表改用 `ai_cache_status` 判定缓存命中；
+- `mod_ai_cache` 位于鉴权与路由之间，缓存命中即短路返回，命中请求不执行路由查找、目标模型白/黑名单校验、限流与配额扣减，`ai_route_rule_hits`/`ai_target_model` 日志字段为空，报表改用 `ai_cache_status` 判定缓存命中；
+- `/ai-cache-rules` 写入时保证 `rules[].cond` 集合内唯一（逐字节比较，重复返回 422），避免重复条件导致 BFE 整份 `ai_cache.data` 拒载；
 - 通过 `ApikeyRouteTableBindings` 实现了 **apikey → entity → global** 三级优先级路由，每张路由表内部再按规则顺序匹配条件表达式；意图分类由 `mod_ai_intent` 懒解析提供，在 `req_ai_intent_in` 首次求值时触发；
+- 系统时间原语 `time_weekday_in` 按星期做时段调度，其位掩码编译与时区解析全部在加载期完成，校验随 `condition.Build` 在热加载阶段一并执行；
 - 配置文件采用 JSON DTO 与运行时结构分层设计，兼容 `route_rules`/`RouteRules` 与 `api_key`/`apikey` 等历史字段差异；
 - 配置加载阶段完成条件表达式编译与权重校验，保证启动与热加载时的配置正确性；
 - 热加载在校验完成后再原子替换内存路由表，失败不会影响当前运行中的规则；
@@ -857,6 +882,7 @@ flowchart TD
 - `bfe/bfe_modules/mod_ai_route/route_table.go`
 - `bfe/bfe_modules/bfe_modules.go`
 - `bfe/bfe_basic/request_ai_route.go`
+- `bfe/bfe_basic/condition/`（`WeekdayMatcher`，`time_weekday_in` 原语）
 - `bfe/bfe_server/reverseproxy.go`
 - `bfe/bfe_model_protocol/`（协议适配层，`shouldTriggerFallback` 中的 ErrorNormalizer 挂钩来源）
 - `bfe/bfe_modules/mod_ai_cache/mod_ai_cache.go`、`cache_rule_load.go`、`request.go`（缓存查找与命中短路）

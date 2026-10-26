@@ -27,6 +27,7 @@ ai-gateway-api/endpoints/
 │   ├── access_logger.go      # 访问日志
 │   ├── convert.go            # 请求/响应转换与中间件适配
 │   ├── cors.go               # 跨域处理
+│   ├── ip_probe.go           # 管理面 IP 白名单
 │   ├── product_probe.go      # 产品线上下文解析
 │   ├── recovery.go           # panic 恢复
 │   └── user_probe.go         # 用户/Token 鉴权
@@ -36,10 +37,13 @@ ai-gateway-api/endpoints/
 │   ├── ai_context/           # /ai-context-rules、/ai-context-settings
 │   ├── api_key/              # /api-keys
 │   ├── auth/                 # /auth、/meta
+│   ├── batches/              # /batches、/batch-files
 │   ├── certificate/          # /certificates
 │   ├── domain/               # 当前未注册
 │   ├── entity/               # /entities
 │   ├── entity_type/          # /entity-types
+│   ├── epp_assignments/      # /epp-assignments
+│   ├── epp_pool/             # /epp-pool
 │   ├── global_route_rules/   # /global-route-rules
 │   ├── intent_config/        # /intent-config
 │   ├── model_price/          # /model-prices
@@ -49,6 +53,7 @@ ai-gateway-api/endpoints/
 │   ├── report/               # /report/*（条件装配，见下文）
 │   ├── route/                # /expression/verify
 │   ├── route_tables/         # /route-tables
+│   ├── security/             # /security/reencrypt-sweeps
 │   ├── subcluster/           # 当前未注册
 │   ├── traffic/              # 当前未注册
 │   └── traffic_mirror/       # /traffic-mirror-rules
@@ -583,7 +588,7 @@ var EntityTypeCreateRoute = &xreq.Endpoint{
 }
 ```
 
-当请求到达该 Endpoint 时，若当前访客不具备 `FeatureEntityType + ActionCreate` 权限，则直接返回 401/402 错误。OpenAPI 的权限模型已经收敛：用户 `is_admin` 仅支持 `true`，Token `scope` 仅保留 `System`/`Support`，因此大多数管理操作需要 System 权限。
+当请求到达该 Endpoint 时，若当前访客不具备 `FeatureEntityType + ActionCreate` 权限，则直接返回 401/402 错误。OpenAPI 的权限模型已经收敛：用户以 `role` 表达（`system_admin` / `system_admin_readonly`，不含 `is_admin` 字段），Token `scope` 取值为 `System`/`SystemReadonly`/`Support`，因此大多数管理操作需要 System 权限。
 
 ### 统一响应
 

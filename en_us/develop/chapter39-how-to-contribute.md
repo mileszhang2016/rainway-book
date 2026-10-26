@@ -1,4 +1,4 @@
-# Chapter 38: How to Contribute Code to Rainway AI Gateway
+# Chapter 39: How to Contribute Code to Rainway AI Gateway
 
 ## Chapter Goals
 
@@ -390,7 +390,7 @@ The generic validator is located in `testutil/schema.go`, supporting validation 
 
 ### BFE Integration Tests (Real Process-Level)
 
-`bfe/tests/integration/` is the Data Plane's real process-level integration test. Unlike the `integration-test/` directory in the repository, it only starts a real `bfe` process and does not involve external components such as `ai-gateway-api` or `conf-agent`; the BFE configuration files needed by the tests are provided directly by test code or static `testdata`, requests are sent over real HTTP to the BFE listening port, and forwarding behavior and backend hit statistics are verified.
+`bfe/tests/integration/` is the Data Plane's real process-level integration test: it only starts a real `bfe` process and does not involve external components such as `ai-gateway-api` or `conf-agent`; the BFE configuration files needed by the tests are provided directly by test code or static `testdata`, requests are sent over real HTTP to the BFE listening port, and forwarding behavior and backend hit statistics are verified.
 
 #### Directory Structure
 

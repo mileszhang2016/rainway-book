@@ -33,3 +33,33 @@ The Rainway AI Gateway Control Plane exports configuration to the Data Plane (BF
 - The configuration returned by InnerAPI is typically pulled by the Conf Agent, written to a local version directory, and then triggers a hot reload.
 - The JSON structure exported for each topic keeps its field naming consistent with the BFE Data Plane configuration files; see the links above for detailed field descriptions.
 - Cache and context compression exports contain top-level global blocks (`Semantic` / `Defaults`), which are always exported and participate in the MD5 signature; intent exports use the `Data` file as-is.
+
+## Export Format Essentials
+
+The following are the key conventions of each topic's export format; the upstream InnerAPI module documents are authoritative for field-level details.
+
+### epp_data Export
+
+The `assignment` section is a cluster→group mapping: entries look like `{"cluster-a": {"group": "g1"}}` and reference only instance group names, without listing instances; every EPP instance receives the identical same-version snapshot. `EPPAddr` in `server_data_conf` is an `[]string` and is always a single-element array (the `host:port` of the sole instance in the assigned group).
+
+### NormalizeUpstreamError in server_data_conf
+
+The `AIConf` of `server_data_conf` carries a `NormalizeUpstreamError` object, corresponding to the Cluster's optional `llm_config.normalize_upstream_error` configuration:
+
+| Export field | Cluster config field | Description |
+|--------------|----------------------|-------------|
+| `Enabled` | `enabled` | Whether upstream error normalization is enabled |
+| `StreamEnabled` | `stream_enabled` | Whether it applies to streaming responses |
+| `UnrecognizedAction` | `unrecognized_action` | Handling of unrecognized errors: `passthrough` or `rewrite_generic` |
+| `MaxBodyBytes` | `max_body_bytes` | Error body read limit, default 65536 |
+| `RedactSecrets` | `redact_secrets` | Whether to redact secrets, default true |
+
+The Control Plane exports only explicitly configured values: when unconfigured the whole field is absent, and BFE synthesizes defaults at load time via `Effective()`.
+
+### Field-Level Encryption of Exports (enc$v1$)
+
+With `[Security].EncryptExports` enabled, sensitive fields in exported files appear as `enc$v1$<base64(...)>` envelopes: the outer keys of `tokens` in the `mod-api-key` topic, and `AIConf.Keys[].Key` in the `server_data_conf` topic; values without the prefix are plaintext passthrough. The envelope format, Control Plane switches, BFE keyring, and failure semantics are fully described in [Chapter 14: Config Export and Version Control Design](../design/chapter14-config-export-and-version-control.md).
+
+### Report Detail Table Unique Key
+
+The dedup unique key `uk_dedup` of the access report detail table `bfe_ai_request_log` spans five columns `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)`, and the `logid` column is `BIGINT NOT NULL DEFAULT 0`; the DDL header ships with migration ALTER statements (backfill `logid`, then rebuild the unique key).

@@ -56,7 +56,7 @@ flowchart TD
 | `id` | 主键 |
 | `name` | 用户名 / Token 名 |
 | `type` | `0`=用户，`1`=Token |
-| `password` | 用户密码（当前为明文存储） |
+| `password` | 用户密码，bcrypt 哈希存储；哈希成本由 `[Security].PasswordHashCost` 控制（默认 10），存量明文口令在校验通过后懒迁移为 bcrypt |
 | `ticket` | Session Key 或 Token 值 |
 | `ticket_created_at` | Session Key 创建时间 |
 | `scopes` | 权限作用域，多个用逗号拼接 |
@@ -125,6 +125,7 @@ var APIKeyCreateRoute = &xreq.Endpoint{
 | Scope | 含义 | 权限范围 |
 |-------|------|---------|
 | `System` | 系统管理员 | 所有 Feature 的全部 Action |
+| `SystemReadonly` | 系统管理员（只读） | 显式列举全部 37 个 Feature 的 `ActionRead`/`ActionReadAll`，全部写接口返回 403 |
 | `Support` | 导出/支持类 Token | 仅部分 Feature 拥有 `ActionExport` |
 
 `AuthorizeManager.Authorizate` 执行步骤如下：
@@ -135,7 +136,28 @@ var APIKeyCreateRoute = &xreq.Endpoint{
 4. 判断所需 Action 是否被允许；
 5. 若 `authorizer.ValidateProduct == true`，再调用 `IsVisitorProductGranted` 校验产品线绑定关系。
 
-> 注：当前 OpenAPI 已移除 `Product` Scope，用户 `is_admin` 仅支持 `true`，Token `scope` 仅保留 `System` 与 `Support`。`user_products` 表继续保留，供未来多租户扩展。
+> 注：当前 OpenAPI 已移除 `Product` Scope，`user_products` 表继续保留，供未来多租户扩展。
+
+### 用户角色（role）
+
+用户资源以 `role` 字段表达角色，取值 `system_admin`（系统管理员）与 `system_admin_readonly`（系统管理员·只读），校验逻辑见 `ai-gateway-api/lib/validate/validate.go`。角色采用**零 DDL** 方案落地：复用 `users.scopes` 字段，`SystemReadonly` 是其中的只读取值，通过 `roleToScopes`/`scopesToRole` 双向映射；`scopes='System'` 的记录在响应中呈现为 `system_admin`。
+
+用户资源不提供 `is_admin` 字段，`/open-api/v1/auth/users/{user_name}/is_admin` 路径也不存在（返回 404）。角色变更的唯一入口是：
+
+```
+PATCH /open-api/v1/auth/users/{user_name}/role
+Body: {"role": "system_admin" | "system_admin_readonly"}
+```
+
+内置 `admin` 用户的 `role` 固定为 `system_admin`，对其执行降级操作返回 422。Token 的 `scope` 取值为 `System`/`SystemReadonly`/`Support`。
+
+权限映射上，`scope2permission` 为 `SystemReadonly` 设有独立档位：显式列举全部 37 个 Feature，仅授予 `ActionRead`/`ActionReadAll`；所有写接口（`ActionCreate`/`ActionUpdate`/`ActionDelete` 等）均返回 403。配合该角色，OpenAPI v1 响应组装层（`lib/xmask`，仅作用于 openapi_v1，InnerAPI 导出不受影响）对敏感字段脱敏：`api-keys` 的 `key`、`providers` 的 `keys[].key`、`tokens` 的 `token` 对只读角色掩码；登录响应仍返回本人 Session Key，用户列表/详情不含 Session Key（固化为契约）。
+
+前端约束：控制面响应不含 `is_admin`，旧版前端守卫会拒绝所有用户，因此启用只读角色需要前端与 AI Gateway API 同版本部署；`conf/nav_tree.toml` 中查询类节点的 `allowed_roles` 含只读角色，只读管理员才能在控制台看到对应菜单。
+
+### 用户名引用与密码契约
+
+保留名 `admin`/`root`/`system` 的约束仅在创建用户时生效；按名引用用户的端点（如 `PATCH /open-api/v1/auth/users/{user_name}/passwd`）以 `UserNameRef` 解析，内置 `admin` 同样可经 API 修改密码。用户密码契约在创建与更新时保持一致：**8–72 字节**（bcrypt 上限），并沿用“不含空格、不与用户名相同或为其逆序”的约束。
 
 ---
 
@@ -146,7 +168,7 @@ var APIKeyCreateRoute = &xreq.Endpoint{
 | 访问者 | Dashboard 用户 / 第三方集成 Token | Conf Agent / BFE Token |
 | 中间件 | `McProductProbe` + `McUserProbe` | 仅 `McUserProbe` |
 | 权限粒度 | Feature-Action + 产品线绑定 | 通常仅 Feature-Action |
-| Token Scope | `System` / `Support` | `System` / `Support` |
+| Token Scope | `System` / `SystemReadonly` / `Support` | `System` / `SystemReadonly` / `Support` |
 | 典型用途 | 配置管理 | 配置导出 |
 
 InnerAPI 的导出接口（如 `/configs/mod-api-key`）虽然也对访问者做认证授权，但 Conf Agent 通常使用 `Support` Scope 的 Token 拉取配置，权限范围较窄，避免暴露管理面能力。
@@ -192,6 +214,8 @@ CREATE TABLE user_products (
 - `model/iauth` 同时面向 OpenAPI 与 InnerAPI，用户与 Token 共用 `users` 表，通过 `Visitor` 统一抽象；
 - 认证方式包括 Password、Session、Token、Skip 四种，分别适用于登录、常规调用、程序化调用和调试场景；
 - 授权采用 Feature-Action 位掩码模型，每个 Endpoint 声明所需权限，Scope 决定权限范围；
+- 用户角色为 `system_admin`/`system_admin_readonly`，零 DDL 复用 `users.scopes`（`SystemReadonly` 为只读取值），用户资源不含 `is_admin` 字段，角色变更统一走 `PATCH .../role`；Token Scope 为 `System`/`SystemReadonly`/`Support`；
+- 用户密码 bcrypt 存储（8–72 字节），保留名约束仅作用于创建场景，按名引用端点使用 `UserNameRef`；
 - OpenAPI 与 InnerAPI 的认证授权链路存在差异，InnerAPI 通常只走 `McUserProbe`；
 - `user_products` 表保留，为未来多租户扩展做准备。
 

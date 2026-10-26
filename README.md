@@ -15,9 +15,10 @@ v0.8.0 includes the following component versions:
 | AI Gateway API | v0.0.11 | Control Plane |
 | AI Gateway EPP | v0.0.2 | EPP scheduling |
 | BFE | v1.8.9 | Data Plane |
-| Dashboard | v0.0.10 | Management console (embedded in the API image) |
+| Dashboard | v0.0.11 | Management console (embedded in the API image) |
 | conf-agent | v0.0.8 | Configuration hot reload agent |
 | Log Reader | v1.5.0 | Access log → Kafka / MySQL (mod_kafka / mod_log_mysql) |
+| ai-gateway-controller | v1.1.0 | Kubernetes controller: Service/Endpoints discovery → InnerAPI `k8s_pools` |
 | ai-gateway-observability | v0.0.2 | Standard reporting form: Doris / ClickHouse / StarRocks docking assets and deployment scripts |
 
 ## Table of Contents
@@ -67,10 +68,11 @@ v0.8.0 includes the following component versions:
 - [Chapter 34: Request Body Processing Module Implementation: mod_body_process](./en_us/implementation/chapter34-mod-body-process.md)
 - [Chapter 35: Conf Agent Implementation](./en_us/implementation/chapter35-conf-agent-implementation.md)
 - [Chapter 36: EPP Component Implementation](./en_us/implementation/chapter36-epp-implementation.md)
+- [Chapter 37: ai-gateway-controller Implementation](./en_us/implementation/chapter37-controller-implementation.md)
 
 ### Development
-- [Chapter 37: How to Extend the Rainway AI Gateway](./en_us/develop/chapter37-how-to-extend.md)
-- [Chapter 38: How to Contribute Code to Rainway AI Gateway](./en_us/develop/chapter38-how-to-contribute.md)
+- [Chapter 38: How to Extend the Rainway AI Gateway](./en_us/develop/chapter38-how-to-extend.md)
+- [Chapter 39: How to Contribute Code to Rainway AI Gateway](./en_us/develop/chapter39-how-to-contribute.md)
 
 ### Appendix
 - [Appendix 1: OpenAPI Quick Reference](./en_us/appendix/appendix01-openapi-quick-reference.md)
@@ -87,9 +89,10 @@ See [writing-guide.md](./writing-guide.md) (currently available in Chinese only)
 - `ai-gateway-api/`: Control Plane core component
 - `bfe/`: Data Plane forwarding engine
 - `ai-gateway-epp/`: EPP scheduling component (based on llm-d; provides backend selection for EPP-mode Clusters via ext_proc)
+- `ai-gateway-controller/`: Kubernetes controller (Service/Endpoints discovery → InnerAPI `k8s_pools`)
 - `conf-agent/`: Configuration agent
 - `ai-gateway-web/`: Management console (Dashboard) frontend
-  - Detailed console usage documentation: <https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.10/docs/zh-cn>
+  - Detailed console usage documentation: <https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.11/docs/zh-cn>
 
 ## License
 

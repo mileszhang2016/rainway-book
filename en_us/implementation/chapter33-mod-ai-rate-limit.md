@@ -8,6 +8,7 @@ Through this chapter, readers will understand the complete implementation of the
 - Master the Redis implementation principles of the three rate limiting algorithms: TPM, RPM, and concurrency;
 - Understand how the Control Plane (AI Gateway API) generates stable Redis rate limit Keys and delivers them to BFE;
 - Trace the construction flow of the 429 response after rate limiting is triggered;
+- Master the implementation of batch task rate limiting (`rules.batch`) and the merging rules for the global file hard ceilings;
 - Master the loading, validation, and hot reload mechanisms of the module configuration;
 - Understand the monitoring items exposed by the module and the meaning of the Prometheus metrics.
 
@@ -157,6 +158,55 @@ sequenceDiagram
     M ->> RC: UpdateConsumeToken(bucketTime, tokenDelta)
     M ->> RC: ConnRelease
 ```
+
+## Batch Task Rate Limiting (rules.batch and the Global Hard Ceilings)
+
+The `batch_limits` exported by the Control Plane (see [Chapter 12: Quota and Rate Limit Design](../design/chapter12-quota-and-rate-limit.md)) lands on the BFE side as the `rules.batch` section of each policy in `ai_rate_limit.data` (`PolicyConf.Rules.Batch`), implemented in `bfe/bfe_modules/mod_ai_rate_limit/batch_check.go`. Unlike TPM/RPM/concurrency, batch rate limiting is **not filtered by `policy.Models`** — batch operations carry no model.
+
+### Operation Classification and Check Dimensions
+
+The entry point first determines via `isBatchOpRequest` whether the request mode is `ModeFile` / `ModeBatch` and `bfe_basic.ClassifyBatchOp` can classify a concrete operation (create / upload, etc.) from the HTTP method plus path. `checkBatchLimits` then checks three dimensions according to the operation type:
+
+| Operation | Dimension | Implementation |
+|-----------|-----------|----------------|
+| create | `max_create_rpm` | The batch create counter of `limiterManager` (Redis) |
+| create | `max_active_batches` | Compared against the limit using `mod_ai_batch.BatchActiveCount(meta.ClientKeyId)` |
+| upload | `max_file_bytes` / `max_file_lines` | Non-multipart uploads with a known `Content-Length` are compared directly; multipart uploads are measured on the content of the `file` part (see the next section); chunked streaming uploads are enforced mid-stream by the `mod_ai_batch` counting reader against the effective ceilings |
+
+The over-limit response is constructed by `executeBatchPolicyAction`: a file-ceiling hit returns 413 `CodeBatchFileTooLarge` (type `rate_limit_error`, `LimitTypeBatchFile`), while the other dimensions return 429 with an RPM-class error code.
+
+### Measurement Semantics of the File Limits
+
+File bytes/lines are measured on the content of the `name="file"` part in a multipart request, excluding boundary lines, part headers, form fields such as `purpose`, and CRLFs. Counting the whole request body would falsely reject a legitimate 1-line/138-byte file sitting in an 11-line/502-byte envelope, and would also inflate the reserve estimate.
+
+Measurement takes two paths depending on whether the request body is already buffered:
+
+- **Buffered (pre-check)**: when `mod_body_process` has already buffered the body to extract the model, `mod_ai_batch` uses `multipartFilePartStats` to locate the first `file` part and obtain exact filename / lines / bytes, then compares them against the effective ceilings before forwarding. An over-limit upload returns 413 `BATCH_FILE_TOO_LARGE` (type `rate_limit_error`, `details.limit_type=batch_file`) and increments `UPLOAD_REJECT_SIZE`.
+- **Streaming (chunked or beyond the buffer)**: the `multipartLimitBody` incremental state machine parses the multipart stream and counts only the payload of the `file` part while forwarding every byte unchanged. Boundary delimiters and part headers split across reads are stitched via a pending buffer, so packetization does not cause a false measurement. When the count reaches the effective ceiling, reads start returning errors and the upload aborts mid-stream (counted in `UPLOAD_ABORT_STREAM`); the client must retransmit. The abort happens before response headers, so no 413 can be returned at that point — which is why the buffered pre-check is preferred.
+- **Fallback (unenforceable envelope)**: with no boundary, part headers beyond the 8KB cap, or an unparsable envelope, the gate counts the whole request body, marks `lines_src` / `bytes_src` as `approx`, and increments `UPLOAD_COUNT_APPROX`. Whole-body counting includes envelope overhead, so it only overstates the file size; limit decisions are therefore conservative and never let an oversized file through.
+
+A non-multipart upload (the body is the file) compares `Content-Length` directly against the byte ceiling and accumulates lines while streaming. A multipart request's `Content-Length` includes envelope overhead and must not be compared directly against the single-file byte ceiling.
+
+### Single Computation Point for the Effective Ceilings
+
+The effective file byte/line ceilings are computed at a single point by `resolveBatchFileLimits`: **the minimum of the bound policies' `batch_limits` and the global hard ceilings in `mod_ai_batch.data` (`mod_ai_batch.BatchGlobalFileCeilings()`)**, written into `AiBasicInfo.BatchEffMaxFileBytes` / `BatchEffMaxFileLines`. Both the `mod_ai_batch` pre-forward check and its counting reader read these two fields, ensuring every check point of the same request sees the same ceilings.
+
+### API-Keys Bound to No Policy and the Global Hard Ceiling Fix
+
+`executeCheckLimitPolicy` passes through API-Keys bound to no rate limit policy without performing TPM/RPM/concurrency checks, but the file ceilings are an exception: this no-binding branch also calls `resolveBatchFileLimits` (merging only the global hard ceilings with an empty policy list), so the global `MaxFileBytes` / `MaxFileLines` ceilings apply to all API-Keys.
+
+```go
+policyIds := m.productTable.getPolicyIds(apiKey)
+if len(policyIds) == 0 {
+    // The mod_ai_batch.data global hard ceilings must apply even when no
+    // rate limit policy is bound: resolveBatchFileLimits merges them into
+    // AiBasicInfo for the batch pre-forward checks (0 bound policies).
+    resolveBatchFileLimits(meta, nil, m.productTable.getPolicy)
+    return bfe_module.BfeHandlerGoOn, nil
+}
+```
+
+---
 
 ## Redis Rate Limit Key Design
 
@@ -512,6 +562,7 @@ func (m *ModuleAiRateLimit) limitRequestFinishHandler(req *bfe_basic.Request, re
 - The callback fires per cluster attempt, but the rate limit check runs at most once per request: `PolicyLimiterContext` doubles as an idempotency guard, and repeated callbacks from key rotation and fallback pass through directly.
 - The module supports three types of limits: TPM, RPM, and maximum concurrency, implemented on Redis Hash, Redis ZSET, and Redis String respectively, all guaranteeing atomicity via Lua scripts.
 - TPM adopts a two-phase "pre-consume + correction" approach: pre-consumption by predicted Tokens at the `HandleAfterAITargetModel` phase, and correction based on actual Token consumption at the `HandleRequestFinish` phase.
+- Batch task rate limiting is implemented by the `rules.batch` section (create RPM, active batch count, file byte/line hard ceilings) and is not filtered by `policy.Models`; the effective file ceilings are the minimum of the bound policies' `batch_limits` and the global hard ceilings in `mod_ai_batch.data`, computed at the single point `resolveBatchFileLimits` and written into `AiBasicInfo`; bytes/lines are measured on the `name="file"` part of the multipart body (the buffered pre-check returns 413, while the streaming path aborts mid-stream), and API-Keys bound to no policy are still constrained by the global hard ceilings.
 - The Control Plane generates a stable `redis_key` for each TPM/RPM rule (`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`); BFE prioritizes this field when building Redis Keys and falls back to the legacy logic when it is not specified.
 - After rate limiting is triggered, the module executes `FINISH` or `CLOSE` according to `hit_action`; by default it returns 429 Too Many Requests, carrying the rate limit type and error code in the response body. A local rate limit sets the `bfe_basic.ErrAiRateLimit` marker, which blocks key rotation and cluster fallback, while an upstream 429 still follows the original key rotation logic.
 - The configuration uses an INI + JSON two-layer structure and supports hot reload via `/reload/mod_ai_rate_limit`; during hot reload, the statistical counts of old limiters are preserved to avoid monitoring jumps.
@@ -521,6 +572,7 @@ func (m *ModuleAiRateLimit) limitRequestFinishHandler(req *bfe_basic.Request, re
 
 - `bfe/bfe_modules/mod_ai_rate_limit/mod_ai_rate_limit.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/policy_limiter.go`
+- `bfe/bfe_modules/mod_ai_rate_limit/batch_check.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/data_load.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/conf_load.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/policy_table.go`

@@ -33,3 +33,33 @@
 - InnerAPI 返回的配置通常由 Conf Agent 拉取后写入本地版本目录，再触发热加载。
 - 各主题导出的 JSON 结构与 BFE 数据面配置文件的字段命名保持一致，详细字段说明见上述链接。
 - 缓存与上下文压缩导出含顶层全局块（`Semantic` / `Defaults`），恒导出并参与 MD5 签名；意图导出走 `Data` 文件原样形态。
+
+## 导出格式要点
+
+以下为各主题导出格式的关键约定；字段级细节以上游 InnerAPI 模块文档为准。
+
+### epp_data 导出
+
+`assignment` 段是 cluster→group 映射：条目形如 `{"cluster-a": {"group": "g1"}}`，只引用实例组名，不列出实例；所有 EPP 实例拿到完全相同的同一 version 快照。`server_data_conf` 中的 `EPPAddr` 为 `[]string` 类型，恒为单元素数组（被分配实例组内唯一实例的 `host:port`）。
+
+### server_data_conf 的 NormalizeUpstreamError
+
+`server_data_conf` 的 `AIConf` 含 `NormalizeUpstreamError` 对象，对应 Cluster 的 `llm_config.normalize_upstream_error` 可选配置：
+
+| 导出字段 | Cluster 配置字段 | 说明 |
+|----------|------------------|------|
+| `Enabled` | `enabled` | 是否启用上游错误规范化 |
+| `StreamEnabled` | `stream_enabled` | 流式响应是否启用 |
+| `UnrecognizedAction` | `unrecognized_action` | 未识别错误的处理动作：`passthrough` 或 `rewrite_generic` |
+| `MaxBodyBytes` | `max_body_bytes` | 错误体读取上限，默认 65536 |
+| `RedactSecrets` | `redact_secrets` | 是否对密钥脱敏，默认 true |
+
+控制面只导出显式配置的值：未配置时整个字段不下发，BFE 在加载期通过 `Effective()` 合成默认值。
+
+### 导出字段级加密（enc$v1$）
+
+`[Security].EncryptExports` 开启时，导出文件中的敏感字段为 `enc$v1$<base64(...)>` 信封：`mod-api-key` 主题 `tokens` 的外层键，以及 `server_data_conf` 主题 `AIConf.Keys[].Key`；无该前缀的值按明文直通。加密信封格式、控制面开关、BFE keyring 与失败语义的完整说明见 [第十四章 配置导出与版本控制设计](../design/chapter14-config-export-and-version-control.md)。
+
+### 报表明细表唯一键
+
+访问报表明细表 `bfe_ai_request_log` 的去重唯一键 `uk_dedup` 为五列 `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)`，`logid` 列为 `BIGINT NOT NULL DEFAULT 0`；DDL 头部附有存量迁移 ALTER 语句（先回填 `logid`，再重建唯一键）。

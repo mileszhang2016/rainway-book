@@ -365,6 +365,8 @@ ALTER TABLE bfe_ai_metrics_1m
   ADD COLUMN ai_intent_answer VARCHAR(64) NOT NULL DEFAULT '' AFTER mirror_hit;
 ```
 
+自 v0.0.10.x 升级至 v0.0.11 可直接使用仓库内置的增量脚本 `database/db_ddl_upgrade_to_0.0.11.sql`（归档于 `database/` 目录，随发布包下发）：覆盖两版之间的表结构差异（如 `clusters.epp_runtime`、`api_keys.api_key` 扩容与 `api_key_hash` 查询哈希列、`model_prices.batch_discount`；`epp_assignments` 去掉 `primary_instance_id`，EPP 分配粒度收敛为实例组，脚本附回滚 `ADD COLUMN`）。其中 `api_key_hash` 需应用侧回填（HMAC-SHA256，SQL 无法计算）后，再按脚本末尾的手动步骤切换唯一键。
+
 升级前务必：
 
 - 对生产库做完整备份；
@@ -430,9 +432,10 @@ WriteTimeoutMs   = 1000
 再以升级到 v0.0.11 为例，配套要求为：
 
 - AI Gateway API 升级为 v0.0.11；
-- Dashboard 保持 v0.0.10；
+- Dashboard 升级为 v0.0.11；
 - Conf Agent 升级为 v0.0.8，并确认 `mod_ai_cache`、`mod_traffic_mirror`、`mod_ai_intent`、`mod_ai_context` 四个 Reloader 已配置；
-- BFE 升级为 v1.8.9，并按上一节说明评估 `bfe.conf` 是否需要补充 `[AIKeyAffinity]` 段。
+- BFE 升级为 v1.8.9，并按上一节说明评估 `bfe.conf` 是否需要补充 `[AIKeyAffinity]` 段；
+- ai-gateway-epp 与前端随 AI Gateway API 同版本同步发布（EPP 相关组件互不兼容，混部将全 no-match 并显式告警）。
 
 建议的升级顺序为：
 
@@ -442,6 +445,18 @@ WriteTimeoutMs   = 1000
 4. 升级 Dashboard；
 5. 按需升级 Conf Agent 并检查配置；
 6. 观察 Conf Agent 日志与 BFE 监控指标，确认配置正常同步。
+
+### EPP 组件同版本同步发布
+
+EPP（端点池）相关组件——ai-gateway-epp、ai-gateway-api（含数据库 schema 升级）与前端——必须同版本同步发布，新旧版本互不兼容。混部期间 EPP 匹配会全部 no-match，并以显式告警提示版本不齐，避免在不知情下降级为普通路由。
+
+### 上线顺序硬约束：先升级 BFE，再开启加密导出
+
+控制面导出配置支持 enc$v1$ 加密（`[Security].EncryptExports`）后，旧版本 BFE 无法解析加密配置。因此必须先全量升级 BFE、确认数据面全部就绪，再开启控制面导出配置加密；顺序颠倒会使未升级的 BFE 拉取配置失败。
+
+### 用户口令升级
+
+用户口令存储升级（明文 → bcrypt 哈希）必须先升级代码、禁止先刷数据：存量明文口令采用懒迁移策略，用户首次登录成功时即按需重哈希并落库。提前批量改写口令数据会导致旧代码无法校验、用户无法登录。
 
 ---
 
@@ -506,12 +521,15 @@ ls -l mod_ai_token_auth
 - 生效版本可通过 Conf Agent 日志、软链接指向或配置文件中的 `version` 字段查看；连续 reload 失败时每 10 次输出的 `reload keeps failing` 汇总 ERROR（含 stage 字段）是识别 reload 循环卡死的信号。
 - 版本回滚可利用 Conf Agent 保留的历史版本目录手动切换软链接并重新加载，无需重启 BFE。
 - 升级时需按顺序执行数据库迁移、AI Gateway API 替换、Dashboard 升级与 Conf Agent 配置检查，并注意鉴权头、数据库 DDL 与配置字段（如 BFE `bfe.conf` 的 `[AIKeyAffinity]` 段、Conf Agent 新模块的 `Reloader`）的兼容性。
+- v0.0.10.x → v0.0.11 有现成的增量升级脚本 `database/db_ddl_upgrade_to_0.0.11.sql`（含 `epp_assignments` 删列、`api_keys` 增 `api_key_hash` 列等）；EPP 相关组件（ai-gateway-epp、ai-gateway-api、schema、前端）必须同版本同步发布，混部全 no-match 并显式告警。
+- 上线顺序硬约束：先全量升级 BFE，再开启控制面导出配置 enc$v1$ 加密（`[Security].EncryptExports`）；用户口令升级先升代码、禁止先刷数据，存量明文首次登录成功即懒迁移重哈希。
 
 ---
 
 ## 参考文档
 
 - `ai-gateway-api/docs/zh_cn/upgrade.md`
+- `ai-gateway-api/database/db_ddl_upgrade_to_0.0.11.sql`：v0.0.10 → v0.0.11 控制面库增量升级脚本
 - `ai-gateway-api/db_ddl.sql`
 - `ai-gateway-api/db_ddl_report_mysql.sql`
 - `conf-agent/AGENTS.md`

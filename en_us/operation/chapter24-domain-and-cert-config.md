@@ -51,7 +51,7 @@ Creating a certificate requires submitting the following fields:
 | Field | Type | Description |
 |------|------|------|
 | `cert_name` | string | Certificate name, globally unique, 2-64 characters, letters, digits, `_`, `-`, `.` only |
-| `description` | string | Certificate description, 2-256 characters |
+| `description` | string | Certificate description; required; length 2-256 bytes (counted in UTF-8 bytes) and no control characters |
 | `is_default` | bool | Whether this is the default certificate; there must be exactly one default certificate globally |
 | `cert_file_content` | string | Certificate file content, PEM-format X.509 certificate |
 | `key_file_content` | string | Private key file content, PEM-format private key |
@@ -158,7 +158,7 @@ The `expired_date` field is read-only. AI Gateway API parses it from `cert_file_
 It is recommended to continuously track certificate status in the following ways:
 
 1. **Call the certificate list endpoint regularly**: iterate over `expired_date` and set alerts for certificates expiring within 30 days, 14 days, and 7 days;
-2. **Visual reminders**: in the current release you must use an external alerting system or a self-developed operations dashboard to display soon-to-expire or expired certificates; Dashboard does not yet provide a certificate management page;
+2. **Visual reminders**: the Dashboard certificate page (route `/cert`) lists certificate names, default flags and expiration times (parsed automatically from the certificate file), and lets you upload a certificate/private key to create, set default, and delete non-default certificates; expiry alerting still requires an external alerting system;
 3. **Example alert rules**:
    - Certificate remaining validity ≤ 30 days: Info;
    - Certificate remaining validity ≤ 7 days: Warning;

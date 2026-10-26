@@ -20,7 +20,7 @@
 - **BFE**：数据面转发引擎，负责 AI 流量的路由、鉴权、限流和转发。对应仓库为 `bfenetworks/bfe`。
 - **Conf Agent**：配置代理（Config Agent），与控制面通信并触发 BFE 配置热加载。对应仓库为 `bfenetworks/conf-agent`。
 - **Dashboard**：可视化管理控制台，通常以静态资源形式挂载到 AI Gateway API 中运行。
-- **Service Controller**：Kubernetes 服务发现组件，可选部署。
+- **ai-gateway-controller（原名 Service Controller）**：Kubernetes 服务发现组件，把带 `ai-gateway-api-name` 标签的 Service/Endpoints 的 Ready 实例上报为 K8s 实例池（InnerAPI `k8s_pools`），可选部署。
 - **Log Reader**：访问日志采集组件，随 BFE 部署在数据面，将 BFE 访问日志输出到 Kafka 或 MySQL，供报表与可观测链路消费。对应仓库为 `rainway-ai-gateway/log-reader`。
 
 此外，报表标准形态（Doris / ClickHouse / StarRocks 三选一，展示层可叠加 Grafana）依赖一组可选的外部组件：Kafka 承接 log-reader 输出的日志消息，数仓存储明细与聚合数据，Grafana 展示监控大盘（可选）。这组可观测组件不属于 AI 网关本体，其存储层与展示层的一键部署脚本由 `rainway-ai-gateway/ai-gateway-observability` 仓库提供，部署步骤见下文「报表标准形态部署」。
@@ -98,7 +98,7 @@ make
 `ai-gateway-api/Makefile` 中定义了如下关键目标：
 
 - `make build`：编译生成 `./ai-gateway-api` 二进制。
-- `make package`：将 `conf/`、`static/`、`db_ddl.sql` 等复制到 `output/`。
+- `make package`（即 `package-bin`）：将 `conf/`、`static/`、`scripts/`、`database/`、`db_ddl.sql`、`db_ddl_sqlite.sql`、`db_ddl_report_mysql.sql` 等复制到 `output/`，形成完整发布包。
 - `make docker`：构建本地容器镜像。
 - `make docker-push REGISTRY=...`：多架构构建并推送镜像。
 
@@ -113,11 +113,14 @@ export GO111MODULE=on
 
 ```text
 output/
-├── ai-gateway-api      # 可执行文件
-├── conf/               # 配置文件
-├── static/             # Dashboard 静态资源
-├── db_ddl.sql          # MySQL 初始化脚本
-└── db_ddl_sqlite.sql   # SQLite 初始化脚本
+├── ai-gateway-api             # 可执行文件
+├── conf/                      # 配置文件
+├── static/                    # Dashboard 静态资源
+├── scripts/                   # 部署脚本（含 SQLite 本地部署脚本）
+├── database/                  # 版本增量升级脚本（如 db_ddl_upgrade_to_0.0.11.sql）
+├── db_ddl.sql                 # MySQL 初始化脚本
+├── db_ddl_sqlite.sql          # SQLite 初始化脚本
+└── db_ddl_report_mysql.sql    # 报表明细表与聚合表 DDL（MySQL 形态）
 ```
 
 ### 启动服务
@@ -149,7 +152,7 @@ curl http://localhost:8284/monitor/health
 
 ## 数据库初始化
 
-AI Gateway API 使用关系型数据库存储配置。目前支持 MySQL 8 与 SQLite 两种后端。
+AI Gateway API 使用关系型数据库存储配置。目前支持 MySQL 8 与 SQLite 两种后端。版本间的表结构增量变更以升级脚本形式归档在仓库 `database/` 目录（如 `database/db_ddl_upgrade_to_0.0.11.sql`），随发布包一并下发。
 
 ### MySQL 初始化
 
@@ -189,24 +192,27 @@ ConnMaxLifetimeInMs  = 50000
 
 生产环境建议为 AI Gateway 单独创建数据库账号，并限制访问源 IP。
 
-### SQLite 初始化
+### SQLite 本地单机部署
 
-测试或单机环境可使用 SQLite，省去安装 MySQL 的步骤。执行 SQLite 初始化脚本：
+测试或单机体验环境可使用 SQLite，省去安装 MySQL 与 Redis 的步骤。仓库提供了一键部署脚本 `scripts/deploy_local_sqlite.sh`，配套专用配置 `conf/ai_gateway_api_sqlite.toml`（部署说明见 `ai-gateway-api/docs/zh_cn/deploy_local_sqlite.md`）：
+
+- **纯 Go SQLite 驱动，无 CGO**：`[Databases.bfe_db]` 使用 `Driver = "sqlite-strip"`（基于 `github.com/glebarez/go-sqlite`，并剥离了 SQLite 不支持的 `FOR UPDATE` 子句），`DBName = "./data/ai_gateway.db"` 指向本地数据库文件。
+- **内存 Redis Mock**：`[RedisConf]` 中 `Bns = "mock"` 且 `ClusterMode = "mock"`，以进程内 Mock 替代真实 Redis，单机即可运行。
+- **一键初始化并启动**：脚本自动完成 SQLite 库初始化（导入 `db_ddl_sqlite.sql`，优先使用 `sqlite3` 命令行，缺失时用 `python3` 兜底）并启动服务；支持 `--reinit`（删除并重建数据库，数据会丢失）与 `--no-start`（只初始化不启动）。编译与部署分离——脚本不负责编译，要求已先执行 `make` 生成根目录二进制 `./ai-gateway-api`（缺省时按部署文档复用 `output/` 产物），两者都不存在会提示先编译。
 
 ```bash
-sqlite3 open_bfe.db < db_ddl_sqlite.sql
+cd ai-gateway-api
+make                                  # 独立编译步骤，产出 ./ai-gateway-api
+./scripts/deploy_local_sqlite.sh      # 初始化 ./data/ai_gateway.db 并启动
 ```
 
-然后在 `ai_gateway_api.toml` 中调整数据库驱动与地址：
+等价的手工启动命令为：
 
-```toml
-[Databases.bfe_db]
-DBName = "open_bfe"
-Addr   = "./open_bfe.db"
-Driver = "sqlite3"
+```bash
+./ai-gateway-api -c ./conf -sc ai_gateway_api_sqlite.toml -l ./log
 ```
 
-SQLite 适用于功能验证与开发调试，不建议用于生产高并发场景。
+适用边界：该方案仅适用于单实例本地部署；多实例部署必须使用 MySQL 与真实 Redis。详细说明见 `ai-gateway-api/docs/zh_cn/deploy_local_sqlite.md`。
 
 ## 报表轻量形态部署（可选）
 
@@ -394,7 +400,7 @@ bash setup.sh
 bash setup.sh ./setup_test.conf
 ```
 
-`clickhouse/setup.sh` 分六步创建数据库与五类对象：数据库（默认 `bfe_observability`）、明细表 `bfe_ai_request_log`（MergeTree，`ORDER BY (hostid, log_time, ai_apikey_id, ai_requested_model)`、`PARTITION BY toDate(log_time)`、`TTL 7 天`；`logid` 为 UInt64，BFE 请求唯一标识超出 Int64 上限）、Kafka 引擎暂存表 `bfe_ai_log_kafka`（`JSONEachRow` 格式，独立消费组 `clickhouse_bfe_ai_log`）、消费 MV `bfe_ai_log_load_mv`（JSON 打平 + UTC 墙钟换算）、聚合表 `bfe_ai_metrics_1m`（SummingMergeTree，40 维 + 24 指标，`ORDER BY` 为全部维度列，`TTL 7 天`）、聚合 MV `bfe_ai_metrics_1m_mv`（`toStartOfMinute` 分钟桶，秒级延迟）。数据库名、Kafka 地址、Topic、消费组等均在 `setup.conf` / `setup_test.conf` 中参数化。部署失败需要清空重试时使用 `clickhouse/cleanup.sh`。
+`clickhouse/setup.sh` 分六步创建数据库与五类对象：数据库（默认 `bfe_observability`）、明细表 `bfe_ai_request_log`（MergeTree，`ORDER BY (hostid, log_time, ai_apikey_id, ai_requested_model)`、`PARTITION BY toDate(log_time)`、`TTL 7 天`；`logid` 为 UInt64 DEFAULT 0——BFE 生成的 logid ≤ 2^63-1，可无损落入 signed BIGINT，明细表无唯一键合并、ORDER BY 为四列）、Kafka 引擎暂存表 `bfe_ai_log_kafka`（`JSONEachRow` 格式，独立消费组 `clickhouse_bfe_ai_log`）、消费 MV `bfe_ai_log_load_mv`（JSON 打平 + UTC 墙钟换算）、聚合表 `bfe_ai_metrics_1m`（SummingMergeTree，40 维 + 24 指标，`ORDER BY` 为全部维度列，`TTL 7 天`）、聚合 MV `bfe_ai_metrics_1m_mv`（`toStartOfMinute` 分钟桶，秒级延迟）。数据库名、Kafka 地址、Topic、消费组等均在 `setup.conf` / `setup_test.conf` 中参数化。部署失败需要清空重试时使用 `clickhouse/cleanup.sh`。
 
 ### 步骤 2：配置 AI Gateway API
 
@@ -468,7 +474,7 @@ bash setup.sh
 bash setup.sh ./setup_test.conf
 ```
 
-`starrocks/setup.sh` 分四步创建：数据库（默认 `bfe_observability`）、明细表 `bfe_ai_request_log`（DUPLICATE KEY，102 列；5 个嵌套列 `req_headers` / `res_headers` / `ai_route_rule_hits` / `ai_cluster_key_names` / `ai_rate_limit_hits` 以 VARCHAR 承载 JSON 文本——SR 3.5 的 Routine Load 不支持嵌套结构导入，仅用于明细展示；动态分区 `start=-7` / `end=3`；`DISTRIBUTED BY HASH(ai_apikey_id) BUCKETS 32`；`logid` 为 BIGINT，超界取值会被拒绝写入）、物化视图 `bfe_ai_metrics_1m`（`REFRESH ASYNC EVERY (INTERVAL 1 MINUTE)`，显式首列 `ts_day` 作分区列并设 `partition_ttl=7 DAY`；MV 名即报表查询契约名，查询无感）、Routine Load `bfe_ai_log_load`（消费组 `starrocks_bfe_ai_log`，`kafka_default_offsets=OFFSET_BEGINNING`，`max_error_number=1000`）。部署失败需要清空重试时使用 `starrocks/cleanup.sh`。
+`starrocks/setup.sh` 分四步创建：数据库（默认 `bfe_observability`）、明细表 `bfe_ai_request_log`（DUPLICATE KEY，102 列；5 个嵌套列 `req_headers` / `res_headers` / `ai_route_rule_hits` / `ai_cluster_key_names` / `ai_rate_limit_hits` 以 VARCHAR 承载 JSON 文本——SR 3.5 的 Routine Load 不支持嵌套结构导入，仅用于明细展示；动态分区 `start=-7` / `end=3`；`DISTRIBUTED BY HASH(ai_apikey_id) BUCKETS 32`；`logid` 为 BIGINT NOT NULL DEFAULT 0——BFE 生成的 logid ≤ 2^63-1，天然落在 signed BIGINT 范围内）、物化视图 `bfe_ai_metrics_1m`（`REFRESH ASYNC EVERY (INTERVAL 1 MINUTE)`，显式首列 `ts_day` 作分区列并设 `partition_ttl=7 DAY`；MV 名即报表查询契约名，查询无感）、Routine Load `bfe_ai_log_load`（消费组 `starrocks_bfe_ai_log`，`kafka_default_offsets=OFFSET_BEGINNING`，`max_error_number=1000`）。部署失败需要清空重试时使用 `starrocks/cleanup.sh`。
 
 ### 步骤 2：配置 AI Gateway API
 
@@ -855,6 +861,54 @@ spec:
 - BFE 作为数据面通常以 DaemonSet 形式部署在每个边缘节点，或使用 Deployment 配合负载均衡器暴露入口。
 - Conf Agent 与 BFE 同 Pod 部署时，使用 `emptyDir` 共享配置目录即可；如需持久化历史版本，可改为 `hostPath` 或 PVC。
 
+### 部署 ai-gateway-controller
+
+`ai-gateway-controller` 是运行在业务 Kubernetes 集群中的控制器，负责把带 `ai-gateway-api-name` 标签的 Service/Endpoints 的 Ready 实例上报为 K8s 实例池。只有在需要 K8s 服务发现时才部署该组件。
+
+**前置条件**
+
+- Kubernetes v1.18+；集群内允许创建 ServiceAccount、ClusterRoleBinding、Deployment 与 ConfigMap。
+- AI Gateway API 版本需 ≥ v0.0.11（该版本提供 InnerAPI `/inner-api/v1/k8s_pools`）。升级时先升级 AI Gateway API，再升级控制器。
+- 在控制台「用户管理 → Token」创建的 Token（`POST /open-api/v1/auth/tokens`），且该 Token 属于 System Scope：控制器需要 `k8s_pools` 域的写权限，Support Scope 没有 K8sPool Feature，调用会返回 402。
+
+**部署清单**
+
+清单位于 `ai-gateway-controller/examples/deploy/`：
+
+| 文件 | 内容 |
+|---|---|
+| `yf-ai-gateway-controller-sa.yaml` | ServiceAccount `bfe-ai-gateway-controller` 与 ClusterRoleBinding |
+| `yf-ai-gateway-controller.yaml` | Deployment `bfe-ai-gateway-controller`（`replicas: 1`、`Recreate`）、探针与安全上下文 |
+
+示例的 ClusterRoleBinding 授予 `cluster-admin`，生产环境可收敛为：Service get/patch/list/watch、Endpoints get/list/watch、ConfigMap create/update/delete/get、Event create/patch。
+
+**必填参数**
+
+必填参数为 `--ai-gateway-api-name`、`--ai-gateway-api-addr` 与 `--ai-gateway-api-token`，三者不可为空（后两者代码内置占位默认值，实际部署须显式覆盖）；`--k8s-cluster-name` 不可为空（内置默认值 `testk8s`，生产环境须显式指定）。
+
+```yaml
+args:
+  - '-ai-gateway-api-name=rainway-ai-gateway-demo'
+  - '-ai-gateway-api-addr=http://ai-gateway-api:8183/'
+  - '-ai-gateway-api-token=Token <your-token>'
+  - '-k8s-cluster-name=szyf'
+  - '-namespace=rainway-ai-gateway'
+```
+
+其余常用参数：`--namespace`（逗号分隔，`*` 或空表示全部命名空间）、`--retry-interval-unit-sec`（> 0 时出错按该秒数重新入队）、`--force-rm-finalizer`、`--skip-nil-svc-delete`（默认 `true`）、`--metrics-bind-address`（`:9080`）、`--health-probe-bind-address`（`:9081`）、`--readiness-endpoint-name`（`/readyz`）、`--liveness-endpoint-name`（`/healthz`）、`--pprof-address` 以及 zap 日志参数。
+
+**探针与端口**
+
+Deployment 暴露 `9081` 供 `/healthz` 与 `/readyz` 使用，metrics 由 `9080` 提供。
+
+**标签与端口约定**
+
+被发现的 Service 必须携带 `ai-gateway-api-name` 标签，其值需与启动参数 `--ai-gateway-api-name` 一致（`*` 表示任意）；需要上报的端口必须有 name，无名端口会被跳过。
+
+**验证**
+
+查看 Service 上的 `k8s.bfenetworks.com/k8spool-result` annotation 与 `<service>.result` ConfigMap，或在 AI Gateway API 上查询 `GET /inner-api/v1/k8s_pools`。
+
 ## 多组件启动顺序
 
 完整生产部署涉及三个核心组件：AI Gateway API、BFE、Conf Agent。推荐按以下顺序启动：
@@ -1019,8 +1073,8 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 本章系统介绍了壬远 AI 网关的安装部署流程：
 
 - 控制面依赖 Go 1.22、MySQL 8 与 Redis 6.2；Redis 用于配额余额、限流计数和会话缓存，是运行时关键依赖。数据面 BFE 与 Conf Agent 需同机部署。
-- 使用 `make` 即可完成 AI Gateway API 的源码编译与打包。
-- 数据库支持 MySQL 与 SQLite，生产环境推荐使用 MySQL，并设置字符集为 `utf8mb4`。
+- 使用 `make` 即可完成 AI Gateway API 的源码编译与打包；发布包（`make package-bin`）包含 `conf/`、`static/`、`scripts/`、`database/` 与全部 DDL 脚本。
+- 数据库支持 MySQL 与 SQLite，生产环境推荐使用 MySQL，并设置字符集为 `utf8mb4`；版本间增量升级脚本归档在 `database/` 目录。单机体验可使用 SQLite 本地部署方案（`scripts/deploy_local_sqlite.sh` + `conf/ai_gateway_api_sqlite.toml`，纯 Go 驱动无 CGO，内存 Redis Mock），仅适用单实例，多实例必须改用 MySQL + 真实 Redis。
 - 最小可运行配置需调整数据库连接与 Redis 逻辑名；Redis 真实地址通过 `name_conf.data` 解析。
 - 可通过 `make docker` 构建容器镜像，并采用 Kubernetes Deployment、Service 与 DaemonSet 进行集群化部署。
 - 多组件启动顺序为：数据库初始化 → AI Gateway API → BFE → Conf Agent，确保数据面能够及时获得控制面下发的最新配置。
@@ -1035,7 +1089,9 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 
 - `ai-gateway-api/README.md`：项目概览、快速开始与容器化部署入口。
 - `ai-gateway-api/docs/zh_cn/deploy.md`：BFE 控制面组件部署步骤与 TLS 配置注意事项。
+- `ai-gateway-api/docs/zh_cn/deploy_local_sqlite.md`：SQLite 本地单机部署（一键脚本、参数与适用边界）。
 - `ai-gateway-api/docs/zh_cn/config_param.md`：`ai_gateway_api.toml` 完整配置参数说明。
+- `ai-gateway-api/database/db_ddl_upgrade_to_0.0.11.sql`：v0.0.10 → v0.0.11 控制面库增量升级脚本。
 - `ai-gateway-api/Makefile`：构建、打包、Docker 镜像构建与推送目标。
 - `conf-agent/AGENTS.md`：Conf Agent 架构、构建方式与本地启动命令。
 - `conf-agent/docs/zh_cn/config/config.md`：Conf Agent 配置文件详细说明。

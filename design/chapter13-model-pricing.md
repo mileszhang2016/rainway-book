@@ -9,6 +9,8 @@
 - `model-list.yaml` 批量导入格式及其使用方式；
 - RMB 配额分时段定价（Tiered Pricing）的设计思路与实现机制；
 - BFE 数据面如何基于定价数据完成运行时成本计算；
+- 批量任务（batch）的折扣定价模型与导出展开规则；
+- image/video entry 驱动计费与"mode 无价格条目回落 chat 价"的兜底计费规则；
 - 模型定价与 Provider、Cluster 概念分离后的关系与配置归属。
 
 ---
@@ -78,12 +80,13 @@
 | `provider` | Provider / Cluster 标识，仅作为价格归集标识，不强制要求在 `/providers` 中存在 |
 | `model` | 模型名，如 `deepseek-v3` |
 | `base_model` | 归一化模型名，用于模型映射后的价格归一 |
-| `mode` | 请求模式，如 `chat`、`completion`、`embedding`、`image_generation` 等 |
+| `mode` | 请求模式，如 `chat`、`completion`、`embedding`、`image_generation`、`batch` 等 |
 | `capabilities` | 模型支持的能力列表，如 `vision`、`reasoning`、`tools` |
 | `supported_parameters` | 支持的请求参数列表，如 `temperature`、`max_tokens` |
 | `limits` | 限制对象，包括上下文窗口、最大输入/输出 Token 数等 |
 | `prices` | 默认价格表，未命中 tier 时作为 fallback |
 | `tier_prices` | 分时段价格表，键为 tier name（初期只支持 `peak`） |
+| `batch_discount` | 批量折扣系数，`*float64`，取值 `(0, 1]`；语义上缺省为 0.5（五折），见下文"批量任务定价" |
 | `price_currency` | 价格货币，当前固定为 `RMB` |
 | `metadata` | 元数据，包括价格来源、备注等 |
 
@@ -166,6 +169,31 @@ models:
 - **merge**：对已有 `(provider, model, mode)` 记录更新，新增记录插入，适用于增量维护。
 
 导入接口仅允许管理员调用。导入过程中会校验必填字段、`prices` 非负、`tier_prices` 键名合法性、`limits` 非负整数以及三元组唯一性。
+
+---
+
+## 批量任务定价（batch 折扣）
+
+批量与异步任务（OpenAI Batch API，见[第十二章 配额与限流设计](./chapter12-quota-and-rate-limit.md)的批量配额模型）按低于在线调用的价格结算，定价模型通过 `mode` 与 `batch_discount` 两个字段表达。
+
+### mode 白名单与 batch_discount
+
+`model_prices` 的 `mode` 白名单含 `batch`，表示该价格行是 batch 模式的显式定价。价格行另含 `batch_discount` 字段：
+
+- 类型为 `*float64`（可空指针），取值区间 `(0, 1]`（`ai-gateway-api/model/imodel_price/validate.go` 对越界值报错）；
+- 语义上缺省表示 0.5，即五折：配置了折扣的 chat 价格行在导出时展开为 batch 价格。
+
+### 导出展开规则
+
+控制面导出 `AIConf.ModelTable` 时按如下规则生成 `mode=batch` 的显式价格行：
+
+1. 价格行配置了 `batch_discount` 时，以 `chat` 价 × 折扣系数展开出一条 `mode=batch` 价格行，随 ModelTable 一并下发给 BFE；
+2. 若管理员已手工维护了 `(provider, model, mode=batch)` 的价格行，则手工行优先于系数展开——导出不会用展开结果覆盖显式配置；
+3. 模型完全未配置任何 batch 价格时，batch 任务按 chat 基价结算。
+
+### batch 结算基价
+
+批量结算在结果文件下载时按 batch 价、按模型执行，结算金额按基价公式计算：`settle_units = usage_in × input_cost_per_token + usage_out × output_cost_per_token`。一期 batch 结算只接入了基价，`tier_prices` 分时段价未接入批量结算。BFE 数据面 `mod_ai_batch` 的预留-结算-释放实现见[第三十二章 Token认证与配额模块实现：mod_ai_token_auth](../implementation/chapter32-mod-ai-token-auth.md)。
 
 ---
 
@@ -403,6 +431,21 @@ Responses API 的 usage 是子集（subset）语义，不做上述 additive 归�
 
 若某个 tier 未配置特定价格键，则自动 fallback 到默认 `prices` 中的对应键。`TokenUsage` 中的 `CacheReadTokens`、`ImageInputTokens`、`VideoCount` 等字段使缓存命中、图片输入与视频生成可以分别计价。
 
+#### image/video entry 驱动计费
+
+image_generation 与 video_generation 的计费由匹配到的价格条目（entry）驱动，判别依据是**价格键是否存在**，而不是键的值（BFE 侧以 `ModelPrice.HasPrice` 判别，`bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`）：
+
+- 条目缺少 per-unit 价格键（`output_cost_per_image` / `output_cost_per_video`）时，回落到 chat token 公式计费（`calcChatCost`），避免未配置图片/视频单价时调用完全不计费；
+- 条目同时持有两类键（混合条目）时按 per-unit 计费；
+- 显式配置 `output_cost_per_image = 0` 仍按 per-image 计费，只是该维度成本为 0；video 对称。这与"键缺失回落 chat 公式"的语义不同：前者是"该维度免费"，后者是"未单独定价、按 token 计价"。
+
+#### mode 无价格条目的回落计费（ai_price_miss）
+
+价格表没有某个 `(model, mode)` 条目时（例如 `/responses` 入口的模型只配置了 `mode=chat` 价格），BFE 回落到同一模型的 chat 价计费，而不是按 0 计费。该行为伴随可观测标记：
+
+- 模块计数器 `PriceFallbackUsed` 统计回落计费的次数，`PriceLookupMiss` 统计连回落基线都不存在的无价格次数（`bfe/bfe_modules/mod_ai_token_auth/mod_ai_token_auth.go`）；
+- 访问日志以 `ai_price_miss` 字段（pb field 763，`bfe-access-pb` ≥ v0.3.14）标记价格缺失：两种 miss（回落计费、无基线）都会置 true，用于区分"未定价的低价/0 计费行"与合法的 0 成本行。字段细节见[第三十二章 Token认证与配额模块实现：mod_ai_token_auth](../implementation/chapter32-mod-ai-token-auth.md)。
+
 ### 向后兼容
 
 分时段定价设计保持了对固定价格的向后兼容：
@@ -555,6 +598,9 @@ models:
 - RMB 配额分时段定价通过 Provider 时段模板与 Model tier 价格配合实现，BFE 按请求发生时刻匹配 `peak` 等 tier，未命中时 fallback 到默认价格。
 - BFE 数据面加载后价格保持 `float64`（负值加载报错），运行时根据 Token 用量和活跃 tier 逐项 `quota.CalcCostUnits` 换算为 1e-8 元定点整数再累加，Redis 扣减与存量配置的金额语义保持不变。
 - chat 计费以总输入 Token 为起点拆分缓存读写、图片输入、音频输入等维度；所有细化价格键均未配置时回退 legacy 公式。
+- image_generation / video_generation 按"价格键是否存在"（`ModelPrice.HasPrice`）判别：缺 per-unit 价键回落 chat token 公式，显式 0 价仍按 per-unit 计费（成本为 0）。
+- 价格表无 `(model, mode)` 条目时回落同模型的 chat 价计费，并通过计数器 `PriceFallbackUsed` / `PriceLookupMiss` 与访问日志字段 `ai_price_miss` 暴露可观测性。
+- 批量任务通过 `mode=batch` 价格行与 `batch_discount` 折扣系数定价：导出时展开为显式 batch 价格行，手工维护的 batch 行优先于系数展开；batch 结算按 `usage_in × input + usage_out × output` 基价，tier 价一期未接入。
 - Anthropic 用量在协议适配层归一化为总输入语义（`input_tokens + cache_read + cache_creation`），与 OpenAI 的 `prompt_tokens` 对齐；Responses API 的 `input_tokens` 是包含 `cached_tokens` 的子集语义，直接取作 `PromptTokens`（不做 additive 累加）；支持 `responses`（复用 chat 计费）与 `video_generation`（按 `output_cost_per_video` × 视频数）两种计费模式。
 - Provider 与 Cluster 概念分离后，`model-prices.provider` 仅作为价格归集标识，与 `/providers` 为弱引用关系，配置更灵活；`AIConf.ModelTable` 由控制面在导出时按 provider 拼接生成。
 
@@ -563,6 +609,7 @@ models:
 ## 参考文档
 
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/model-prices.md`
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/batches.md`
 - `ai-gateway-api/design-docs/sys-design/details/RMB配额分时段定价.md`
 - `ai-gateway-api/design-docs/sys-design/details/provider与cluster概念分离.md`
 - `bfe/bfe_config/bfe_cluster_conf/cluster_conf/cluster_conf_load.go`

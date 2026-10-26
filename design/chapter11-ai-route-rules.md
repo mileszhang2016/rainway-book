@@ -9,6 +9,7 @@
 - 掌握 `route_rules` 表的数据模型、校验规则与生命周期一致性；
 - 了解 AI 路由规则如何导出到 BFE、绑定顺序与文件格式；
 - 掌握 `req_ai_intent_in` 意图条件原语的语义与路由规则消费意图的完整示例；
+- 掌握时间条件原语 `time_weekday_in` 的语法、星期编号约定与时区语义；
 - 掌握 Fallback 与默认路由的设计与配置方法。
 
 ## AI 路由规则在请求处理链路中的位置
@@ -228,6 +229,13 @@ AI 路由规则与 API-Key / Entity 的生命周期保持一致：
 | Global 路由表禁用 | 无全局兜底，可能导致请求无规则可匹配 |
 | 引用的 Cluster 被删除 | 删除集群时校验失败，需先解除引用或删除规则 |
 
+### AI 缓存规则的集合约束
+
+AI 缓存规则由 `/open-api/v1/ai-cache-rules` 整组读写，与路由规则共享 BFE 条件表达式语法，但约束独立：
+
+- **`cond` 在集合内唯一**：提交的 `rules[].cond` 必须两两不同，按逐字节比较判定。出现重复时接口返回 422 `duplicate ai cache rule cond`。该约束是导出侧的前置条件——重复的 `cond` 会使 BFE 无法确定同一请求应命中哪条规则，整份 `ai_cache.data` 将被拒载，而不是跳过重复项。
+- **整组替换语义**：写入接口以提交的 `rules` 数组整体替换现有集合，不提供单条增删改。响应中的规则元素因此不包含 `created_at` / `updated_at`——这两列随整组替换重置，不能作为规则自身的生命周期依据；需要追溯规则何时被修改时，以操作日志（`/open-api/v1/operation-logs`）中的审计记录为准。
+
 ## 语义路由与意图条件
 
 AI 路由规则的 `cond` 除了常规的请求特征原语（如 `req_host_in`、`req_body_json_in`），还支持意图条件原语 `req_ai_intent_in`，实现基于请求语义内容的语义路由。该原语定义于 `bfe/bfe_basic/condition/primitive.go` 的 `PrimitiveAiIntentIn`，签名如下：
@@ -294,6 +302,34 @@ req_ai_intent_in("task_type", "test_writing|doc_writing", 0.9)
 该配置的效果：写作类请求（意图分类置信度 ≥ 0.9）路由到 `cluster_deepseek_a`，其余请求走 `default-route` 全局兜底。当决策服务故障或分类置信不足时，`req_ai_intent_in` 不匹配，写作请求自动回落到默认路由，语义路由不会导致请求失败。
 
 意图问题集（`intent_questions.data`）的数据模型与决策服务协议详见[第七章 数据面转发设计](./chapter07-data-plane-design.md)的 mod_ai_intent 小节；实现时序详见[第三十一章 AI 路由模块实现](../implementation/chapter31-mod-ai-route.md)。
+
+## 时间条件原语 time_weekday_in
+
+除请求特征与意图原语外，AI 路由规则的 `cond` 还支持系统时间条件原语 `time_weekday_in`，用于按星期几做时段类调度（例如工作日与周末分流到不同集群）。该原语由 `bfe/bfe_basic/condition` 的 `WeekdayMatcher` 实现，签名如下：
+
+```
+time_weekday_in(String weekday_list [, String zone])
+```
+
+参数语义：
+
+- `weekday_list`：`|` 分隔的星期编号枚举，配置加载时校验取值范围；不支持区间写法（`"1-5"` 会报错）；元素允许重复、允许两侧空白。
+- `zone`：军事时区字母（见 `bfe_util.TimeZoneMap`，`"H"` 表示 UTC+8），可省略；省略时按 UTC（`"Z"`）判定。国内部署必须显式传 `"H"`——北京时间周一 00:00 时 UTC 时间仍是周日，省略 `zone` 会把工作日误判为周末。
+
+星期编号遵循 Go `time.Weekday` 约定：`0` 表示周日，`6` 表示周六，与 cluster 定价 `TimeRange.Weekdays` 字段一致。
+
+示例：
+
+```
+time_weekday_in("0|6", "H")        // 周末（北京时间）
+time_weekday_in("1|2|3|4|5", "H")  // 工作日（北京时间）
+```
+
+语义：当前时间所在的星期属于给定集合时命中。时间取自进程时钟；当请求携带 `X-Bfe-Debug-Time` 调试头时，以该头指定的时间为准。
+
+实现上，`WeekdayMatcher` 在配置加载期把 `weekday_list` 编译为 `uint8` 位掩码、把 `zone` 解析为 `time.Location`，运行时只做位测试；原语注册于 `funcProtos` 与 `optionalLastArgProtos`（后者提供可省略的 `zone` 参数）。命名约定上，系统时间类新原语使用 `time_` 前缀，历史原语 `bfe_time_range` / `bfe_periodic_time_range` 保留 `bfe_` 前缀不变。
+
+控制面方面，升级 bfe 依赖后，保存/校验条件表达式的全部入口——路由规则、AI 缓存规则、AI 上下文规则、流量镜像规则以及 `PATCH /expression/verify`——都接受该原语；非法取值（如 `"7"`、非法 `zone`）仍由编译期校验拒绝并返回 422。
 
 ## 导出到 BFE 的绑定顺序与文件格式
 
@@ -536,6 +572,7 @@ Global 路由表通常配置一条 `default_t()` 规则作为默认路由，确�
 - `route_rules` 表通过 `type` 和 `owner` 区分层级，规则以 JSON 数组形式存储；
 - 控制面在保存时校验规则名称、条件、权重与 Fallback，并与 API-Key / Entity 生命周期保持一致；
 - `req_ai_intent_in` 原语支持按意图分类结果做语义路由，意图懒解析由 `mod_ai_intent` 提供，决策服务不可用时 fail-safe 回落后续规则；
+- `time_weekday_in` 原语支持按星期（Go `time.Weekday` 编号）做时段调度，`zone` 省略时按 UTC 判定，国内部署应显式传 `"H"`；
 - AI 路由规则通过 InnerAPI 导出为 `ai_route.json`，BFE 落地为 `ai_route.data`，`ApikeyRouteTableBindings` 决定查找顺序；
 - Fallback 用于 target 不可用时的有序降级，Global 默认路由用于兜底，二者共同提升路由可靠性。
 
@@ -553,3 +590,4 @@ Global 路由表通常配置一条 `default_t()` 规则作为默认路由，确�
 - `ai-gateway-api/model/imods/ai_route_exporter.go`
 - `bfe/bfe_modules/mod_ai_route/mod_ai_route.go`
 - `bfe/bfe_basic/condition/primitive.go` 的 `PrimitiveAiIntentIn`
+- `bfe/bfe_basic/condition/` 的 `WeekdayMatcher`（`time_weekday_in`）

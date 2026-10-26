@@ -9,6 +9,7 @@
 - `config_versions` 表在版本控制中的作用，以及下游如何基于该表判断配置是否变化；
 - 十三类配置导出主题各自的职责与导出格式；
 - `mod-api-key` 导出时采用的批量预加载与内存回溯优化手段；
+- 下发配置文件的字段级 `enc$v1$` 加密：信封格式、控制面开关、BFE 侧解密与失败语义；
 - Conf Agent 如何拉取配置并与 BFE 热加载机制衔接；
 - 一条配置从数据库到 BFE 生效的完整链路。
 
@@ -253,6 +254,96 @@ type ModAPIKeyRuleConf struct {
 
 ---
 
+## 下发配置的字段级加密（enc$v1$）
+
+InnerAPI 导出的配置最终以 JSON 文件形态落盘在 BFE 侧，其中包含两类敏感凭证：下游 API-Key 值与上游 Provider 密钥。为防止配置文件在分发、备份与共享过程中泄露，控制面支持对下发配置做**字段级加密**（控制面实现见 `ai-gateway-api/lib/xcrypto/` 与 `ai-gateway-api/design-docs/sys-design/details/下发配置加密.md`，数据面加载点解密见 `bfe/bfe_util/crypto/`）。加密只作用于指定字段，导出文件仍是合法 JSON。
+
+### 信封格式与读兼容
+
+加密字段采用统一的信封格式：
+
+```
+enc$v1$<base64(keyID(1B) | nonce(12B) | AES-256-GCM 密文+tag)>
+```
+
+- `keyID`：1 字节密钥标识，BFE 侧据此在 keyring 中选择解密密钥；
+- `nonce`：12 字节。为使密文具有确定性，nonce 由 `HMAC-SHA256(key, plaintext)[0:12]` 派生——同一 `(keyID, 明文)` 产生的密文恒定，因此导出数据的 `data_sign`（内容 MD5）保持稳定，Conf Agent 不会反复推送内容等价的配置；
+- 加密直接使用 keyring 中的 32 字节原始密钥，不做 HKDF 派生，与 BFE `bfe_util/crypto` 字节兼容。
+
+**无前缀 marker 的值明文直通**：凡是不以 `enc$v1$` 开头的值一律按明文处理。这一读兼容设计支持灰度发布与不停机迁移——控制面可以先加密部分值、保留其余明文，BFE 混合加载两种形态。
+
+### 控制面开关
+
+导出加密由 `ai_gateway_api.toml` 的 `[Security]` 段控制：
+
+```toml
+[Security]
+# 是否对导出配置中的敏感字段加密（默认 false）
+EncryptExports = true
+
+# 导出专用 keyring 文件（TOML），须分发到全部 BFE 实例
+# 与落盘加密的 MasterKeyFile 密钥相互独立
+ExportKeyFile = "/etc/ai-gateway/export_keys.toml"
+
+# 当前用于加密的密钥 ID；默认 0 = 跟随 keyring 文件内的 ActiveKeyID
+ActiveExportKeyID = 1
+```
+
+### 加密范围
+
+加密仅覆盖两个导出主题中的特定字段，其余字段不受影响：
+
+| 导出主题           | 加密字段                                   | 说明                                                       |
+|--------------------|--------------------------------------------|------------------------------------------------------------|
+| `mod_api_key`      | `tokens` 的外层键（API-Key 值本身）        | 内层 `"key"` 字段在加密导出时置空，BFE 解密后回填明文键    |
+| `server_data_conf` | `AIConf.Keys[].Key`（上游 Provider 密钥）  | 仅密钥值，其余集群配置字段不变                             |
+
+### BFE 侧 keyring 与解密
+
+BFE 侧在 `bfe.conf` 的 `[Security]` 段只有一个键：
+
+```toml
+[Security]
+# keyring 文件路径，默认空 = 禁用导出解密
+KeyFile = "/etc/bfe/conf.d/export_keys.toml"
+```
+
+keyring 为 TOML 格式，支持多 `keyID` 并存与轮换：
+
+```toml
+ActiveKeyID = 1
+
+[Keys]
+0 = "<base64 32字节密钥>"
+1 = "<base64 32字节密钥>"
+```
+
+- BFE 按密文自带的 `keyID` 选择解密密钥，轮换新密钥后旧密文仍可解密；
+- keyring 解析严格 fail-closed：文件损坏或格式非法直接报错。
+
+**热更新**：keyring 在每次 data 文件加载时重新读取，不在模块 `Init` 时缓存。轮换流程为更新 keyring 文件后，触发既有的 `/reload/mod_ai_token_auth`、`/reload/server_data_conf` 监控接口，无需重启 BFE（K8s subPath 挂载场景因 kubelet 不刷新挂载内容而例外）。
+
+### 解密点与失败语义
+
+解密发生在 BFE 加载 data 文件阶段，共两个解密点：
+
+- `mod_ai_token_auth/token_rule.data` 的 `Tokens` 外层键：解密失败导致整次加载报错，不允许跳过单条记录；
+- `server_data_conf/cluster_conf.data` 的 `AIConf.Keys[].Key`：在校验（`AIConfCheck`）之前解密，保证校验基于明文进行。
+
+失败语义：
+
+- **reload 解密失败**：本次 reload 失败，旧配置保留，BFE 继续按旧配置转发；
+- **首次启动解密失败**：模块 `Init` 失败，BFE 拒绝启动，避免以错误配置对外服务；
+- **全明文 + 无密钥**：正常启动，便于渐进启用。
+
+### 部署纪律与上线顺序
+
+- keyring 文件权限设为 `0600`，并与 conf 目录分目录存放；
+- `bfe.conf` 只包含 keyring 文件路径，不内嵌密钥材质；
+- **上线顺序硬约束**：必须先全量升级支持解密的 BFE，再开启控制面导出加密。旧版 BFE 遇到密文会 reload 失败并滞留旧配置，若先发密文再升级，数据面将无法接收新配置。
+
+---
+
 ## Conf Agent 拉取与 BFE 热加载的衔接
 
 Conf Agent 是部署在 BFE 侧的 Sidecar 组件，负责将 InnerAPI 导出的配置转换为 BFE 可加载的本地文件，并在配置变化时触发 BFE 热加载。其整体流程见 `conf-agent/AGENTS.md`。
@@ -369,6 +460,7 @@ Conf Agent 接收到 `Data: null` 后跳过本次写入与热加载；当管理�
 - `config_versions` 表按主题记录配置签名与版本号的映射关系，是增量同步的依据；
 - 当前 InnerAPI 共导出十三类配置主题，分别对应 BFE 的 Server Data、GSLB、Cluster Table、证书、附加文件、`mod_ai_token_auth`、`mod_body_process`、`mod_ai_rate_limit`、`mod_ai_route`、AI 缓存、上下文压缩、流量镜像与意图配置；
 - `mod-api-key` 通过批量预加载与内存回溯优化，解决了跨表查询与 Entity 层级回溯带来的性能问题；
+- 下发配置支持字段级 `enc$v1$` 加密：确定性密文保证 `data_sign` 稳定，无前缀值明文直通支持灰度迁移；BFE 按 keyring 多钥解密，keyring 随每次加载热更新；
 - Conf Agent 以拉取方式获取配置，通过版本目录、Symlink 切换与 BFE `/reload/{module}` 接口完成配置热加载；
 - 拉取式设计使控制面与数据面解耦，支持跨网络区域部署与快速故障恢复。
 

@@ -1,4 +1,4 @@
-# 第三十八章 如何向壬远AI网关贡献代码
+# 第三十九章 如何向壬远AI网关贡献代码
 
 ## 本章目标
 
@@ -390,7 +390,7 @@ go test -v -count=1 -timeout 300s ./tests/schema/innerapi/...
 
 ### BFE 集成测试（真实进程级）
 
-`bfe/tests/integration/` 是数据面的真实进程级集成测试。与仓库中 `integration-test/` 目录不同，它仅启动真实的 `bfe` 进程，不引入 `ai-gateway-api`、`conf-agent` 等外部组件；测试所需的 BFE 配置文件直接由测试代码或静态 `testdata` 提供，请求通过真实 HTTP 发送到 BFE 监听端口，验证转发行为与后端命中统计。
+`bfe/tests/integration/` 是数据面的真实进程级集成测试：它仅启动真实的 `bfe` 进程，不引入 `ai-gateway-api`、`conf-agent` 等外部组件；测试所需的 BFE 配置文件直接由测试代码或静态 `testdata` 提供，请求通过真实 HTTP 发送到 BFE 监听端口，验证转发行为与后端命中统计。
 
 #### 目录结构
 

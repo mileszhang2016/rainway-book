@@ -9,6 +9,7 @@ Through this chapter, the reader will understand:
 - The role of the `config_versions` table in version control, and how downstream components determine whether configuration has changed based on this table;
 - The responsibilities and export formats of the thirteen configuration export topics;
 - The batch preloading and in-memory backtracking optimizations used when exporting `mod-api-key`;
+- The field-level `enc$v1$` encryption of exported configuration files: envelope format, Control Plane switches, BFE-side decryption, and failure semantics;
 - How Conf Agent pulls configuration and connects with BFE's hot reload mechanism;
 - The complete path of a configuration from the database to taking effect in BFE.
 
@@ -253,6 +254,96 @@ Runtime states such as `expired`/`exhausted` are no longer computed by the expor
 
 ---
 
+## Field-Level Encryption of Exported Configuration (enc$v1$)
+
+The configuration exported via InnerAPI ultimately lands on the BFE side as JSON files, which contain two types of sensitive credentials: downstream API-Key values and upstream Provider keys. To prevent configuration files from leaking during distribution, backup, and sharing, the Control Plane supports **field-level encryption** of exported configuration (Control Plane implementation: `ai-gateway-api/lib/xcrypto/` and `ai-gateway-api/design-docs/sys-design/details/下发配置加密.md`; Data Plane decryption at load time: `bfe/bfe_util/crypto/`). Only the designated fields are encrypted; the exported file remains valid JSON.
+
+### Envelope Format and Read Compatibility
+
+Encrypted fields use a unified envelope format:
+
+```
+enc$v1$<base64(keyID(1B) | nonce(12B) | AES-256-GCM ciphertext+tag)>
+```
+
+- `keyID`: a 1-byte key identifier, based on which BFE selects the decryption key from its keyring;
+- `nonce`: 12 bytes. To make the ciphertext deterministic, the nonce is derived as `HMAC-SHA256(key, plaintext)[0:12]` — the same `(keyID, plaintext)` always produces the same ciphertext, so the exported data's `data_sign` (content MD5) remains stable and Conf Agent will not repeatedly push content-equivalent configuration;
+- Encryption uses the raw 32-byte key from the keyring directly, without HKDF derivation, keeping it byte-compatible with BFE's `bfe_util/crypto`.
+
+**Values without the prefix marker pass through as plaintext**: any value that does not start with `enc$v1$` is treated as plaintext. This read-compatibility design supports grayscale rollout and zero-downtime migration — the Control Plane can encrypt some values first while leaving the rest in plaintext, and BFE loads both forms side by side.
+
+### Control Plane Switches
+
+Export encryption is controlled by the `[Security]` section of `ai_gateway_api.toml`:
+
+```toml
+[Security]
+# Whether to encrypt sensitive fields in exported config (default false)
+EncryptExports = true
+
+# Dedicated keyring file (TOML) for export; must be distributed to all BFE instances
+# Its keys are independent from MasterKeyFile used for at-rest encryption
+ExportKeyFile = "/etc/ai-gateway/export_keys.toml"
+
+# Key ID currently used for encryption; default 0 = follow the ActiveKeyID in the keyring file
+ActiveExportKeyID = 1
+```
+
+### Encryption Scope
+
+Encryption covers only specific fields in two export topics; all other fields are unaffected:
+
+| Export topic         | Encrypted field                                   | Notes                                                                  |
+|----------------------|---------------------------------------------------|------------------------------------------------------------------------|
+| `mod_api_key`        | Outer keys of `tokens` (the API-Key value itself) | The inner `"key"` field is set to empty on encrypted export; BFE fills the plaintext key back after decryption |
+| `server_data_conf`   | `AIConf.Keys[].Key` (upstream Provider keys)      | Only the key value; other cluster config fields are unchanged          |
+
+### BFE-Side Keyring and Decryption
+
+On the BFE side, the `[Security]` section of `bfe.conf` has a single key:
+
+```toml
+[Security]
+# Keyring file path; empty by default = export decryption disabled
+KeyFile = "/etc/bfe/conf.d/export_keys.toml"
+```
+
+The keyring is in TOML format and supports multiple coexisting `keyID`s and rotation:
+
+```toml
+ActiveKeyID = 1
+
+[Keys]
+0 = "<base64 32-byte key>"
+1 = "<base64 32-byte key>"
+```
+
+- BFE selects the decryption key by the `keyID` carried in the ciphertext, so old ciphertexts remain decryptable after rotating to a new key;
+- Keyring parsing is strictly fail-closed: a corrupted or malformed file fails with an error.
+
+**Hot update**: the keyring is re-read on every data-file load and is not cached at module `Init`. Rotation consists of updating the keyring file and then triggering the existing `/reload/mod_ai_token_auth` and `/reload/server_data_conf` monitor interfaces; no BFE restart is required (except with Kubernetes subPath mounts, where the kubelet does not refresh mounted content).
+
+### Decryption Points and Failure Semantics
+
+Decryption happens while BFE loads data files, at two points:
+
+- Outer keys of `Tokens` in `mod_ai_token_auth/token_rule.data`: a decryption failure aborts the entire load; skipping individual entries is not allowed;
+- `AIConf.Keys[].Key` in `server_data_conf/cluster_conf.data`: decrypted before validation (`AIConfCheck`), so validation always operates on plaintext.
+
+Failure semantics:
+
+- **Decryption failure on reload**: the reload fails and the old configuration is retained; BFE keeps forwarding with the old configuration;
+- **Decryption failure at first startup**: the module's `Init` fails and BFE refuses to start, avoiding serving with a broken configuration;
+- **All-plaintext with no key**: BFE starts normally, making gradual enablement easy.
+
+### Deployment Discipline and Rollout Order
+
+- Set keyring file permissions to `0600` and store it in a directory separate from the conf directory;
+- `bfe.conf` contains only the keyring file path and never embeds key material;
+- **Hard rollout-order constraint**: all BFE instances must be upgraded to a decryption-capable version before export encryption is enabled on the Control Plane. An old BFE fails to reload on ciphertext and keeps the old configuration; if ciphertext is distributed before the upgrade, the Data Plane will be unable to receive new configuration.
+
+---
+
 ## Conf Agent Pulling and Integration with BFE Hot Reload
 
 Conf Agent is a Sidecar component deployed alongside BFE, responsible for converting the configuration exported by InnerAPI into local files that BFE can load, and triggering BFE hot reload when configuration changes. Its overall flow is described in `conf-agent/AGENTS.md`.
@@ -369,6 +460,7 @@ After receiving `Data: null`, Conf Agent skips this write and hot reload; when a
 - The `config_versions` table records the mapping between configuration signatures and version numbers per topic, and is the basis of incremental sync;
 - InnerAPI currently exports thirteen configuration topics, corresponding to BFE's Server Data, GSLB, Cluster Table, certificates, extra files, `mod_ai_token_auth`, `mod_body_process`, `mod_ai_rate_limit`, `mod_ai_route`, AI cache, context compression, traffic mirror, and intent configuration;
 - `mod-api-key` solves the performance problems caused by cross-table queries and Entity hierarchy backtracking through batch preloading and in-memory backtracking;
+- Exported configuration supports field-level `enc$v1$` encryption: deterministic ciphertext keeps `data_sign` stable, prefix-less values pass through as plaintext to support grayscale migration; BFE decrypts with a multi-key keyring that is re-read on every load;
 - Conf Agent pulls configuration and completes hot reload through version directories, Symlink switching, and BFE's `/reload/{module}` interface;
 - The pull-based design decouples the Control Plane from the Data Plane, and supports cross-network-region deployment and rapid failure recovery.
 

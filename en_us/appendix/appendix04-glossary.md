@@ -2,6 +2,9 @@
 
 ## A
 
+**ai-gateway-controller (formerly Service Controller)**
+: A controller deployed inside a Kubernetes cluster; it watches Services carrying the `ai-gateway-api-name` label together with their same-named Endpoints, and for each named port reports the Ready instances in full via the InnerAPI `PUT /inner-api/v1/k8s_pools/{name}/instances` as a K8s pool. The Control Plane fans the pool members out to the Provider mirror and Cluster derived pools, which then reach BFE through the `cluster_table` export.
+
 **AI Business Cluster (Cluster)**
 : A logical backend unit that references a Provider and configures forwarding policies, determining how traffic is forwarded, which models are used, and how Key weights are distributed.
 
@@ -53,7 +56,7 @@
 : The hierarchical classification definition of an Entity, distinguishing levels via the `level` field; the smaller the value, the higher the level.
 
 **EPP (Endpoint Picker)**
-: A backend scheduler independent of BFE that takes over backend instance selection (load balancing) for Clusters in EPP mode; it is deployed in instance groups (primary/backup) and registered in the EPP instance pool.
+: A backend scheduler independent of BFE that takes over backend instance selection (load balancing) for Clusters in EPP mode; it is deployed in instance groups (exactly 1 instance per group in this release) and registered in the EPP instance pool.
 
 ## F
 
@@ -86,8 +89,8 @@
 
 ## K
 
-**K8s Pool**
-: The set of backend instances maintained via InnerAPI by the K8s discovery component; a Provider can switch its instance source (`instance_pool` / `k8s_pool`) and the result is delivered under the Effective Instance Pool contract.
+**K8s Pool (k8s_pool)**
+: The set of backend instances reported and maintained in full by ai-gateway-controller via the InnerAPI `/inner-api/v1/k8s_pools`; that controller is the sole writer of the pool members. A Provider can switch its instance source (`instance_pool` / `k8s_pool`) and the result is delivered under the Effective Instance Pool contract.
 
 **Key Affinity**
 : Session-level Key affinity implemented based on Redis; the same `ClientKeyId` keeps hitting the same Provider Key within a certain period of time; the Redis connection is held by the `[AIKeyAffinity]` section of `bfe.conf`.
@@ -173,7 +176,7 @@
 : The price level divided by time dimension in model pricing; only the `peak` (busy hours) tier is supported initially. The busy-hours windows are maintained in the Provider resource (tiered pricing configuration).
 
 **Token**
-: A programmatic access credential created via `/auth/tokens`, with two Scopes: `System` (full management permissions) and `Support` (read-only export permissions).
+: A programmatic access credential created via `/auth/tokens`, with Scopes `System` (full management permissions), `SystemReadonly` (read-only management permissions) and `Support` (read-only export permissions).
 
 **TPM (Tokens Per Minute)**
 : The upper limit of Token consumption per minute, using sliding window counting.

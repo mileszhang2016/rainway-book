@@ -10,6 +10,7 @@
 - 周期重置如何通过 Redis 分布式锁在多实例部署下互斥执行，以及原子 SET 与条件更新如何保证重置幂等；
 - `quota=0`（无余额计划）在控制面与数据面两侧的一致语义；
 - `RateLimitPolicy` 的 TPM、RPM、并发限制模型，以及策略如何按 Entity 层级向上合并并导出到 BFE；
+- 批量与异步任务（Batch）场景下 `batch_limits` 限流段与后付费配额的预留-结算-释放模型；
 - RMB 配额如何结合 Provider 时段模板与 Model 分时段价格实现高峰/空闲差异化计费；
 - 典型的配额与限流配置示例。
 
@@ -218,6 +219,7 @@ sequenceDiagram
 - **令牌与释放**：每个实例启动时生成唯一的 `instanceToken`（UUID），加锁时写入锁 value；释放锁时通过 Lua 脚本校验 `GET == token` 后才 `DEL`，避免持锁实例宕机后锁被其他实例误删，也避免过期后旧持有者误删新持有者的锁。
 - **看门狗续期**：持锁期间启动看门狗协程，按 TTL/3（约 100 秒）周期对锁执行 `EXPIRE` 续期，防止重置耗时超过 TTL 导致锁提前过期、其他实例中途抢锁造成并发重置。
 - **幂等兜底**：即使锁意外失效出现同周期重复重置，原子 SET 本身幂等；同时 `last_reset_at` 采用条件更新（`QuotaPlanFilter` 带有 `LastResetAtBefore = 周期起点` 字段，`ai-gateway-api/model/quota/quota_plan.go`），同周期内第二次更新的影响行数为 0，不再推进重置水位。
+- **先认领后重置**：调度器先做条件认领更新（`last_reset_at IS NULL OR last_reset_at < 周期起点`，`TQuotaPlanClaimPeriodReset`），仅当影响行数 > 0 时才执行本轮的 Redis 原子重置，同一周期内全局至多重置一次；`weekly` / `monthly` 计划在创建时把 `last_reset_at` 初始化为创建时间（`never` 保持 NULL），使 SQL 三值逻辑（`NULL < x` 恒不成立）不会让存量 NULL 行陷入"认领恒 0 行却仍报成功"的每分钟重复重置。
 
 ---
 
@@ -243,6 +245,7 @@ CREATE TABLE rate_limit_policies (
     max_concurrency INT DEFAULT NULL,
     tpm_configs JSON DEFAULT NULL,
     rpm_configs JSON DEFAULT NULL,
+    batch_limits JSON DEFAULT NULL,
     create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     update_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
@@ -285,7 +288,35 @@ TPM 与 RPM 规则以 JSON 数组形式存储在 `tpm_configs` 与 `rpm_configs`
 - `max_concurrency` 必须 ≥ 0；
 - 每条规则的 `name` 必填、非空、长度 1-128 字符，字符集限制为 `[a-zA-Z0-9_-]`；
 - `name` 在同一策略内唯一；重命名一条规则等价于删除旧规则并新增规则（见下文“Redis Key 稳定性”）；
-- `model` 不能为空，`limit` 必须 ≥ 0。
+- `model` 不能为空，`limit` 必须 ≥ 0；
+- `enabled=true` 的策略，`rules` 至少要配置 `tpm`、`rpm`、`max_concurrency`、`batch_limits` 四者之一；四者全部缺失时返回 422，并在文案中提示需要配置的维度；
+- `tpm` / `rpm` 每条规则的 `limit`、`max_concurrency`、`batch_limits` 各数值字段均须 ≥ 0；0 是合法取值，`max_concurrency=0` 与 `batch_limits` 中取 0 的字段在数据面不启用该维度。
+
+### batch_limits：批量任务限流段
+
+为支撑批量与异步任务（`/v1/files`、`/v1/batches` 端点族，见[第三十二章 Token认证与配额模块实现：mod_ai_token_auth](../implementation/chapter32-mod-ai-token-auth.md)），限流策略的 `rules` 含可选的 `batch_limits` 段。该段属于共享的 `RateLimitPolicy` 类型，既可出现在 `/rate-limit-policies` 资源中，也可出现在 API-Key 与 Entity 的内联 `rate_limit_policy.rules` 中：
+
+```json
+{
+  "batch_limits": {
+    "max_create_rpm": 60,
+    "max_active_batches": 10,
+    "max_file_bytes": 104857600,
+    "max_file_lines": 1000000
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `max_create_rpm` | 每分钟允许创建的 batch 数上限（create 操作 RPM） |
+| `max_active_batches` | 单个 API-Key 同时处于活跃（未终态）状态的 batch 数上限 |
+| `max_file_bytes` | 上传文件字节数硬顶 |
+| `max_file_lines` | 上传文件行数硬顶 |
+
+`batch_limits` 省略或为 `null` 表示该策略不参与批量限流。控制面导出时把该段写入 BFE `ai_rate_limit.data` 的 `rules.batch` 段；BFE 侧 `mod_ai_rate_limit` 按操作类型（`bfe_basic.ClassifyBatchOp` 分类的 create / upload 等）分别执行 create RPM、活跃 batch 数、文件字节/行数硬顶检查：create RPM 与活跃 batch 数超限返回 429，文件硬顶超限返回 413 `BATCH_FILE_TOO_LARGE`。文件字节/行数硬顶还会与 `mod_ai_batch.data` 中的全局硬顶合并取最小值作为生效值，即使 API-Key 未绑定任何限流策略，全局硬顶同样生效（实现细节见[第三十三章 限流模块实现：mod_ai_rate_limit](../implementation/chapter33-mod-ai-rate-limit.md)）。
+
+`batch_limits` 的配置入口与 TPM/RPM/并发一致：独立策略资源（`POST/PUT /rate-limit-policies`）与 API-Key / Entity 的内联 `rate_limit_policy` 使用同一 `RateLimitPolicy` 结构，由同一 `validate.RateLimitPolicy` 校验（`endpoints/openapi_v1/api_key/checker.go`、`endpoints/openapi_v1/entity/validator.go`），内联策略同样落库到 `rate_limit_policies` 行。各维度按 API-Key 计数（`max_active_batches` 比较该 `ClientKeyId` 的活跃 batch 数），并随 Entity 层级向上合并：API-Key 与各层 Entity 的策略都会参与检查，同一维度按 AND 生效（等价于取最小值），文件字节/行数再与 `mod_ai_batch.data` 全局硬顶取最小值。控制台当前未提供该段的表单，可经 OpenAPI 配置。
 
 ---
 
@@ -374,6 +405,16 @@ BFE 收到配置后：
 3. 命中规则后，使用规则中的 `redis_key` 构建 Redis 计数器 key 进行限流检查；
 4. 同时检查 `max_concurrency`；
 5. 任一限制超出时返回 429 Too Many Requests。
+
+## 上游 Key 耗尽：429 NO_AVAILABLE_KEY
+
+限流返回的 429 表示"调用方超限"，而 `NO_AVAILABLE_KEY` 表示"网关上没有可用的上游凭证"，两者同为 429 但归因不同：
+
+- 集群内候选 Key 全部处于惩罚期（429 惩罚 60s，401/402/403 惩罚 3600s；仅在开启会话亲和惩罚时写入）时，Key 选择返回空候选，转发循环合成 429 `NO_AVAILABLE_KEY`（type `rate_limit_error`，message `no available upstream api key for this cluster`），响应带 `Retry-After` 与 `error.details.retry_after_seconds`，两者固定为 60s；
+- Key 惩罚过滤跳过 `Weight=0` 的 Key：它们既不参与选择，也不计入候选数；
+- 候选集为空即表现为该集群的熔断：本次 attempt 不再轮换 Key，按 fallback 规则降级到备用集群；TTL 到期后 Key 自动恢复可用，无需人工介入。
+
+该错误不消耗调用方的 QuotaPlan 余额，也不计入 RateLimitPolicy 的限流计数。排障时应检查上游 Provider 的凭证有效性与集群 Key 池规模，而不是调整限流策略。
 
 ---
 
@@ -476,6 +517,38 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
 
 ---
 
+## 批量任务的后付费配额：预留-结算-释放
+
+批量与异步任务（OpenAI Batch API，`/v1/files` + `/v1/batches`）的计费与普通请求有本质区别：batch 创建时最终 Token 用量未知，结果文件由客户在异步任务完成后按需下载，费用不能在请求结束时立即结算。为此系统引入"预留-结算-释放"三态对账模型：
+
+1. **预留（reserve）**：`POST /v1/batches` 创建时做配额预检并预留额度（数据面 `mod_ai_batch` 以 Redis `SETNX` 先到先得的方式做 batch 级 key 亲和，同一 batch 的后续操作路由到同一数据面实例）；
+2. **结算（settle）**：结果文件下载时按 batch 价、按模型结算实际费用；
+3. **释放（release）**：batch 被取消或进入终态时释放预留额度。
+
+幂等由 `BATCH_RESERVE_BATCH:<batch_id>`（预留簿记）与 `BATCH_SETTLED`（结算去重 SETNX 锁）两个 Redis 标记保证：重复结算、重复释放、404 后重试等路径都收敛到同一终态。结算金额按基价计算：`settle_units = usage_in × input_cost_per_token + usage_out × output_cost_per_token`（batch 价与折扣的定义见[第十三章 模型定价与成本核算设计](./chapter13-model-pricing.md)；tier 时段价一期未接入批量结算）。
+
+### 控制面数据与对账
+
+控制面以两张表承载批量任务数据：
+
+- `batch_files`：上传的文件实体（含方向、行数、字节数等元数据）；
+- `batch_tasks`：batch 任务实体，承载 OpenAI batch 状态机（`validating` / `in_progress` / `completed` / `failed` / `cancelled` 等）以及预留-结算-释放三态对账状态。
+
+Redis 键契约（`ai-gateway-api/model/ibatch/redis_keys.go`）：
+
+| Redis Key | 说明 |
+|-----------|------|
+| `BATCH_FILE:<cluster>:<file_id>` | 文件实体（dir 等字段） |
+| `BATCH_TASK:<batch_id>`（hash） | 任务实体与状态 |
+| `BATCH_RESERVE_BATCH:<batch_id>` | 预留簿记，取消/终态时释放 |
+| `BATCH_SETTLED:<batch_id>` | 结算去重标记（SETNX 锁） |
+
+对账由控制面 batch reconcile job 执行：通过 MySQL named lock 在多个 AI Gateway API 实例间互斥协调，使用 Redis `SCAN` 遍历任务键，同步任务实体、推进状态、兜底结算（例如数据面实例宕机导致的结算残留）。该 job 默认关闭，在配置中设置 `[BatchJob] Enable=true` 开启（`ai-gateway-api/stateful/config.go` 的 `BatchJobConfig`）。
+
+数据面 `mod_ai_batch` 模块的实现细节（上传行/字节计数、大文件流式转发、key 亲和、按 batch 价结算）见[第三十二章 Token认证与配额模块实现：mod_ai_token_auth](../implementation/chapter32-mod-ai-token-auth.md)；批量限流的 `batch_limits` 实现见[第三十三章 限流模块实现：mod_ai_rate_limit](../implementation/chapter33-mod-ai-rate-limit.md)。
+
+---
+
 ## 配额与限流配置示例
 
 ### QuotaPlan 示例
@@ -557,7 +630,13 @@ func (table *ModelTable) ActiveTierName(now time.Time) string {
           "burst": 1
         }
       ],
-      "max_concurrency": 50
+      "max_concurrency": 50,
+      "batch_limits": {
+        "max_create_rpm": 60,
+        "max_active_batches": 10,
+        "max_file_bytes": 104857600,
+        "max_file_lines": 1000000
+      }
     }
   }
 }
@@ -616,6 +695,8 @@ Model 价格：
 - `quota=0` 表示无余额计划：控制面正常计算并同步余额，数据面将其视为合法配置，命中请求返回 429 QuotaExhausted，Redis 余额 key 缺失视为耗尽而非 500。
 - `RateLimitPolicy` 提供 TPM、RPM、并发数三类限制，规则支持具体模型名或 `*` 默认匹配；导出时按 Entity 层级向上合并，生成 `rate_limit_policies.json` 与 `api_key_rl_policy_bindings.json`。
 - 控制面为每条 TPM/RPM 规则按规则名生成 Redis Key（形如 `default_bfe_rlp-<id>_RL_TPM_rlp-<id>_<name>`）：重命名规则等价于删除旧规则并新增规则（计数器清零），修改 `model` 等其它字段不会重置计数器。
+- `rate_limit_policies` 含可空的 `batch_limits` 段（create RPM、活跃 batch 数、文件字节/行数硬顶），省略即不参与批量限流；导出后生成 BFE `ai_rate_limit.data` 的 `rules.batch` 段，文件硬顶与 `mod_ai_batch.data` 全局硬顶合并取最小值，未绑定策略的 API-Key 同样受全局硬顶约束。
+- 批量任务采用后付费配额的"预留-结算-释放"三态对账：create 时预检预留、结果文件下载时按 batch 价结算、取消/终态释放；控制面以 `batch_files` / `batch_tasks` 表与 `BATCH_FILE` / `BATCH_TASK` / `BATCH_RESERVE_BATCH` / `BATCH_SETTLED` Redis 键契约承载，对账 job 由 `[BatchJob] Enable=true` 开启，多实例间以 MySQL named lock 协调。
 - RMB 配额支持分时段定价：Provider 维护 `time_zone` 与 `tiers`，Model 维护 `tier_prices`，导出后由 BFE 根据请求时刻匹配 tier 并选择对应价格，未命中时 fallback 到默认价格。
 
 ---
@@ -640,3 +721,7 @@ Model 价格：
 - `ai-gateway-api/model/rate_limit_policy/rate_limit_policy_manager.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/data_load.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/policy_limiter.go`
+- `bfe/bfe_modules/mod_ai_rate_limit/batch_check.go`
+- `ai-gateway-api/model/ibatch/redis_keys.go`
+- `ai-gateway-api/stateful/config.go`
+- `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/batches.md`

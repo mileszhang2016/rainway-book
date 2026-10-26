@@ -32,6 +32,8 @@ Conf Agent 的代码位于仓库根目录的 `conf-agent/` 下。按照功能可
 
 一个典型的生产配置文件见 `conf-agent/conf/conf-agent.toml`，其中为 `server_data_conf`、`cluster_conf`、`tls_conf` 以及 `mod_ai_route`、`mod_ai_token_auth`、`mod_ai_rate_limit`、`mod_body_process`、`mod_ai_cache`、`mod_traffic_mirror`、`mod_ai_intent`、`mod_ai_context` 等 11 个模块分别定义了 `Reloader`。
 
+值得注意的是，示例配置中整个 `[Reloaders.tls_conf]` 段（含 `CopyFiles` 与 `[[Reloaders.tls_conf.ExtraFileTasks]]`）默认被注释掉：ai-gateway-api 目前不支持 TLS 配置下发，启用该 Reloader 会使 prober 轮询持续产生大量 error 级日志；而 TLS 特性（服务端证书、client CA/CRL 下发，见下文"附加文件任务"一节）在当前部署中并不使用。将来启用 TLS 时取消注释即可恢复该 Reloader，无需任何 Go 代码改动。相应地，上文提到的"11 个模块"是示例配置的完整形态，实际生效的 Reloader 集合以各部署自己的 `conf-agent.toml` 为准。
+
 ## Agent 与 Reloader 生命周期
 
 ### 启动流程
@@ -591,7 +593,7 @@ if runtime.GOOS == "windows" && targetInfo.IsDir() {
 
 Conf Agent 是壬远 AI 网关实现“控制面下发、数据面无中断加载”的关键组件。本章围绕其源码实现，重点阐述了以下内容：
 
-- **目录与模块划分**：`main.go`、`agent`、`conf_reload` 三个层级各司其职，`prober`、`file_store`、`trigger` 完成拉取、存储、触发三步。
+- **目录与模块划分**：`main.go`、`agent`、`conf_reload` 三个层级各司其职，`prober`、`file_store`、`trigger` 完成拉取、存储、触发三步；示例配置中 `[Reloaders.tls_conf]` 段因 ai-gateway-api 暂不支持 TLS 配置下发而默认注释，启用 TLS 时取消注释即可，无需 Go 代码改动。
 - **生命周期**：`Agent` 管理多个 `Reloader` goroutine，每个 `Reloader` 按 `ReloadInterval` 轮询，启动时加入随机抖动避免惊群。
 - **配置拉取**：普通任务一对一拉取；多 Key JSON 任务从一个大 JSON 中拆分多个文件；附加文件任务通过 JSON Path 解析并下载证书等额外资源。
 - **版本化存储**：每次生成 `ConfDir_{version}` 临时目录，写入 `.conf-agent-version` 标记；切换时通过 symlink/junction 原子指向新版本。

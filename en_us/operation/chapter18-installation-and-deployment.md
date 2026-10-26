@@ -20,7 +20,7 @@ The Rainway AI Gateway adopts a layered **Control Plane + Data Plane** architect
 - **BFE**: the Data Plane forwarding engine, responsible for routing, authentication, rate limiting, and forwarding of AI traffic. The corresponding repository is `bfenetworks/bfe`.
 - **Conf Agent**: the configuration agent, which communicates with the Control Plane and triggers hot reload of BFE configurations. The corresponding repository is `bfenetworks/conf-agent`.
 - **Dashboard**: the visual management console, usually served as static assets mounted into AI Gateway API.
-- **Service Controller**: a Kubernetes service discovery component, deployed optionally.
+- **ai-gateway-controller** (formerly Service Controller): a Kubernetes service discovery component that reports the Ready instances of Services/Endpoints carrying the `ai-gateway-api-name` label as a K8s pool (InnerAPI `k8s_pools`); deployed optionally.
 - **Log Reader**: the access-log collection component, deployed with BFE in the Data Plane. It forwards BFE access logs to Kafka or MySQL for the reporting and observability pipelines. The corresponding repository is `rainway-ai-gateway/log-reader`.
 
 In addition, the reporting standard form (one of Doris / ClickHouse / StarRocks, with Grafana optional as the presentation layer) relies on a set of optional external components: Kafka receives log messages from log-reader, the data warehouse stores detail and aggregated data, and Grafana renders the monitoring dashboards (optional). These observability components are not part of the AI Gateway itself; the one-click deployment scripts for the storage and presentation layers are provided by the `rainway-ai-gateway/ai-gateway-observability` repository, as described in "Deploying the Reporting Standard Form" below.
@@ -98,7 +98,7 @@ make
 The key targets defined in `ai-gateway-api/Makefile` are:
 
 - `make build`: compiles the `./ai-gateway-api` binary.
-- `make package`: copies `conf/`, `static/`, `db_ddl.sql`, etc. into `output/`.
+- `make package` (i.e., `package-bin`): copies `conf/`, `static/`, `scripts/`, `database/`, `db_ddl.sql`, `db_ddl_sqlite.sql`, `db_ddl_report_mysql.sql`, etc. into `output/`, forming a complete release package.
 - `make docker`: builds a local container image.
 - `make docker-push REGISTRY=...`: builds multi-architecture images and pushes them.
 
@@ -113,11 +113,14 @@ After compilation, the `output/` directory has the following structure:
 
 ```text
 output/
-├── ai-gateway-api      # Executable
-├── conf/               # Configuration files
-├── static/             # Dashboard static assets
-├── db_ddl.sql          # MySQL initialization script
-└── db_ddl_sqlite.sql   # SQLite initialization script
+├── ai-gateway-api             # Executable
+├── conf/                      # Configuration files
+├── static/                    # Dashboard static assets
+├── scripts/                   # Deployment scripts (including the SQLite local deployment script)
+├── database/                  # Incremental upgrade scripts per version (e.g., db_ddl_upgrade_to_0.0.11.sql)
+├── db_ddl.sql                 # MySQL initialization script
+├── db_ddl_sqlite.sql          # SQLite initialization script
+└── db_ddl_report_mysql.sql    # Report detail/aggregation table DDL (MySQL form)
 ```
 
 ### Starting the Service
@@ -149,7 +152,7 @@ Visiting `http://localhost:8183` opens the Dashboard; the default username and p
 
 ## Database Initialization
 
-AI Gateway API uses a relational database to store configurations. It currently supports two backends: MySQL 8 and SQLite.
+AI Gateway API uses a relational database to store configurations. It currently supports two backends: MySQL 8 and SQLite. Incremental schema changes between versions are archived as upgrade scripts in the repository's `database/` directory (e.g., `database/db_ddl_upgrade_to_0.0.11.sql`) and shipped with the release package.
 
 ### MySQL Initialization
 
@@ -189,24 +192,27 @@ ConnMaxLifetimeInMs  = 50000
 
 For production, it is recommended to create a dedicated database account for AI Gateway and restrict the source IP addresses allowed to connect.
 
-### SQLite Initialization
+### SQLite Local Single-Machine Deployment
 
-For testing or single-machine environments, you can use SQLite and skip installing MySQL. Run the SQLite initialization script:
+For testing or single-machine evaluation environments, you can use SQLite and skip installing both MySQL and Redis. The repository provides a one-click deployment script `scripts/deploy_local_sqlite.sh` with a dedicated configuration `conf/ai_gateway_api_sqlite.toml` (deployment notes in `ai-gateway-api/docs/zh_cn/deploy_local_sqlite.md`):
+
+- **Pure-Go SQLite driver, no CGO**: `[Databases.bfe_db]` uses `Driver = "sqlite-strip"` (based on `github.com/glebarez/go-sqlite`, with the unsupported `FOR UPDATE` clause stripped), and `DBName = "./data/ai_gateway.db"` points to the local database file.
+- **In-memory Redis Mock**: in `[RedisConf]`, `Bns = "mock"` together with `ClusterMode = "mock"` replaces the real Redis with an in-process mock, so a single machine is sufficient.
+- **One-click initialization and startup**: the script automatically initializes the SQLite database (applying `db_ddl_sqlite.sql`, preferring the `sqlite3` CLI and falling back to `python3`) and starts the service. It supports `--reinit` (drop and recreate the database — data will be lost) and `--no-start` (initialize only). Build and deployment are separate steps — the script does not compile; it requires the root binary `./ai-gateway-api` built beforehand via `make` (per the deployment document, the `output/` artifact is reused when the root binary is missing), and prompts you to build first when neither exists.
 
 ```bash
-sqlite3 open_bfe.db < db_ddl_sqlite.sql
+cd ai-gateway-api
+make                                  # independent build step, produces ./ai-gateway-api
+./scripts/deploy_local_sqlite.sh      # initializes ./data/ai_gateway.db and starts the service
 ```
 
-Then adjust the database driver and address in `ai_gateway_api.toml`:
+The equivalent manual startup command is:
 
-```toml
-[Databases.bfe_db]
-DBName = "open_bfe"
-Addr   = "./open_bfe.db"
-Driver = "sqlite3"
+```bash
+./ai-gateway-api -c ./conf -sc ai_gateway_api_sqlite.toml -l ./log
 ```
 
-SQLite is suitable for functional validation and development debugging; it is not recommended for high-concurrency production scenarios.
+Scope: this solution is only for single-instance local deployment; multi-instance deployments must use MySQL and a real Redis. See `ai-gateway-api/docs/zh_cn/deploy_local_sqlite.md` for details.
 
 ## Deploying the Reporting Lightweight Form (Optional)
 
@@ -394,7 +400,7 @@ bash setup.sh
 bash setup.sh ./setup_test.conf
 ```
 
-`clickhouse/setup.sh` creates the database and five kinds of objects in six steps: the database (default `bfe_observability`); the detail table `bfe_ai_request_log` (MergeTree, `ORDER BY (hostid, log_time, ai_apikey_id, ai_requested_model)`, `PARTITION BY toDate(log_time)`, `TTL 7 days`; `logid` is UInt64, since the BFE request unique identifier exceeds the Int64 limit); the Kafka engine staging table `bfe_ai_log_kafka` (`JSONEachRow` format, with its own consumer group `clickhouse_bfe_ai_log`); the consuming MV `bfe_ai_log_load_mv` (JSON flattening + UTC wall-clock conversion); the aggregation table `bfe_ai_metrics_1m` (SummingMergeTree, 40 dimensions + 24 metrics, `ORDER BY` on all dimension columns, `TTL 7 days`); and the aggregation MV `bfe_ai_metrics_1m_mv` (`toStartOfMinute` minute buckets, second-level latency). The database name, Kafka address, topic, and consumer group are all parameterized in `setup.conf` / `setup_test.conf`. If a deployment fails and you need a clean retry, use `clickhouse/cleanup.sh`.
+`clickhouse/setup.sh` creates the database and five kinds of objects in six steps: the database (default `bfe_observability`); the detail table `bfe_ai_request_log` (MergeTree, `ORDER BY (hostid, log_time, ai_apikey_id, ai_requested_model)`, `PARTITION BY toDate(log_time)`, `TTL 7 days`; `logid` is UInt64 DEFAULT 0 — BFE generates logid ≤ 2^63-1, which fits losslessly into a signed BIGINT; the detail table has no unique-key merge and the ORDER BY is four columns); the Kafka engine staging table `bfe_ai_log_kafka` (`JSONEachRow` format, with its own consumer group `clickhouse_bfe_ai_log`); the consuming MV `bfe_ai_log_load_mv` (JSON flattening + UTC wall-clock conversion); the aggregation table `bfe_ai_metrics_1m` (SummingMergeTree, 40 dimensions + 24 metrics, `ORDER BY` on all dimension columns, `TTL 7 days`); and the aggregation MV `bfe_ai_metrics_1m_mv` (`toStartOfMinute` minute buckets, second-level latency). The database name, Kafka address, topic, and consumer group are all parameterized in `setup.conf` / `setup_test.conf`. If a deployment fails and you need a clean retry, use `clickhouse/cleanup.sh`.
 
 ### Step 2: Configure AI Gateway API
 
@@ -468,7 +474,7 @@ bash setup.sh
 bash setup.sh ./setup_test.conf
 ```
 
-`starrocks/setup.sh` creates the following in four steps: the database (default `bfe_observability`); the detail table `bfe_ai_request_log` (DUPLICATE KEY, 102 columns; the 5 nested columns `req_headers` / `res_headers` / `ai_route_rule_hits` / `ai_cluster_key_names` / `ai_rate_limit_hits` carry JSON text in VARCHAR — SR 3.5 Routine Load does not support nested-structure ingestion — for detail display only; dynamic partitioning `start=-7` / `end=3`; `DISTRIBUTED BY HASH(ai_apikey_id) BUCKETS 32`; `logid` is BIGINT, and out-of-range values are rejected on write); the materialized view `bfe_ai_metrics_1m` (`REFRESH ASYNC EVERY (INTERVAL 1 MINUTE)`, with an explicit leading column `ts_day` as the partition column and `partition_ttl=7 DAY`; the MV name is the report query contract name, so queries are unaware of it); and the Routine Load `bfe_ai_log_load` (consumer group `starrocks_bfe_ai_log`, `kafka_default_offsets=OFFSET_BEGINNING`, `max_error_number=1000`). If a deployment fails and you need a clean retry, use `starrocks/cleanup.sh`.
+`starrocks/setup.sh` creates the following in four steps: the database (default `bfe_observability`); the detail table `bfe_ai_request_log` (DUPLICATE KEY, 102 columns; the 5 nested columns `req_headers` / `res_headers` / `ai_route_rule_hits` / `ai_cluster_key_names` / `ai_rate_limit_hits` carry JSON text in VARCHAR — SR 3.5 Routine Load does not support nested-structure ingestion — for detail display only; dynamic partitioning `start=-7` / `end=3`; `DISTRIBUTED BY HASH(ai_apikey_id) BUCKETS 32`; `logid` is BIGINT NOT NULL DEFAULT 0 — BFE generates logid ≤ 2^63-1, which naturally falls within the signed BIGINT range); the materialized view `bfe_ai_metrics_1m` (`REFRESH ASYNC EVERY (INTERVAL 1 MINUTE)`, with an explicit leading column `ts_day` as the partition column and `partition_ttl=7 DAY`; the MV name is the report query contract name, so queries are unaware of it); and the Routine Load `bfe_ai_log_load` (consumer group `starrocks_bfe_ai_log`, `kafka_default_offsets=OFFSET_BEGINNING`, `max_error_number=1000`). If a deployment fails and you need a clean retry, use `starrocks/cleanup.sh`.
 
 ### Step 2: Configure AI Gateway API
 
@@ -855,6 +861,54 @@ When deploying in Kubernetes, also note the following:
 - As the Data Plane, BFE is usually deployed as a DaemonSet on every edge node, or as a Deployment exposed via a load balancer.
 - When Conf Agent and BFE are deployed in the same Pod, an `emptyDir` volume is sufficient to share the configuration directory; if you need to persist historical versions, use `hostPath` or a PVC instead.
 
+### Deploying ai-gateway-controller
+
+`ai-gateway-controller` is a controller running in the business Kubernetes cluster. It reports the Ready instances of Services/Endpoints carrying the `ai-gateway-api-name` label as a K8s pool. Deploy it only when Kubernetes service discovery is needed.
+
+**Prerequisites**
+
+- Kubernetes v1.18+; the cluster allows creating ServiceAccounts, ClusterRoleBindings, Deployments, and ConfigMaps.
+- AI Gateway API version ≥ v0.0.11 (that version provides the InnerAPI `/inner-api/v1/k8s_pools`). When upgrading, upgrade AI Gateway API first, then the controller.
+- A Token created in the console under "User Management → Token" (`POST /open-api/v1/auth/tokens`). The Token must belong to the System Scope: the controller needs write access to the `k8s_pools` domain, while the Support Scope lacks the K8sPool feature and the call returns 402.
+
+**Manifests**
+
+The manifests live in `ai-gateway-controller/examples/deploy/`:
+
+| File | Content |
+|---|---|
+| `yf-ai-gateway-controller-sa.yaml` | ServiceAccount `bfe-ai-gateway-controller` and ClusterRoleBinding |
+| `yf-ai-gateway-controller.yaml` | Deployment `bfe-ai-gateway-controller` (`replicas: 1`, `Recreate`), probes, and security context |
+
+The example ClusterRoleBinding grants `cluster-admin`. In production it can be narrowed to: Services get/patch/list/watch, Endpoints get/list/watch, ConfigMaps create/update/delete/get, and Events create/patch.
+
+**Required arguments**
+
+The required arguments are `--ai-gateway-api-name`, `--ai-gateway-api-addr`, and `--ai-gateway-api-token`; none may be empty (the latter two have placeholder defaults in code and must be overridden in real deployments). `--k8s-cluster-name` must not be empty (the built-in default is `testk8s`, but production should set it explicitly).
+
+```yaml
+args:
+  - '-ai-gateway-api-name=rainway-ai-gateway-demo'
+  - '-ai-gateway-api-addr=http://ai-gateway-api:8183/'
+  - '-ai-gateway-api-token=Token <your-token>'
+  - '-k8s-cluster-name=szyf'
+  - '-namespace=rainway-ai-gateway'
+```
+
+Other common arguments: `--namespace` (comma-separated; `*` or empty means all namespaces), `--retry-interval-unit-sec` (when > 0, errors are requeued after that many seconds), `--force-rm-finalizer`, `--skip-nil-svc-delete` (default `true`), `--metrics-bind-address` (`:9080`), `--health-probe-bind-address` (`:9081`), `--readiness-endpoint-name` (`/readyz`), `--liveness-endpoint-name` (`/healthz`), `--pprof-address`, and the zap logging arguments.
+
+**Probes and ports**
+
+The Deployment exposes `9081` for `/healthz` and `/readyz`; metrics are served on `9080`.
+
+**Label and port conventions**
+
+Every Service to be discovered must carry the `ai-gateway-api-name` label whose value matches the `--ai-gateway-api-name` argument (`*` matches any). Every port to be reported must have a name; unnamed ports are skipped.
+
+**Verification**
+
+Check the `k8s.bfenetworks.com/k8spool-result` annotation on the Service and the `<service>.result` ConfigMap, or query `GET /inner-api/v1/k8s_pools` on AI Gateway API.
+
 ## Multi-Component Startup Order
 
 A complete production deployment involves three core components: AI Gateway API, BFE, and Conf Agent. The recommended startup order is:
@@ -1019,8 +1073,8 @@ redis-cli -h 127.0.0.1 -p 6379 ping
 This chapter systematically covered the installation and deployment of the Rainway AI Gateway:
 
 - The Control Plane depends on Go 1.22, MySQL 8, and Redis 6.2; Redis, used for quota balances, rate limit counters, and session cache, is a critical runtime dependency. The Data Plane BFE and Conf Agent must be deployed on the same machine.
-- Running `make` completes the source compilation and packaging of AI Gateway API.
-- The database supports MySQL and SQLite; MySQL is recommended for production with the character set `utf8mb4`.
+- Running `make` completes the source compilation and packaging of AI Gateway API; the release package (`make package-bin`) includes `conf/`, `static/`, `scripts/`, `database/`, and all DDL scripts.
+- The database supports MySQL and SQLite; MySQL is recommended for production with the character set `utf8mb4`; incremental upgrade scripts between versions are archived in the `database/` directory. For single-machine evaluation, the SQLite local deployment solution (`scripts/deploy_local_sqlite.sh` + `conf/ai_gateway_api_sqlite.toml`, pure-Go driver with no CGO, in-memory Redis Mock) is available — it applies to single instances only, and multi-instance deployments must switch to MySQL + real Redis.
 - The minimal runnable configuration requires adjusting the database connection and the Redis logical name; the real Redis address is resolved via `name_conf.data`.
 - Container images can be built with `make docker`, and cluster deployment uses Kubernetes Deployments, Services, and DaemonSets.
 - The multi-component startup order is: database initialization → AI Gateway API → BFE → Conf Agent, ensuring the Data Plane promptly receives the latest configuration distributed by the Control Plane.
@@ -1035,7 +1089,9 @@ This chapter references the following project documentation and code:
 
 - `ai-gateway-api/README.md`: project overview, quick start, and containerized deployment entry point.
 - `ai-gateway-api/docs/zh_cn/deploy.md`: deployment steps for the BFE Control Plane components and TLS configuration notes.
+- `ai-gateway-api/docs/zh_cn/deploy_local_sqlite.md`: SQLite local single-machine deployment (one-click script, parameters, and scope).
 - `ai-gateway-api/docs/zh_cn/config_param.md`: complete configuration parameter description for `ai_gateway_api.toml`.
+- `ai-gateway-api/database/db_ddl_upgrade_to_0.0.11.sql`: incremental upgrade script for the Control Plane database from v0.0.10 to v0.0.11.
 - `ai-gateway-api/Makefile`: build, packaging, Docker image build, and push targets.
 - `conf-agent/AGENTS.md`: Conf Agent architecture, build method, and local startup commands.
 - `conf-agent/docs/zh_cn/config/config.md`: detailed description of the Conf Agent configuration file.

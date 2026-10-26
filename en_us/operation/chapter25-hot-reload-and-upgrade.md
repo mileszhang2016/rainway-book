@@ -365,6 +365,8 @@ ALTER TABLE bfe_ai_metrics_1m
   ADD COLUMN ai_intent_answer VARCHAR(64) NOT NULL DEFAULT '' AFTER mirror_hit;
 ```
 
+For upgrades from v0.0.10.x to v0.0.11, a ready-made incremental script is available: `database/db_ddl_upgrade_to_0.0.11.sql` (archived in the `database/` directory and shipped with the release package). It covers the schema differences between the two versions (such as `clusters.epp_runtime`, the enlarged `api_keys.api_key` column with the `api_key_hash` lookup-hash column, and `model_prices.batch_discount`; `epp_assignments` no longer has the `primary_instance_id` column, as EPP assignment granularity converges to instance groups, with a rollback `ADD COLUMN` attached). The `api_key_hash` column must be backfilled by the application (HMAC-SHA256, which SQL cannot compute) before the unique key is switched following the manual steps at the end of the script.
+
 Before upgrading, be sure to:
 
 - Make a full backup of the production database;
@@ -430,9 +432,10 @@ According to `upgrade.md`, the v0.0.2 upgrade requires:
 Taking the upgrade to v0.0.11 as another example, the matching requirements are:
 
 - AI Gateway API upgraded to v0.0.11;
-- Dashboard kept at v0.0.10;
+- Dashboard upgraded to v0.0.11;
 - Conf Agent upgraded to v0.0.8, with confirmation that the four Reloaders `mod_ai_cache`, `mod_traffic_mirror`, `mod_ai_intent`, and `mod_ai_context` are configured;
-- BFE upgraded to v1.8.9, and evaluate as described in the previous section whether `bfe.conf` needs the `[AIKeyAffinity]` section added.
+- BFE upgraded to v1.8.9, and evaluate as described in the previous section whether `bfe.conf` needs the `[AIKeyAffinity]` section added;
+- ai-gateway-epp and the frontend released in lockstep with AI Gateway API (the EPP-related components are mutually incompatible; a mixed deployment results in all-no-match EPP matching with an explicit alert).
 
 The recommended upgrade order is:
 
@@ -442,6 +445,18 @@ The recommended upgrade order is:
 4. Upgrade the Dashboard;
 5. Upgrade Conf Agent as needed and check its configuration;
 6. Observe the Conf Agent logs and BFE monitoring metrics to confirm that configurations are synchronizing normally.
+
+### EPP Components Must Be Released in Lockstep
+
+The EPP (endpoint pool) related components — ai-gateway-epp, ai-gateway-api (including the database schema upgrade), and the frontend — must be released in lockstep at the same version; old and new versions are mutually incompatible. During a mixed deployment, EPP matching returns all no-match and raises an explicit alert about the version mismatch, avoiding a silent degradation to plain routing.
+
+### Hard Ordering Constraint: Upgrade BFE Before Enabling Encrypted Exports
+
+Once the Control Plane supports encrypted configuration exports with enc$v1$ (`[Security].EncryptExports`), older BFE versions cannot parse the encrypted configuration. Therefore, all BFE instances must be fully upgraded first, and only after the Data Plane is confirmed ready should encrypted configuration export be enabled on the Control Plane; reversing the order causes unupgraded BFE instances to fail when pulling configurations.
+
+### User Password Upgrade
+
+For the user password storage upgrade (plaintext → bcrypt hash), the code must be upgraded first — never rewrite the data first: existing plaintext passwords are migrated lazily, being re-hashed and persisted on the first successful login. Bulk-rewriting password data ahead of the code upgrade would leave the old code unable to verify passwords and lock users out.
 
 ---
 
@@ -506,12 +521,15 @@ ls -l mod_ai_token_auth
 - The active version can be checked via the Conf Agent log, the symlink target, or the `version` field in the configuration file; the summary ERROR `reload keeps failing` (with the stage field) emitted every 10 consecutive reload failures is the signal for recognizing a stuck reload loop.
 - Version rollback can use the historical version directories retained by Conf Agent: manually switch the symlink and reload, without restarting BFE.
 - When upgrading, perform database migration, AI Gateway API replacement, Dashboard upgrade, and Conf Agent configuration checks in order, and pay attention to the compatibility of authentication headers, database DDL, and configuration fields (such as the `[AIKeyAffinity]` section of BFE `bfe.conf` and the `Reloader`s of new Conf Agent modules).
+- The v0.0.10.x → v0.0.11 upgrade ships a ready-made incremental script `database/db_ddl_upgrade_to_0.0.11.sql` (including dropping `primary_instance_id` from `epp_assignments` and adding the `api_key_hash` column to `api_keys`); the EPP-related components (ai-gateway-epp, ai-gateway-api, schema, frontend) must be released in lockstep at the same version, and a mixed deployment produces all-no-match EPP matching with an explicit alert.
+- Hard ordering constraints: upgrade all BFE instances before enabling encrypted configuration export enc$v1$ (`[Security].EncryptExports`) on the Control Plane; for the user password upgrade, upgrade the code first and never rewrite the data first — existing plaintext passwords are re-hashed lazily on the first successful login.
 
 ---
 
 ## References
 
 - `ai-gateway-api/docs/zh_cn/upgrade.md`
+- `ai-gateway-api/database/db_ddl_upgrade_to_0.0.11.sql`: incremental upgrade script for the Control Plane database from v0.0.10 to v0.0.11
 - `ai-gateway-api/db_ddl.sql`
 - `ai-gateway-api/db_ddl_report_mysql.sql`
 - `conf-agent/AGENTS.md`

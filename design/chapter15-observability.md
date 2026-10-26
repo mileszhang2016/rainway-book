@@ -21,7 +21,7 @@ AI 网关承接大量大模型调用流量，请求链路涉及认证、路由�
 
 ### 日志（Logs）
 
-日志用于记录每个请求的完整生命周期。BFE 数据面通过访问日志（Access Log）输出请求在认证、路由、转发、计费各阶段的关键信息，支持下游进行故障排查、计费对账和安全审计。AI 专属字段统一占用 `bfe-access-pb` 协议的 701-900 编号区间，覆盖认证、路由、限流、配额、缓存、镜像、意图、上下文压缩、Token 计量与成本等维度，可观测字段全集详见 `bfe/docs/zh_cn/sys_design/ai_access_log_fields.md`。
+日志用于记录每个请求的完整生命周期。BFE 数据面通过访问日志（Access Log）输出请求在认证、路由、转发、计费各阶段的关键信息，支持下游进行故障排查、计费对账和安全审计。AI 专属字段统一占用 `bfe-access-pb` 协议的 701-900 编号区间（批量任务字段另占 901-907 扩展段），覆盖认证、路由、限流、配额、缓存、镜像、意图、上下文压缩、Token 计量与成本等维度，可观测字段全集详见 `bfe/docs/zh_cn/sys_design/ai_access_log_fields.md`。
 
 ### 指标（Metrics）
 
@@ -58,6 +58,7 @@ AI 可观测字段统一占用 `bfe-access-pb` 的 701-900 编号区间，按用
 | 801 - 840 | 路由、转换、插件与意图，如路由规则命中、cluster/key 尝试列表、意图分类结果 |
 | 841 - 880 | 安全、合规、隐私与流量镜像，如命中/拒绝的 Quota Plan ID、镜像命中与目标集群 |
 | 881 - 900 | 厂商扩展与预留 |
+| 901 - 907 | 批量任务（batch），如任务 ID、文件 ID/操作、文件行数/字节数、任务状态与结算 |
 
 ### 核心 AI 访问日志字段
 
@@ -143,6 +144,41 @@ AI 可观测字段统一占用 `bfe-access-pb` 的 701-900 编号区间，按用
 
 上述字段中，`ai_cache_status`（789）、`ai_intent_*` 七字段（803-809）与 `mirror_hit` / `mirror_cluster`（842/843）共 10 列由 log-reader `mod_log_mysql` 注册并写入报表库，MySQL 明细表 `bfe_ai_request_log` 共 99 列，列序与 ai-gateway-api `db_ddl_report_mysql.sql` 一致；`ai_cache_key` / `ai_cache_semantic` / `ai_cache_similarity`（790-792）与 `ai_context_*` 四字段（793-796）仅在访问日志层可见，不进入报表库。Kafka 侧 `mod_kafka` 默认字段集与 MySQL 写入列对齐（92 个），其中 `ai_intent_confidence` / `ai_intent_latency_us` / `ai_intent_cache_hit` 为 proto optional 数值，未求值时输出 JSON `null`，语义与 MySQL 侧 NULL 一致。
 
+### 计费归因、上游错误归一化与批量任务字段
+
+除上述字段外，访问日志还提供三组面向计费对账与错误归因的字段（本章仅做概要列举，实现细节见 [第三十二章 mod_ai_token_auth 实现](../implementation/chapter32-mod-ai-token-auth.md)）。
+
+计费归因字段（763-765），由 `mod_ai_token_auth` 在计量阶段填充，使计费旁路与零成本请求在对账中可直接查询、可归因：
+
+| 字段名 | 编号 | 类型 | 说明 |
+|--------|------|------|------|
+| `ai_price_miss` | 763 | bool | 价格缺失标记：`(model, mode)` 无价格条目、回退到该模型 chat 模式价格（或无回退价格计 0）时为 true |
+| `ai_usage_source` | 764 | string | usage 来源：`parsed`（解析到最终 usage）/ `estimated`（估算 Token 获准计费）/ `aborted`（客户端断连、跳过多计费）/ `unrecognized`（未识别且不可估算、跳过多计费） |
+| `ai_zero_cost_reason` | 765 | string | 2xx 零成本原因：`cache_hit` / `batch_release` / `price_miss` / `price_zero` / `no_usage_tokens` 等 |
+
+上游错误归一化字段（810-815），记录网关向上游转发过程中的错误归一化结果，使不同厂商的错误在报表与告警中可按统一口径统计：
+
+| 字段名 | 编号 | 类型 | 说明 |
+|--------|------|------|------|
+| `ai_upstream_status` | 810 | int32 | 上游原始 HTTP 状态码 |
+| `ai_upstream_err_code` | 811 | string | 上游错误码 |
+| `ai_err_normalized` | 812 | bool | 错误是否已归一化为网关标准错误 |
+| `ai_err_normalize_miss` | 813 | bool | 错误未命中归一化规则 |
+| `ai_stream_error_rewritten` | 814 | bool | 流式响应中的错误是否已被改写 |
+| `ai_stream_truncated` | 815 | bool | 流式响应是否被截断 |
+
+批量任务字段（901-907），由 `mod_ai_batch` 在批量任务与文件操作场景填充：
+
+| 字段名 | 编号 | 类型 | 说明 |
+|--------|------|------|------|
+| `ai_batch_id` | 901 | string | 批量任务 ID（`batch_xxx`），任务及其所属文件操作携带 |
+| `ai_file_id` | 902 | string | 文件 ID（`file-xxx`），文件操作时填充 |
+| `ai_batch_op` | 903 | string | 批量/文件操作类型 |
+| `ai_file_lines` | 904 | int64 | jsonl 行数（上传时计数或从批量输出文件解析） |
+| `ai_file_bytes` | 905 | int64 | 文件字节数 |
+| `ai_batch_status` | 906 | string | 厂商侧批量任务状态快照：`validating` / `queued` / `in_progress` 等 |
+| `ai_batch_settle` | 907 | string | 批量任务结算结果 |
+
 ### 耗时字段的零值语义
 
 访问日志的五个耗时字段 `ClusterServeTime` / `BackendServeTime` / `WriteClientTime` / `SessionOffsetTime` / `ProxyDelayTime` 统一经 `bfe_modules/mod_access_pb3/request_log.go` 的 `durationMsUint32` 收口：任一端点为零值时间或差值为负时一律写 0。
@@ -152,6 +188,20 @@ AI 可观测字段统一占用 `bfe-access-pb` 的 701-900 编号区间，按用
 ### Responses API 缓存计量的 subset 语义
 
 Responses API 的 `input_tokens` 已包含 `cached_tokens`（`total_tokens = input_tokens + output_tokens`，与 Chat Completions / Gemini 的总输入口径一致）。协议适配层（`bfe/bfe_model_protocol/utils/usage_parse.go` 的 `ParseOpenAIUsageFields`）对 Responses 链直接取 `input_tokens` 作为 `PromptTokens`，不再叠加缓存拆分项——访问日志中 `ai_input_tokens` 为总输入、`ai_cache_read_tokens` 为其子集。Anthropic 协议则不同：`input_tokens` 只统计未命中缓存的新鲜 Token，不含 `cache_read_input_tokens` / `cache_creation_input_tokens`，协议适配层（`ParseAnthropicUsageFields`）保留 additive 归一化（`PromptTokens = input_tokens + cache_read + cache_creation`），与 OpenAI `prompt_tokens` 的总输入语义对齐。两种口径的差异在解析层统一收口，下游计费拆分与报表无需按协议区分。
+
+### logid 编码与报表去重键
+
+访问日志的 `logid` 是逐请求唯一标识，报表按它做请求级判别。
+
+**logid 编码**：BFE 的 `genLogId`（`bfe/bfe_modules/mod_logid/mod_logid.go`）生成 `[1, 2^63-1]` 区间的十进制字符串：它与访问日志中的 uint64 日志字段无损互转，63 位上界保证取值始终落在 MySQL / Doris / StarRocks 的 signed BIGINT 范围内。`X-Bfe-Log-Id` 响应头、文本访问日志的 `log_id`、`%bfe_log_id` 日志模板变量、WAF/镜像日志中的 logid 均为该十进制串，下游消费者按十进制解析（按 32 位 hex 解析将无法关联）。无法转换的会话（`mod_logid` 未加载、畸形值等）由 `mod_access_pb3` 在本地重新生成非零 id，并分别计入 `LogidRegenerated` / `SessionIdRegenerated` 模块计数器，不会写入 0。
+
+**报表去重键**：报表明细表的唯一键 `uk_dedup` 为 `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)` 五列——logid 作为请求级判别列入键后，同秒同 Key 同模型的并发请求各自成行，只有同一请求的重放（同 logid）才命中覆盖，重发 / `-b` 补读保持幂等。各后端的落地方式：
+
+- **MySQL**：`bfe_ai_request_log` 的 `logid` 列类型为 `BIGINT NOT NULL DEFAULT 0`（NULL 在唯一键语义下互不相等，可空列会让缺 logid 的行逃过去重）；`db_ddl_report_mysql.sql` 头部附存量迁移 `ALTER` 语句（先回填 `logid IS NULL` 行，再重建唯一键）。
+- **Doris**：明细表 UNIQUE KEY 为五列（logid 为第 5 个 KEY 列，`BIGINT NOT NULL`）。Doris 的 KEY 列集合不支持在线 schema change，调整需整表重建：暂停 Routine Load → 按目标 schema 建 `_v2` 表并回灌 `IFNULL(logid,0)`（与四元组语义等价）→ `REPLACE WITH TABLE` swap 原子换名 → 恢复 Routine Load → 验证 → 删除旧表。完整步骤见 `ai-gateway-observability/doris/docs/user/HOWTO.md` §11.5，Doris 3.0.8 验证通过。
+- **ClickHouse / StarRocks**：ClickHouse 明细表为 MergeTree（append-only，写入链路无去重合并；`ORDER BY` 为四列，`logid` 为 `UInt64 DEFAULT 0`），StarRocks 明细表为 DUPLICATE KEY（append-only），两者均不存在 UNIQUE KEY 合并语义。
+
+**log-reader 侧**：`mod_log_mysql` 对 `logid=0` 的行退化为四元组语义（同秒并发仍互相覆盖），并计入 `LOGID_EMPTY` 计数器——该计数阈值应为 0，>0 即应告警，提示仍有上游在产生零 logid 日志。详见 `ai-gateway-api/db_ddl_report_mysql.sql`、`log-reader/doc/modules/mod_log_mysql/output-columns.md` 与 `ai-gateway-observability/doris/docs/user/HOWTO.md` §11.5。
 
 ### 控制面操作日志（审计数据源）
 
@@ -166,6 +216,8 @@ Responses API 的 `input_tokens` 已包含 `cached_tokens`（`total_tokens = inp
 - 请求上下文：`request_path`、`request_method`、`client_ip`、`user_agent` 与 `created_at`。
 
 操作日志存储于控制面数据库的 `operation_logs` 表，`log_id` 与 BFE 访问日志中的 LogID 一致，审计场景下可按操作人、资源、时间区间等条件分页查询，实现"配置变更—请求行为"的双向追溯。
+
+查询接口使用页码分页，响应为 `{list, pagination: {page, page_size, total}}`；列表按 `created_at DESC, id DESC` 排序，过滤列建有组合索引以支撑高频审计查询。`pagination.total` 由 TTL 10s 的计数缓存提供：本实例的写入会即时失效缓存，跨实例的失效依赖异步批量刷盘（约 5s 一个周期），因此多实例部署下 `total` 可能滞后一个刷盘周期；翻页结束应以返回的 `list` 是否为空为准。
 
 ## 关键监控指标
 
@@ -282,11 +334,24 @@ groups:
 
 标准形态的官方组件（ai-gateway-observability 仓库）命名如下：Doris 侧建库 `bfe_observability`，含明细表 `bfe_ai_request_log` 与分钟聚合表 `bfe_ai_metrics_1m`；明细经 Routine Load `bfe_ai_log_load` 从 Kafka 灌入，分钟预聚合由 INSERT JOB `bfe_ai_metrics_1m_job` 在 Doris 侧完成；Grafana 以 MySQL 协议直连 Doris FE 查询端口（默认 9030）作为数据源，Dashboard 配置为 `grafana/dashboards/bfe-ai-gateway-observability.json`。ClickHouse 侧由 `clickhouse/setup.sh` 分六步创建数据库与五类对象：明细表（MergeTree，TTL 7 天）、Kafka 引擎暂存表、消费物化视图（JSON 打平入明细表）、聚合表（SummingMergeTree）、聚合物化视图（分钟桶）；明细与聚合的 Kafka 消费组为 `clickhouse_bfe_ai_log`。StarRocks 侧由 `starrocks/setup.sh` 分四步创建数据库、明细表（DUPLICATE KEY）、异步物化视图 `bfe_ai_metrics_1m`（`REFRESH ASYNC EVERY (INTERVAL 1 MINUTE)`，名字即报表查询契约名）与 Routine Load `bfe_ai_log_load`；消费组为 `starrocks_bfe_ai_log`。三侧部署手册见 `doris/docs/user/HOWTO.md`、`clickhouse/docs/user/HOWTO.md`、`starrocks/docs/user/HOWTO.md`，表结构设计见各目录 `docs/design/TABLE_DESIGN.md`，Grafana 面板与 SQL 见 `grafana/docs/design/DASHBOARD_DESIGN.md`，PB 字段 → log-reader JSON 字段映射见 `api/depends_api/req_log.md`。
 
+### StarRocks 明细表的布尔列
+
+StarRocks 明细表 `bfe_ai_request_log` 中 `is_trust_src_ip`、`ai_stream`、`mirror_hit`、`ai_intent_cache_hit` 四列的类型为 `BOOLEAN`，Kafka 消息中的 JSON `true`/`false` 直接写入布尔值。若按其他引擎的习惯把这些列声明为 `TINYINT`，Routine Load 不会报错，而是静默写入 `NULL`——信任源 IP 判定、流式标记、镜像命中与意图缓存命中会在报表中整体失真，且无法通过错误日志发现。
+
+跨引擎的列类型对齐口径为：Doris `TINYINT`、ClickHouse `UInt8`、StarRocks `BOOLEAN`。明细表已存在且布尔列类型不符时，StarRocks 不支持 `TINYINT` → `BOOLEAN` 的就地类型转换，需重建表：
+
+1. `STOP ROUTINE LOAD FOR bfe_ai_log_load`；
+2. `DROP MATERIALIZED VIEW bfe_ai_metrics_1m`，再 `DROP TABLE bfe_ai_request_log`；
+3. 执行 `starrocks/setup.sh` 按目标 schema 重建明细表、物化视图与 Routine Load；
+4. 以 `OFFSET_BEGINNING` 重放 Kafka 消息，回填重建窗口内的旧值。
+
+重建窗口内报表数据为空，应安排在低峰期并提前对齐 Kafka 保留时长。
+
 四条链路的关键设计取舍：
 
 - **插件直写数据库，不经控制面中转**。log-reader 随 BFE 部署在数据面，日志链路可用性不能依赖控制面（ai-gateway API）的发布与负载；访问日志是数据面最高吞吐的数据流，经 api 中转会形成汇聚瓶颈。这与既有 `mod_kafka` 直写 Kafka 的惯例一致。
 - **同名同列的表设计**。四种后端的明细表同名、列集合对齐同一套 log-reader 输出字段，报表查询 API 对各后端返回结构一致的响应，差异仅在可选字段的有无（如 MySQL 不提供分位数）。
-- **幂等写入**。唯一键 `(hostid, log_time, ai_apikey_id, ai_requested_model)` 在各侧分别落地：MySQL 侧写入采用 `INSERT ... ON DUPLICATE KEY UPDATE` 覆盖语义，log-reader 重发或 `-b` 补读不会产生重复数据；Doris / StarRocks 侧由 Routine Load 按消息位点保证；ClickHouse 侧消费链路为 at-least-once 语义，查询侧以维度聚合兜底。
+- **幂等写入**。唯一键 `uk_dedup` 为五列 `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)`（logid 为请求级判别列，见上文"logid 编码与报表去重键"一节）在各侧分别落地：MySQL 侧写入采用 `INSERT ... ON DUPLICATE KEY UPDATE` 覆盖语义，只有同一请求的重放（同 logid）才命中覆盖，log-reader 重发或 `-b` 补读不会产生重复数据；Doris 侧由 UNIQUE KEY 合并语义保证（KEY 集合调整需整表重建，见 HOWTO §11.5）；StarRocks 侧 Routine Load 按消息位点保证；ClickHouse 侧消费链路为 at-least-once 语义，查询侧以维度聚合兜底。
 - **单集群单落库形态**。同一集群同时启用多种落库形态时，各套报表会因各自的数据缺口窗口而不一致；同一 Kafka topic 可并行部署多套存储做灰度比对，但生产环境应按"单集群单落库形态"部署。
 - **schema-first**。两张报表表（明细表 + 分钟聚合表）的 DDL 先于插件启用发布：MySQL 形态由 ai-gateway-api 仓库随版本发布（`db_ddl_report_mysql.sql`），Doris / ClickHouse / StarRocks 形态由 ai-gateway-observability 仓库发布（各 `sqls/` 目录与 `setup.sh`）；部署流程先执行建表，再启用 log-reader 插件，插件自身不提供自动建表。
 - **最小权限账号**。log-reader 写入账号仅持有目标库目标表的 INSERT/UPDATE 权限（幂等覆盖需要 UPDATE），无 DDL/DELETE；ai-gateway-api 查询账号在纯查询后端（Doris / ClickHouse / StarRocks）仅需 SELECT，MySQL 形态另需聚合表 INSERT/DELETE、明细表 DELETE（非分区降级清理）及 ALTER TABLE（分区管理）。
@@ -339,9 +404,12 @@ MySQL 没有 Doris 的定时 INSERT 聚合，预聚合由 ai-gateway-api 内嵌 
 - **启动连接容错**：MySQL 暂不可达时进程不退出，`connSupervisor` 按 `ConnectRetryIntervalMs`（默认 3000ms）后台持续重试，监控键 `MYSQL_CONN_STATE` 为 `DOWN`；建连成功前新日志在缓冲队列堆积，连通后自动排空补写。配置错误（`Addr`/`User`/`DBName`/`Table` 为空、配置文件缺失或格式错误）仍 fail-fast，`Init` 返回错误进程退出。
 - **运行期断连自动重连**：写重试耗尽后 `markDown`（`MYSQL_CONN_STATE` 置 `DOWN`、`MYSQL_CONN_LOST` 计数、持有该批不占 `QueueSize`），supervisor 按 `ConnectRetryIntervalMs` 后台重连，成功后失败批优先补写，补写仍失败才计 `SEND_MYSQL_FAILED` 丢弃；写入采用 `INSERT ... ON DUPLICATE KEY UPDATE` 幂等覆盖，补写/重放不产生重复行。断连窗口内行序可能与到达序不一致，消费侧以 `log_time` + `logid` 为准，分钟聚合报表不受影响。
 - **可选健康探活**：`HealthPingIntervalMs > 0` 时 supervisor 在 UP 期周期 `PingContext`，失败即 `markDown`，用于更早发现防火墙断链、NAT 超时等半开连接；默认 0（关闭）。
+- **数值列超界归一**：写入前对 16 个整数列做边界收敛——`req_num`、`req_header_len`、`req_body_len`、`res_header_len`、`res_body_len`、`all_time`、`read_client_time`、`cluster_serve_time`、`backend_serve_time`、`write_client_time`、`connect_backend_time`、`proxy_delay_time`、`session_offset_time`、`ai_retry_count` 的上限为 `2147483647`（INT），`res_status_code` 上限为 32767（SMALLINT），`backend_retry` 上限为 127（TINYINT）；超界值 clamp 到列上限后照常落库。每次归一按字段值计入 `VALUE_NORMALIZED` 并触发限频告警，避免异常值导致整批 INSERT 失败。
+- **坏行隔离**：批写入命中可定位到行的数据类错误（MySQL 1264/1406 且错误消息含 `at row N`）时，剔除该行并立即重建语句重写，不消耗重试次数、不 `markDown`，计入 `ROW_DROPPED_DATA`。`SEND_MYSQL_FAILED` 只统计结构性错误（表缺失、权限收回等）；`WRITE_BATCH_SIZE` 按实际落库行数计，因此坏行被剔除后该计数会小于原始批大小。`VALUE_NORMALIZED` 与 `ROW_DROPPED_DATA` 在稳态下恒为 0，非 0 即需排查上游字段取值或数据质量问题。
 - **连接相关配置键**：`[mysql]` 段 `ConnectTimeoutMs = 3000`、`ConnectRetryIntervalMs = 3000`、`HealthPingIntervalMs = 0`；`[Writer]` 段 `BatchTimeoutMs = 30000`。
 - **连接监控键**：`MYSQL_CONN_STATE`（`UP`/`DOWN`）、`MYSQL_CONN_RETRY`（建连重试累计）、`MYSQL_CONN_OK`（建连成功累计）、`MYSQL_CONN_LOST`（运行期断连次数）。`MYSQL_CONN_STATE` 跳变或长期 `DOWN` 建议告警；运行期断连本身不贡献 `SEND_MYSQL_FAILED`（该计数 >0 意味着结构性错误，如表被删、权限收回）。
 - **mod_kafka 字段对齐**：默认字段集 92 个，与 `mod_log_mysql` 写入列对齐，`log_tag` / `client_network` / `user_agent` / `vip` 等字段在 Kafka JSON 中同样有值；`ai_intent_confidence` / `ai_intent_latency_us` / `ai_intent_cache_hit` 三个 proto optional 数值未求值时输出 JSON `null`，与 MySQL 侧 NULL（未求值）语义一致。
+- **logid 兜底与告警**：`logid=0` 的行无法按请求级判别列去重，写入时退化为四元组语义（同秒并发仍互相覆盖），并计入 `LOGID_EMPTY` 计数器。该计数阈值应为 0，>0 即说明仍有上游在产生零 logid 日志（如仍运行旧版本的 BFE），应触发告警。
 
 ### 模块装配与发布顺序
 
@@ -396,6 +464,8 @@ BFE 数据面在 AI 网关场景下返回统一的 OpenAI 兼容格式错误响�
 | 首 Token 延迟高 | `ai_ttft_us` P99 超过业务 SLA | warning | 排查网络延迟、后端模型负载、是否命中冷启动 |
 | 平均输出 Token 延迟高 | `ai_tpot_us` P99 超过阈值 | warning | 检查模型实例负载、流式响应带宽 |
 | 重试次数高 | `ai_retry_count` 平均值异常升高 | info | 检查上游 key 可用性、模型服务稳定性 |
+| 报表明细 logid 缺失 | log-reader `LOGID_EMPTY` > 0 | warning | 存在 logid=0 的行，报表去重退化为四元组语义；排查仍运行旧版本 BFE 的节点或 logid 转换异常 |
+| log-reader 写入数据异常 | `VALUE_NORMALIZED` 或 `ROW_DROPPED_DATA` > 0 | warning | 存在被 clamp 到列上限的字段值或被剔除的坏行；排查上游字段取值与列范围表的覆盖情况 |
 
 告警通知建议按产品线或租户拆分，避免全局告警淹没关键信息。同时，对于计费相关告警（如配额不足），应优先通知业务方而非仅通知运维团队。
 
@@ -452,13 +522,14 @@ StdOut      = false
 本章介绍了壬远 AI 网关的可观测性设计，核心要点如下：
 
 - 可观测性由日志、指标、追踪三个支柱构成，BFE 数据面当前在日志与指标方面做了深度定制；
-- AI 访问日志的专属字段覆盖认证、路由、限流、配额、缓存、镜像、意图、上下文压缩、Token 计量（含图像/视频生成子项）、成本估算等全生命周期信息，且不会记录原始 API Key；
+- AI 访问日志的专属字段覆盖认证、路由、限流、配额、缓存、镜像、意图、上下文压缩、Token 计量（含图像/视频生成子项）、成本估算、计费归因、上游错误归一化与批量任务等全生命周期信息，且不会记录原始 API Key；
+- logid 为 `[1, 2^63-1]` 区间的十进制字符串（兼容 signed BIGINT），报表去重键为含 logid 的五列唯一键；`X-Bfe-Log-Id` 等字段均为十进制串，下游消费者按十进制解析；无法转换的会话本地重新生成非零 id 并计入 `LogidRegenerated` / `SessionIdRegenerated` 计数器；
 - 控制面操作日志记录每一次配置变更的操作者、资源、变更摘要（含 diff_keys）与请求上下文，敏感字段已脱敏，可通过 `GET /open-api/v1/operation-logs` 审计查询；
 - 关键监控指标包括 `REQ_TOTAL`、路由命中/未命中/兜底、限流触发、配额命中与拒绝、Token 消耗速率、TTFT/TPOT 等；
 - Prometheus 可通过 Pull 方式采集 BFE 指标，Zabbix 可通过 HTTP Agent 或自定义脚本接入；
 - 报表系统采用一套查询 API 与控制台页面、四种存储后端（MySQL / Doris / ClickHouse / StarRocks）的设计，`[Report].Backend` 配置切换，缺省不装配（端点 404）；生产按"单集群单落库形态"部署，同一 Kafka topic 可并行部署多套存储做灰度比对；
 - 四种后端的聚合表统一为 40 维 + 24 指标（含缓存/镜像/意图下钻维度），预聚合按形态分工：MySQL 由内置分钟聚合 JOB 与分区管理 JOB 完成，Doris 由 INSERT JOB、ClickHouse 由物化视图、StarRocks 由异步物化视图维护；
-- 报表查询 API 通过 `ReportStorager` 接口与 `BackendCaps` 能力门控屏蔽四后端方言差异，总览/时序/排行/分布/日志端点提供缓存、镜像、意图三组指标与过滤参数；log-reader `mod_log_mysql` 以"进程常驻 + 后台重连 + 失败批优先补写"保证写入韧性；
+- 报表查询 API 通过 `ReportStorager` 接口与 `BackendCaps` 能力门控屏蔽四后端方言差异，总览/时序/排行/分布/日志端点提供缓存、镜像、意图三组指标与过滤参数；log-reader `mod_log_mysql` 以"进程常驻 + 后台重连 + 失败批优先补写"保证写入韧性，`LOGID_EMPTY` 计数 >0 即应告警，`VALUE_NORMALIZED` / `ROW_DROPPED_DATA` 稳态恒 0；StarRocks 明细表的布尔列（`is_trust_src_ip`、`ai_stream`、`mirror_hit`、`ai_intent_cache_hit`）为 `BOOLEAN`，声明为 `TINYINT` 会静默写 NULL；
 - 错误码体系分为认证与准入、限流检查、配额扣减、转发与协议适配四个层级，与访问日志字段存在明确对应关系；
 - 告警应覆盖错误率、限流、配额、路由命中率、延迟与重试等维度，并按产品线或租户拆分通知。
 
@@ -473,8 +544,8 @@ StdOut      = false
 - `ai-gateway-api/docs/zh_cn/config_param.md` — AI Gateway API 配置文件说明
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/operation-logs.md` — 操作日志接口定义
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/report.md` — 报表查询接口定义
-- `ai-gateway-api/design-docs/modifications/2026-09-15-report-query-api/change-summary.md` — 报表查询 API 变更摘要
-- `ai-gateway-api/db_ddl_report_mysql.sql` — 报表明细表与聚合表 DDL（MySQL 形态）
+- `ai-gateway-api/db_ddl_report_mysql.sql` — 报表明细表与聚合表 DDL（MySQL 形态，含 `uk_dedup` 与迁移语句）
+- `log-reader/doc/modules/mod_log_mysql/output-columns.md` — mod_log_mysql 输出列与幂等键（含 logid 请求级判别列）
 - `log-reader/doc/modules/mod_log_mysql/mod_log_mysql.md` — mod_log_mysql 插件说明（连接容错、写入攒批与监控键）
 - `log-reader/doc/modules/mod_kafka/output-fields.md` — mod_kafka 默认输出字段（92 个）与 optional null 语义
 - `ai-gateway-observability/doris/docs/user/HOWTO.md` — Doris 部署手册（标准形态）

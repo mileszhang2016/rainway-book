@@ -2,6 +2,9 @@
 
 ## A
 
+**ai-gateway-controller（原名 Service Controller）**
+：部署在 Kubernetes 集群内的控制器，监听带 `ai-gateway-api-name` 标签的 Service 及其同名 Endpoints，按具名端口把 Ready 实例经 InnerAPI `PUT /inner-api/v1/k8s_pools/{name}/instances` 全量上报为 K8s 实例池；池成员由控制面扇出到 Provider 镜像与 Cluster 派生池，再经 `cluster_table` 导出到 BFE。
+
 **AI 业务集群（Cluster）**
 ：引用 Provider 并配置转发策略的逻辑后端单元，决定流量如何转发、使用哪些模型、Key 权重如何分配。
 
@@ -53,7 +56,7 @@
 ：Entity 的层级分类定义，通过 `level` 字段区分层级高低，数值越小层级越高。
 
 **EPP（Endpoint Picker）**
-：独立于 BFE 的后端调度器，为 EPP 模式 Cluster 接管后端实例选择（负载均衡），通过实例组（主备）部署并被登记到 EPP 实例池。
+：独立于 BFE 的后端调度器，为 EPP 模式 Cluster 接管后端实例选择（负载均衡），以实例组为部署单元（本期每组恰好 1 个实例）并被登记到 EPP 实例池。
 
 ## F
 
@@ -86,8 +89,8 @@
 
 ## K
 
-**K8s 实例池（K8s Pool）**
-：由 K8s 发现组件经 InnerAPI 维护的后端实例集合，Provider 可切换实例来源（`instance_pool` / `k8s_pool`），以有效实例池契约下发。
+**K8s 实例池（K8s Pool / k8s_pool）**
+：由 ai-gateway-controller 经 InnerAPI `/inner-api/v1/k8s_pools` 全量上报和维护的后端实例集合，池成员的唯一写入方是该控制器；Provider 可切换实例来源（`instance_pool` / `k8s_pool`），以有效实例池契约下发。
 
 **Key Affinity（Key 亲和性）**
 ：基于 Redis 实现会话级 Key 亲和，同一 `ClientKeyId` 在一定时间内持续命中同一 Provider Key；Redis 连接由 `bfe.conf` 的 `[AIKeyAffinity]` 配置段自持。
@@ -173,7 +176,7 @@
 ：模型定价中按时间维度划分的价格层级，初期仅支持 `peak`（忙时）；忙时时间段定义在服务商资源中维护（分段计价配置）。
 
 **Token**
-：由 `/auth/tokens` 创建的程序访问凭证，分为 `System`（完整管理权限）与 `Support`（只读导出权限）两种 Scope。
+：由 `/auth/tokens` 创建的程序访问凭证，Scope 取值为 `System`（完整管理权限）、`SystemReadonly`（只读管理权限）与 `Support`（只读导出权限）。
 
 **TPM（Tokens Per Minute）**
 ：每分钟 Token 消耗上限，采用滑动窗口计数。

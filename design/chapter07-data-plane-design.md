@@ -254,6 +254,8 @@ http_conn.serveRequest()
 
 为保证依赖方向不出现环，`bfe_model_protocol` 只允许 import `bfe_http` 与 gjson，不许 import `bfe_basic` / `bfe_config` / `bfe_modules`；`bfe_basic.GetApiKey` / `DetectAuthStyle`、`mod_ai_token_auth.SetApiKey` 等历史入口保留原签名，内部委托给适配层，因此对既有模块行为完全兼容。模型名改写（prefix 剥离、`ModelMapping`）属于协议无关逻辑，仍留在 `computeTargetModel`，不在适配层职责范围内。
 
+**出站凭证头互斥**：协议适配器的 `InjectAuth` 只负责注入本次使用的凭证头，清理由转发层在 header 副本上完成。当网关向上游注入凭证时，出站请求只保留本次注入的那一个凭证头，客户端带来的 `Authorization`、`x-api-key`、`x-goog-api-key`（注册表内各协议 `CredentialHeader` 的并集）一律删除，避免上游同时收到网关凭证与客户端凭证而按错误的那个鉴权。删除只作用于出站 header 副本，入站请求的 header 不被改写；未配置 Keys 的透传集群既不清理也不注入，客户端凭证原样转发。
+
 ### 模块协作关系
 
 ```
@@ -351,7 +353,7 @@ Authorization: Bearer <api-key>
 
 缓存键格式为 `{CacheKeyPrefix}:{key_id|unknown}:{sha256(question) 前 16 字节 hex}`，租户标识取自 `AiBasicInfo.ClientKeyId`，未鉴权请求回退到 `unknown` 键空间，不同租户互不可见。请求头 `x-bfe-skip-ai-cache: on` 令请求整体跳过缓存（不读不写）；命中响应携带 `X-Bfe-Ai-Cache: hit` 响应头。
 
-规则文件 `mod_ai_cache_rule.data` 按产品线组织规则列表，主要字段：
+规则文件 `ai_cache.data`（`mod_ai_cache.conf` 的 `ProductRulePath` 指向该文件）按产品线组织规则列表，主要字段：
 
 | 字段 | 说明 |
 |------|------|
@@ -653,6 +655,17 @@ prepareRequestBodyForRetry()
 
 该流程确保只有在后端不可用或出现服务端错误时才尝试降级，而客户端错误不会触发无意义的 fallback，避免将错误请求扩散到备用集群。
 
+### 后端不可用的错误边界
+
+`ClusterTable.Lookup(ClusterName)` 之后，转发循环按集群的有效后端实例池挑选实例。两种失败在语义上不同，排查方向也不同：
+
+- **500 `BK_NO_BACKEND`**：集群在 `cluster_table` 中存在，但可用后端实例池为空——例如 K8s 实例池尚未导出任何实例，或子集群实例被全部移除。响应体为 `{"error":{"code":"BK_NO_BACKEND","type":"internal_error","param":null,"message":"no available backend for this request","details":null}}`。`cluster_table` 中缺失的子集群同样按空 backend 处理；热加载释放旧实例、新实例尚未就绪的时间窗也会返回该错误。该错误反映配置或实例导出问题，应配置告警，而不是当作上游故障盲目重试。
+- **502 `BACKEND_UNAVAILABLE`**：目标集群不存在（无法解析到集群配置）或后端连接失败，message 为 `upstream backend unavailable for this request`。它表示"集群不可达"，与"集群存在但没有可用实例"的 `BK_NO_BACKEND` 明确区分。
+
+子集群没有任何 `weight > 0` 的后端时，配置加载只输出 WARN，不会导致整表加载失败；该子集群在请求期按空实例池处理，返回 `BK_NO_BACKEND`。
+
+网关自生成的 AI 错误响应（包括上述两类，以及鉴权、限流、配额、内容审查等拒绝）统一携带 `X-Bfe-Gw-Error: 1`，并恒写 `X-Bfe-Log-Id`，用于把错误响应与访问日志、后端日志关联。`X-Bfe-Log-Id` 按回退链取值：`req.LogId` → 入站 `X-Bfe-Log-Id` 头 → 现场生成。`X-Request-ID` 只做回显：客户端携带则原样返回，未携带则不生成，避免网关伪造调用方的请求标识。
+
 ## 上游路径按协议改写（ProtocolPaths）
 
 不同 provider 的上游路径前缀各不相同（如百炼 `/compatible-mode/v1`、火山 `/api/v3`、Kimi Code `/coding/v1`），同一 provider 的不同协议还常挂在不同前缀下。为了让客户端统一使用标准入口 `/v1/...` 发起请求，BFE 在转发循环内按 cluster 的 `AIConf.ProtocolPaths` 改写出站请求的 URL path：
@@ -669,6 +682,10 @@ prepareRequestBodyForRetry()
 未配置 `ProtocolPaths` 或对应协议无条目时同样原样透传。改写只落在出站拷贝上、不改入站请求，因此 fallback 的每次 attempt 都基于原始客户端路径重算——切换到不同前缀配置的备用 cluster 后，上游路径自动跟随新 cluster 的配置。
 
 `ProtocolPaths` 由控制面按 cluster 引用的 provider 恒透传（配置入口为 Provider 的 `protocol_paths` 字段，见[第十章 Provider 与 Cluster 设计](./chapter10-provider-and-cluster.md)）。BFE 在配置加载与热加载时校验 key 白名单（`openai`/`anthropic`）与 value 格式，非法配置拒绝加载，作为控制面校验被手工配置等路径绕过时的兜底。
+
+## batch / file 透传的模型改写边界
+
+模型改写（请求体 `model` 字段覆盖、前缀裁剪与 `ModelMapping`）只适用于 JSON 的推理类请求。`ModeFile` / `ModeBatch` 以及非 JSON `Content-Type` 的请求跳过 `shouldRewriteBodyModel` 判定：`/v1/files` 的 multipart 请求体原样透传，`/v1/batches` 不注入 `model` 字段。批量任务与文件上传的语义完全由上游 Provider 决定，网关只做认证、路由与限额，不对请求体做模型相关改写。
 
 ## 本章小结
 

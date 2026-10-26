@@ -7,6 +7,9 @@ Through this chapter, readers will understand:
 - What security mechanisms Rainway AI Gateway provides at the transport layer, the authentication/authorization layer, and the policy enforcement layer;
 - How API-Keys, as the direct credential of the request path, are stored in the Control Plane, inherit policies through Entities, and are validated in the Data Plane;
 - The Control Plane authentication/authorization model (Visitor, Scope, Feature-Action) and how it integrates with the OpenAPI / InnerAPI;
+- How user passwords are stored as bcrypt hashes, the password policy, and the lazy migration of legacy plaintext;
+- The envelope format, keyring management, and key-rotation convergence tasks of encryption at rest;
+- The configuration model, middleware position, failure semantics, and hot reload of the management-plane IP allowlist;
 - Key configuration points for TLS/HTTPS on both the Control Plane and the Data Plane;
 - How access-log audit fields and Control Plane operation logs support security incident tracing and billing reconciliation;
 - The cleanup triggers for Quota Keys and Rate-Limit Keys in Redis, and practices for protecting sensitive data;
@@ -83,6 +86,8 @@ An API-Key is associated with an **Entity (business organization unit)** via `ap
 
 This design allows administrators to uniformly manage policies at the organization level, while the API-Key serves only as the final usage credential. See `ai-gateway-api/design-docs/sys-design/details/API-Key与Entity关联及模型继承.md` for details.
 
+The API-Key value itself is not stored in plaintext: `api_keys.api_key` is stored encrypted with the `enc$v1$` envelope in the database, uniqueness checks use an irreversible hash column, and the DAO layer performs transparent encryption/decryption. See the "Encryption at Rest" section below for the full design.
+
 ### Transport Security
 
 API-Keys are transported in HTTP headers and must be encrypted with **TLS/HTTPS** to prevent theft or tampering by man-in-the-middle attacks. In production, plaintext HTTP entry points should be disabled and HTTPS access enforced. It is also recommended to:
@@ -91,6 +96,69 @@ API-Keys are transported in HTTP headers and must be encrypted with **TLS/HTTPS*
 - Use `allowed_subnets` to restrict the client IP ranges allowed to call;
 - Avoid displaying the full API-Key in the Dashboard; show only the prefix and the last few characters;
 - Immediately clean up the API-Key's Quota Keys and Rate-Limit Keys in Redis upon deletion, to prevent residual data from being reused.
+
+### Cleanup of Upstream Credential Headers
+
+When the gateway calls an upstream with a Key configured in the Provider, the outbound request keeps only the single credential header injected for that attempt; any client-supplied `Authorization`, `x-api-key`, or `x-goog-api-key` (the union of the credential headers registered by all protocols) is removed. This mutual-exclusion rule has three security implications:
+
+- It prevents the caller's downstream credential from being forwarded to a third-party upstream, which would leak the credential or allow cross-tenant impersonation;
+- It prevents the upstream, upon receiving two credentials at once, from authenticating with the client credential and thereby bypassing the gateway's Key pool, penalty, and quota controls;
+- The cleanup applies only to the outbound header copy; inbound headers remain available for logging and auditing but do not participate in upstream authentication.
+
+A passthrough cluster with no Keys configured neither cleans nor injects, and client credentials reach the upstream by design; trust in that case must come from cluster admission, network boundaries, and the upstream's own authentication policy.
+
+---
+
+## Encryption at Rest
+
+The Control Plane database stores two types of highly sensitive credentials: downstream API-Keys (`api_keys.api_key`) and upstream Provider keys (`providers.api_keys`). Both are encrypted at rest with a keyring-based scheme (implementation: `ai-gateway-api/lib/xcrypto/` and `ai-gateway-api/design-docs/sys-design/details/密钥静态加密.md`), and the DAO layer transparently encrypts/decrypts them without business code being aware of it.
+
+### Envelope Format and Key Injection
+
+At-rest encryption reuses the same envelope format as export encryption:
+
+```
+enc$v1$<base64(keyID(1B) | nonce(12B) | AES-256-GCM ciphertext+tag)>
+```
+
+Values without the prefix marker pass through as plaintext, making grayscale migration easy. Keys are injected via the `[Security]` section of `ai_gateway_api.toml`; the file path is the only injection mechanism — no environment variable is provided:
+
+```toml
+[Security]
+# Keyring file (TOML) path; empty = at-rest encryption disabled
+MasterKeyFile = "/etc/ai-gateway/master_keys.toml"
+
+# Key ID in the keyring used to encrypt newly written values
+ActiveKeyID = 1
+```
+
+Unlike the export keyring (see [Chapter 14](./chapter14-config-export-and-version-control.md)), each key in the at-rest keyring is derived via **HKDF-SHA256** into two purpose-specific sub-keys: `db-enc-key` (field encryption/decryption) and `hash-pepper` (hash pepper). The keyring supports multiple coexisting keys and **atomic hot replacement**: update the file and call the monitor port's `/reload/security` to complete rotation without a restart.
+
+Startup semantics are fail-fast: if the database already contains ciphertext but the keyring is missing or the key does not match, the Control Plane refuses to start; if there is no ciphertext and no key configured, startup is allowed, making a gradual transition from plaintext to encryption possible.
+
+### Provider Key Column Type and Startup Self-Check
+
+The `providers.api_keys` column is typed `MEDIUMTEXT`, holding the key-pool JSON serialized and encrypted as a single `enc$v1$` envelope for the whole column; values without the prefix are still read as plaintext JSON. The trade-off of a whole-column envelope rather than per-field encryption is that the number of entries and the field structure of a key pool vary by Provider type: whole-column encryption keeps the schema unaware of the internal structure and avoids a Provider's keys ending up partly encrypted and partly plaintext.
+
+When `[Security].MasterKeyFile` is configured, the Control Plane self-checks the database column type of `providers.api_keys` at startup: if it is still a JSON type, startup is refused and the `ALTER TABLE` statement to execute is printed (corresponding to the column-type adjustment in `ai-gateway-api/database/db_ddl_upgrade_to_0.0.11.sql` §1.6). This check moves an implicit failure — writing ciphertext into a JSON column — to startup instead of exposing it on the first Provider write.
+
+On the read path, an undecryptable value (corrupted envelope, `keyID` absent from the keyring, key mismatch) returns 500 and is never silently degraded to plaintext, an empty value, or "no key configured", so a corrupted key is not disguised as a Provider without credentials that then sends bad requests upstream.
+
+### Accompanying Database Structure
+
+- The `api_keys` table has an `api_key_hash char(64)` column containing the hexadecimal string of `HMAC-SHA256(pepper, key)`; it is irreversible and used for uniqueness checks, and the unique key is `uk_api_key_hash`;
+- The `keyrotate_sweep_tasks` table records key-rotation convergence tasks, with fields including `created_by`, `mode`, `dry_run`, `scope`, `scanned`, `rewritten`, `summary`, etc.;
+- The `keyrotate_sweep_lock` table provides mutual exclusion among multiple Control Plane instances, with takeover of lost locks, preventing concurrent convergence runs.
+
+### Convergence Sweep
+
+Legacy plaintext is not encrypted automatically; it is force-converged by a sweep task:
+
+- `mode=reencrypt` (default): re-encrypts both ciphertext and plaintext in the database to the current active key;
+- `mode=decrypt`: decrypts everything back to plaintext, serving as a **rollback plan** for scenarios such as key loss;
+- Supports `dry_run` (scan and count only, without rewriting); scans in batches along the primary-key cursor, with in-batch heartbeats to prevent lock-table timeouts, and relies on the lock table for multi-instance mutual exclusion.
+
+Sweep task history can be queried via `GET /open-api/v1/security/reencrypt-sweeps`: it supports `page`/`page_size` pagination and `sort_by` (only `started_at`, `task_id`)/`sort_order` sorting, and can be filtered by `status`/`mode`/`scope`/`dry_run`/`start_time`/`end_time`. Task objects include `created_by`; running tasks have an empty `summary` object and `duration_ms` of 0; successful dry-run tasks have `error="dry_run"`.
 
 ---
 
@@ -194,14 +262,61 @@ The Control Plane's global middleware chain is:
 HTTP Request
     │
     ▼
-MCRecovery ──► MCLogger ──► MCCors
+MCRecovery ──► MCLogger ──► McIPProbe ──► MCCors
     │
     ▼
 /open-api/v1: McProductProbe ──► McUserProbe
 /inner-api/v1: McUserProbe
 ```
 
-`McUserProbe` parses the `Authorization` header and completes authentication, writing the `Visitor` into the `context`; `McProductProbe` parses the product-line context from the URL path. Each Endpoint with an `Authorizer` creates a separate Subrouter and mounts the authorization middleware.
+`McUserProbe` parses the `Authorization` header and completes authentication, writing the `Visitor` into the `context`; `McProductProbe` parses the product-line context from the URL path. Each Endpoint with an `Authorizer` creates a separate Subrouter and mounts the authorization middleware. `McIPProbe` is the management-plane IP allowlist middleware described in the section above.
+
+### bcrypt Hash Storage of User Passwords
+
+Dashboard user passwords are uniformly stored as **bcrypt** hashes in `users.password` (implementation: `ai-gateway-api/lib/xcrypto/password.go` and `model/iauth/authentication.go`):
+
+- All comparison paths (login, password change, etc.) use bcrypt constant-time comparison, with no shortcut credential (the `"SKIP"` literal carries no privilege), eliminating timing side channels;
+- `[Security].PasswordHashCost` controls the hashing strength; the default is 10, the valid range is 4-16, and out-of-range values fail fast at startup;
+- The password policy is 8-72 **bytes** (counted in UTF-8 bytes, constrained by bcrypt's 72-byte limit);
+- **Migration of legacy plaintext passwords**: a historical plaintext password is re-hashed and persisted in the same transaction upon the user's first successful login (lazy migration). The upgrade order is therefore code first, data second: rewriting passwords in the database with a script before upgrading would leave the old code unable to verify them and the new code unable to recognize them.
+
+---
+
+## Management-Plane Access Control (IP Allowlist)
+
+Beyond Token/password authentication, the Control Plane supports restricting the access scope of management interfaces by **client IP subnet** (implementation: `ai-gateway-api/stateful/access_control.go` and `endpoints/middleware/ip_probe.go`). The configuration lives in the `[AccessControl]` section of `ai_gateway_api.toml`; the sample configuration has the entire section commented out by default, i.e. disabled.
+
+```toml
+[AccessControl]
+# Master switch, default false
+Enable = true
+# Trusted proxy ranges (list of CIDRs)
+TrustedProxies = ["10.0.0.0/8"]
+
+[[AccessControl.Rules]]
+Name = "ops-console"
+PathPrefix = "/open-api/v1"
+Subnets = ["192.168.0.0/16"]
+# Audit mode: only logs and counts on a reject match, without actually rejecting
+Audit = false
+```
+
+Key semantics:
+
+- `Subnets` is required; its absence fails fast at startup;
+- Client IP resolution follows the same logic as BFE's `mod_trust_clientip`: `X-Forwarded-For` is parsed only when the peer IP belongs to `TrustedProxies`, scanning from the right, skipping trusted proxies, and taking the first non-trusted IP; XFF from untrusted sources is always ignored (`X-Real-IP` is not used in this phase);
+- The rule is selected by **longest-match** on `PathPrefix`; requests matching no rule are allowed directly;
+- On a reject match, the response is `403 {"ErrNum":403,"Type":"Access Forbidden"}`.
+
+### Middleware Position and Failure Semantics
+
+The global middleware `McIPProbe` sits after `MCLogger` and before `MCCors`, and executes before authentication, so rejected requests never enter the authentication or authorization flow.
+
+When the allowlist component itself fails, it is **fail-open**: if the client IP cannot be resolved, the request is allowed, and the anomaly is exposed via the Prometheus counter `mgmt_access_reject_total{rule="unresolvable"}` so operators can spot configuration problems early.
+
+### Hot Reload
+
+Access-control rules and trusted proxy ranges support hot update: modify the configuration and call the monitor port's `/reload/access_control` to take effect without a restart.
 
 ---
 
@@ -422,8 +537,11 @@ Combined with the Entity hierarchy, `block_models: ["gpt-4-32k"]` can be set at 
 ## Chapter Summary
 
 - Rainway AI Gateway adopts the defense-in-depth principle; security mechanisms cover the transport layer, the authentication/authorization layer, the request admission layer, and the policy enforcement layer.
-- The API-Key is the direct credential of the request path; it should be transported over HTTPS and combined with Entity inheritance for organization-level policy control.
-- The Control Plane uses the Visitor abstraction and the Feature-Action permission model, and supports four authentication methods — Password, Session, Token, and Skip; `SkipTokenValidate` must be disabled in production.
+- The API-Key is the direct credential of the request path; it should be transported over HTTPS and combined with Entity inheritance for organization-level policy control; API-Keys and upstream Provider keys are stored encrypted at rest with the `enc$v1$` envelope, with transparent DAO encryption/decryption.
+- Upstream credential injection follows the "keep only the injected header" mutual-exclusion rule: client `Authorization` / `x-api-key` / `x-goog-api-key` headers are not forwarded on the outbound request; `providers.api_keys` is a `MEDIUMTEXT` whole-column envelope, and at startup with a keyring configured the column type is self-checked, failing fast if it is still JSON.
+- The Control Plane uses the Visitor abstraction and the Feature-Action permission model, and supports four authentication methods — Password, Session, Token, and Skip; `SkipTokenValidate` must be disabled in production; user passwords are stored as bcrypt hashes, the password policy is 8-72 bytes, and legacy plaintext is lazily migrated on first login.
+- At-rest encryption keys are injected via `MasterKeyFile`, supporting multi-key HKDF derivation and hot rotation via `/reload/security`; existing data is converged by reencrypt/decrypt sweeps, and task history can be queried via `GET /open-api/v1/security/reencrypt-sweeps`.
+- The management plane supports an IP allowlist matched by longest `PathPrefix` (`McIPProbe`, running before authentication); on its own failure it is fail-open and exposes a Prometheus counter, and can be hot-reloaded via `/reload/access_control`.
 - The Data Plane BFE outputs structured error responses and access log fields, supporting security auditing, anomaly detection, and billing reconciliation; the Control Plane operation logs persistently record configuration write operations and can be audited via `GET /open-api/v1/operation-logs`.
 - Quota Keys and Rate-Limit Keys in Redis are actively cleaned up when an API-Key / Entity is deleted or a policy changes, avoiding the security risks of residual data.
 - Rate limiting and quota are key defenses against API-Key leakage, abuse, and runaway costs, and support multi-level inheritance from API-Keys and Entities.

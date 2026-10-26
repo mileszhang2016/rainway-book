@@ -15,9 +15,10 @@ v0.8.0 包含以下组件版本：
 | AI Gateway API | v0.0.11 | 控制面 |
 | AI Gateway EPP | v0.0.2 | EPP 智能调度 |
 | BFE | v1.8.9 | 数据面 |
-| Dashboard | v0.0.10 | 控制台（内嵌于 API 镜像） |
+| Dashboard | v0.0.11 | 控制台（内嵌于 API 镜像） |
 | conf-agent | v0.0.8 | 配置热加载代理 |
 | Log Reader | v1.5.0 | 访问日志 → Kafka / MySQL（mod_kafka / mod_log_mysql） |
+| ai-gateway-controller | v1.1.0 | Kubernetes 控制器：Service/Endpoints 发现 → InnerAPI `k8s_pools` |
 | ai-gateway-observability | v0.0.2 | 报表标准形态：Doris / ClickHouse / StarRocks 对接资产与部署脚本 |
 
 ## 全书目录
@@ -67,10 +68,11 @@ v0.8.0 包含以下组件版本：
 - [第三十四章 请求体处理模块实现：mod_body_process](./implementation/chapter34-mod-body-process.md)
 - [第三十五章 Conf Agent实现](./implementation/chapter35-conf-agent-implementation.md)
 - [第三十六章 EPP组件实现](./implementation/chapter36-epp-implementation.md)
+- [第三十七章 ai-gateway-controller实现](./implementation/chapter37-controller-implementation.md)
 
 ### 开发篇
-- [第三十七章 如何扩展壬远AI网关](./develop/chapter37-how-to-extend.md)
-- [第三十八章 如何向壬远AI网关贡献代码](./develop/chapter38-how-to-contribute.md)
+- [第三十八章 如何扩展壬远AI网关](./develop/chapter38-how-to-extend.md)
+- [第三十九章 如何向壬远AI网关贡献代码](./develop/chapter39-how-to-contribute.md)
 
 ### 附录篇
 - [附1 OpenAPI接口速查](./appendix/appendix01-openapi-quick-reference.md)
@@ -87,9 +89,10 @@ v0.8.0 包含以下组件版本：
 - `ai-gateway-api/`：控制面核心组件
 - `bfe/`：数据面转发引擎
 - `ai-gateway-epp/`：EPP 智能调度组件（基于 llm-d，经 ext_proc 为 EPP 模式 Cluster 提供后端选择）
+- `ai-gateway-controller/`：Kubernetes 控制器（Service/Endpoints 发现 → InnerAPI `k8s_pools`）
 - `conf-agent/`：配置代理
 - `ai-gateway-web/`：管理控制台（Dashboard）前端
-  - 控制台详细使用说明见：<https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.10/docs/zh-cn>
+  - 控制台详细使用说明见：<https://github.com/rainway-ai-gateway/ai-gateway-web/tree/refs/tags/v0.0.11/docs/zh-cn>
 
 ## 版权许可
 

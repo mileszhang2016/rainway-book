@@ -9,6 +9,7 @@ In an AI gateway scenario, the forwarding target of a request is determined enti
 - Master the data model, validation rules, and lifecycle consistency of the `route_rules` table;
 - Learn how AI route rules are exported to BFE, including binding order and file format;
 - Master the semantics of the `req_ai_intent_in` intent condition primitive and a complete example of route rules consuming intent;
+- Master the syntax, weekday numbering convention, and time zone semantics of the time condition primitive `time_weekday_in`;
 - Master the design and configuration of Fallback and the default route.
 
 ## Where AI Route Rules Sit in the Request Processing Pipeline
@@ -228,6 +229,13 @@ AI route rules keep their lifecycle consistent with that of API-Keys / Entities:
 | Global Route Table disabled | No global fallback; requests may end up with no rule to match |
 | Referenced Cluster deleted | Cluster deletion fails validation; references must be removed or rules deleted first |
 
+### Collection Constraints for AI Cache Rules
+
+AI cache rules are read and written as a whole set via `/open-api/v1/ai-cache-rules`. They share the BFE condition-expression syntax with route rules but have independent constraints:
+
+- **`cond` is unique within the set**: the submitted `rules[].cond` values must be pairwise distinct, compared byte for byte. A duplicate makes the interface return 422 `duplicate ai cache rule cond`. This constraint is a precondition for export — duplicate `cond` values leave BFE unable to decide which rule a given request should match, so the entire `ai_cache.data` file is rejected rather than the duplicate entry being skipped.
+- **Whole-set replacement semantics**: the write interface replaces the existing set with the submitted `rules` array as a whole; there is no per-entry create/update/delete. The rule elements in the response therefore contain no `created_at` / `updated_at` — those columns are reset by a whole-set replacement and cannot serve as the rules' own lifecycle evidence. To trace when a rule was modified, rely on the change records in the operation log (`/open-api/v1/operation-logs`).
+
 ## Semantic Routing and Intent Conditions
 
 Beyond conventional request-feature primitives (such as `req_host_in`, `req_body_json_in`), the `cond` of AI route rules also supports the intent condition primitive `req_ai_intent_in`, enabling semantic routing based on the semantic content of requests. The primitive is defined as `PrimitiveAiIntentIn` in `bfe/bfe_basic/condition/primitive.go`, with the signature:
@@ -294,6 +302,34 @@ The Control Plane maintains the following route table per API-Key (Entity / API-
 The effect of this configuration: writing requests (intent classification confidence ≥ 0.9) are routed to `cluster_deepseek_a`, and all other requests take the `default-route` global fallback. When the decision service fails or classification confidence is insufficient, `req_ai_intent_in` does not match, and writing requests automatically fall back to the default route — semantic routing never causes a request to fail.
 
 The data model of the intent question set (`intent_questions.data`) and the decision service protocol are detailed in the mod_ai_intent section of [Chapter 7: Data Plane Forwarding Design](./chapter07-data-plane-design.md); the implementation timing is detailed in [Chapter 31: Implementing the AI Route Module](../implementation/chapter31-mod-ai-route.md).
+
+## The Time Condition Primitive time_weekday_in
+
+Beyond request-feature and intent primitives, the `cond` of AI route rules also supports the system-time condition primitive `time_weekday_in`, enabling time-of-week scheduling such as splitting weekday and weekend traffic across different clusters. The primitive is implemented as `WeekdayMatcher` in `bfe/bfe_basic/condition`, with the signature:
+
+```
+time_weekday_in(String weekday_list [, String zone])
+```
+
+Parameter semantics:
+
+- `weekday_list`: a `|`-separated enumeration of weekday numbers, validated at configuration load time; range syntax is not supported (`"1-5"` is an error); elements may repeat and may carry whitespace on either side.
+- `zone`: a military time zone letter (see `bfe_util.TimeZoneMap`; `"H"` means UTC+8), optional; when omitted, evaluation uses UTC (`"Z"`). For deployments in China, `"H"` must be passed explicitly — at Monday 00:00 Beijing time, the UTC time is still Sunday, so omitting `zone` would misclassify a weekday as the weekend.
+
+The weekday numbering follows the Go `time.Weekday` convention: `0` is Sunday and `6` is Saturday, consistent with the `TimeRange.Weekdays` field of cluster pricing.
+
+Examples:
+
+```
+time_weekday_in("0|6", "H")        // weekends (Beijing time)
+time_weekday_in("1|2|3|4|5", "H")  // weekdays (Beijing time)
+```
+
+Semantics: the condition matches when the weekday of the current time belongs to the given set. The time is taken from the process clock; when the request carries the `X-Bfe-Debug-Time` debug header, the time specified by that header is used instead.
+
+In implementation, `WeekdayMatcher` compiles `weekday_list` into a `uint8` bitmask and resolves `zone` into a `time.Location` at configuration load time, performing only a bitmask test at runtime. The primitive is registered in `funcProtos` and `optionalLastArgProtos` (the latter provides the optional `zone` argument). By naming convention, new system-time primitives use the `time_` prefix, while the historical primitives `bfe_time_range` and `bfe_periodic_time_range` keep their `bfe_` prefix unchanged.
+
+On the Control Plane side, after the bfe dependency is upgraded, every entry point that saves or validates condition expressions — route rules, AI cache rules, AI context rules, traffic mirroring rules, and `PATCH /expression/verify` — accepts this primitive; illegal values (such as `"7"` or an invalid `zone`) are still rejected by the compile-time validation with a 422.
 
 ## Binding Order and File Format Exported to BFE
 
@@ -536,6 +572,7 @@ This chapter introduced the AI route rule design of the Rainway AI Gateway:
 - The `route_rules` table distinguishes levels via `type` and `owner`, and rules are stored as a JSON array;
 - The Control Plane validates rule names, conditions, weights, and Fallbacks at save time, and keeps the lifecycle consistent with that of API-Keys / Entities;
 - The `req_ai_intent_in` primitive supports semantic routing by intent classification results; intent lazy resolution is provided by `mod_ai_intent`, and when the decision service is unavailable it fails safe and falls through to subsequent rules;
+- The `time_weekday_in` primitive supports time-of-week scheduling by weekday (Go `time.Weekday` numbering); when `zone` is omitted it evaluates in UTC, so deployments in China should pass `"H"` explicitly;
 - AI route rules are exported via InnerAPI as `ai_route.json` and land in BFE as `ai_route.data`; `ApikeyRouteTableBindings` determines the lookup order;
 - Fallback provides ordered degradation when targets are unavailable, and the Global default route serves as the last-resort fallback; together they improve routing reliability.
 
@@ -553,3 +590,4 @@ This chapter introduced the AI route rule design of the Rainway AI Gateway:
 - `ai-gateway-api/model/imods/ai_route_exporter.go`
 - `bfe/bfe_modules/mod_ai_route/mod_ai_route.go`
 - `bfe/bfe_basic/condition/primitive.go` (`PrimitiveAiIntentIn`)
+- `bfe/bfe_basic/condition/` (`WeekdayMatcher`, `time_weekday_in`)

@@ -27,6 +27,7 @@ ai-gateway-api/endpoints/
 │   ├── access_logger.go      # Access logging
 │   ├── convert.go            # Request/response conversion and middleware adaptation
 │   ├── cors.go               # Cross-origin handling
+│   ├── ip_probe.go           # Management-plane IP allowlist
 │   ├── product_probe.go      # Product line context resolution
 │   ├── recovery.go           # panic recovery
 │   └── user_probe.go         # User/Token authentication
@@ -36,10 +37,13 @@ ai-gateway-api/endpoints/
 │   ├── ai_context/           # /ai-context-rules, /ai-context-settings
 │   ├── api_key/              # /api-keys
 │   ├── auth/                 # /auth, /meta
+│   ├── batches/              # /batches, /batch-files
 │   ├── certificate/          # /certificates
 │   ├── domain/               # Not currently registered
 │   ├── entity/               # /entities
 │   ├── entity_type/          # /entity-types
+│   ├── epp_assignments/      # /epp-assignments
+│   ├── epp_pool/             # /epp-pool
 │   ├── global_route_rules/   # /global-route-rules
 │   ├── intent_config/        # /intent-config
 │   ├── model_price/          # /model-prices
@@ -49,6 +53,7 @@ ai-gateway-api/endpoints/
 │   ├── report/               # /report/* (conditionally assembled, see below)
 │   ├── route/                # /expression/verify
 │   ├── route_tables/         # /route-tables
+│   ├── security/             # /security/reencrypt-sweeps
 │   ├── subcluster/           # Not currently registered
 │   ├── traffic/              # Not currently registered
 │   └── traffic_mirror/       # /traffic-mirror-rules
@@ -583,7 +588,7 @@ var EntityTypeCreateRoute = &xreq.Endpoint{
 }
 ```
 
-When a request reaches this Endpoint, if the current visitor does not have the `FeatureEntityType + ActionCreate` permission, a 401/402 error is returned directly. The OpenAPI permission model has been consolidated: the user `is_admin` field only supports `true`, and the Token `scope` retains only `System`/`Support`, so most management operations require System permission.
+When a request reaches this Endpoint, if the current visitor does not have the `FeatureEntityType + ActionCreate` permission, a 401/402 error is returned directly. The OpenAPI permission model has been consolidated: users are described by `role` (`system_admin` / `system_admin_readonly`; there is no `is_admin` field), and the Token `scope` takes `System`/`SystemReadonly`/`Support`, so most management operations require System permission.
 
 ### Unified Response
 

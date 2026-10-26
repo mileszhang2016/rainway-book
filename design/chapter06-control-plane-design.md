@@ -27,7 +27,7 @@
 | Dashboard | 管理控制台 | 调用 OpenAPI 完成可视化操作 |
 | BFE | 数据面 | 消费 InnerAPI 导出的配置并执行转发 |
 | Conf Agent | 配置代理 | 轮询 InnerAPI，拉取最新配置并触发 BFE 热加载 |
-| Service Controller | 服务发现 | 向控制面同步后端服务实例信息 |
+| ai-gateway-controller（原名 Service Controller） | 服务发现 | 把 K8s Service/Endpoints 的 Ready 实例上报为 K8s 实例池（InnerAPI `k8s_pools`），控制面再扇出到 Provider 镜像与 Cluster 派生池，最终经 `cluster_table` 导出到 BFE |
 
 AI Gateway API 当前的功能范围覆盖：API-Key / Entity / Entity-Type 管理、Provider 与 Cluster 管理、模型定价管理、配额计划与限流策略管理、AI 路由规则管理、AI 缓存规则、流量镜像规则、意图配置、上下文压缩规则、K8s 实例池管理、证书与附加文件管理、认证授权、配置操作日志审计以及面向数据面的配置导出。
 
@@ -313,7 +313,7 @@ OpenAPI 资源并非只有“按 id 寻址的 CRUD”一种形态。面向 BFE �
 
 - **Manager 设计**：`OperationLogManager` 实现 `OperationLogRecorder`（`Record`）与 `OperationLogManagerInterface`（含 `QueryLogs`、`Close`）两级接口。各业务 Manager 通过 `SetOperationLogManager` 注入 recorder，仅依赖最小接口 `OperationLogRecorder`，避免对查询能力的反向依赖；
 - **存储实现**：`storage/rdb/ioperlog/operation_log.go` 实现 `BatchCreate`（批量插入）与 `List`（条件查询 + 分页），DAO 层对应 `storage/rdb/internal/dao/table_operation_logs.go`；
-- **查询接口**：`endpoints/openapi_v1/operation_log/list.go` 暴露 `GET /open-api/v1/operation-logs`，鉴权为 `iauth.FeatureOperationLog + ActionReadAll`，仅 `ScopeSystem` 全权限可查询。
+- **查询接口**：`endpoints/openapi_v1/operation_log/list.go` 暴露 `GET /open-api/v1/operation-logs`，鉴权为 `iauth.FeatureOperationLog + ActionReadAll`；`ScopeSystem`（系统管理员）与 `ScopeSystemReadonly`（系统管理员·只读）均具备该读权限。
 
 ### 异步缓冲写入机制
 

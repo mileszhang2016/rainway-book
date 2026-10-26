@@ -535,6 +535,16 @@ The validation rules include:
 
 These checks ensure that configuration errors surface at startup or hot reload time, rather than failing during request processing.
 
+### The Time Condition Primitive time_weekday_in
+
+Beyond request-feature primitives, a rule's `Cond` can also reference the system-time condition primitive `time_weekday_in` — for example, `time_weekday_in("0|6", "H")` matches weekends. It is implemented as `WeekdayMatcher` in `bfe/bfe_basic/condition` and registered in `funcProtos` and `optionalLastArgProtos` (the latter provides the optional `zone` argument). The key design point is pushing all validation down to configuration load time:
+
+- `weekday_list` is a `|`-separated enumeration of weekday numbers following the Go `time.Weekday` convention (`0` is Sunday ... `6` is Saturday, consistent with the `TimeRange.Weekdays` field of cluster pricing). At load time it is compiled into a `uint8` bitmask and validated (`"7"` and other illegal values fail outright); range syntax is not supported (`"1-5"` is an error), and elements may repeat and carry whitespace;
+- the optional `zone` argument is a military time zone letter (`bfe_util.TimeZoneMap`, `"H"` = UTC+8), resolved into a `time.Location` at load time; when omitted, evaluation uses UTC (`"Z"`) — at Monday 00:00 Beijing time the UTC time is still Sunday, so deployments in China should pass `"H"` explicitly;
+- at runtime the current weekday is taken from the process clock (or from the `X-Bfe-Debug-Time` header when the request carries it), and only a single bitmask test is performed, so the per-evaluation cost is negligible.
+
+Since condition compilation uniformly goes through `condition.Build`, all of the above validation happens inside `ValidateRouteTable()`: illegal expressions and illegal primitive values fail at startup or hot reload and never reach runtime. The full semantics and Control Plane entry points of the primitive are covered in the "Time Condition Primitive time_weekday_in" section of [Chapter 11: AI Route Rule Design](../design/chapter11-ai-route-rules.md).
+
 ## Fallback Handling
 
 `mod_ai_route` is only responsible for writing the `Fallbacks` list into `AiRouteResult`; the actual fallback logic is executed in `ServeHTTPForAI()` in `bfe/bfe_server/reverseproxy.go`.
@@ -652,12 +662,25 @@ mod_ai_token_auth (authentication / quota binding)
 
 ### Impact of Hit Short-Circuit on Routing and Downstream
 
-Hit requests no longer execute `mod_ai_route`, which produces the following observable semantics:
+Hit requests finish with `BfeHandlerFinish` at the `HandleFoundProduct` stage and never enter the `ServeHTTPForAI()` attempt loop, so the following steps are skipped entirely:
+
+- rule evaluation and intent lazy resolution in `mod_ai_route`;
+- the target-model allowlist/blocklist check performed by `mod_ai_token_auth` at `HandleAfterAITargetModel`;
+- the TPM/RPM/concurrency checks of `mod_ai_rate_limit`;
+- upstream forwarding, usage parsing, and quota settlement at `HandleRequestFinish`.
+
+This produces the following observable semantics:
 
 - `AiRouteResult` does not exist in the request context, so the routing hit fields in the access log (`ai_route_rule_hits`, `ai_target_model`) are empty;
 - downstream reports determine cache hits using the access log field `ai_cache_status=hit` (exact hit) / `hit_semantic` (semantic hit) instead of the routing fields;
+- a hit calls no upstream, produces no tokens, and incurs no charge: `ai_zero_cost_reason=cache_hit`, and `ai_rate_limit_hits` is empty;
 - `mod_ai_token_auth` skips quota settlement at the `HandleRequestFinish` stage based on `AiBasicInfo.AiCacheHit`;
+- cache policy and rule changes take effect for already-cached entries when the entry TTL expires (`cacheTTL` or `DefaultCacheTTL`), not at rule load time;
 - when a cache rule `cond` references `req_ai_intent_in`, load time only logs a WARN without rejecting it (`bfe/bfe_modules/mod_ai_cache/cache_rule_load.go`): cache lookup runs before routing, so intent conditions only participate in evaluation on the miss path; on a hit, lazy resolution is not triggered, and referencing intent conditions dilutes the benefit of moving the cache forward.
+
+### Set Constraints on the Cache Rule File
+
+When writing, the Control Plane `/open-api/v1/ai-cache-rules` enforces that `rules[].cond` is unique within the set (compared byte for byte), returning 422 `duplicate ai cache rule cond` on a duplicate. This constraint maps directly to BFE load behavior: when `mod_ai_cache` parses `ai_cache.data`, a duplicate `cond` within the same product line prevents the module from deciding which rule a request should match, and the entire file is rejected rather than the duplicate entry being skipped. Uniqueness is therefore intercepted at Control Plane write time, and the Data Plane loads only a fully valid file.
 
 ### Intent Lazy Resolution Timing
 
@@ -839,8 +862,10 @@ flowchart TD
 `mod_ai_route` is the routing module that connects the upstream and downstream of the Rainway AI Gateway Data Plane:
 
 - It is registered at the `HandleFoundProduct` callback point and relies on `ClientApiKey` written by `mod_ai_token_auth` for route lookup;
-- `mod_ai_cache` sits between authentication and routing; a cache hit short-circuits and returns immediately — hit requests do not execute route lookup, the `ai_route_rule_hits`/`ai_target_model` log fields are empty, and reports use `ai_cache_status` to determine cache hits;
+- `mod_ai_cache` sits between authentication and routing; a cache hit short-circuits and returns immediately — hit requests skip route lookup, target-model allowlist/blocklist validation, rate limiting, and quota deduction, the `ai_route_rule_hits`/`ai_target_model` log fields are empty, and reports use `ai_cache_status` to determine cache hits;
+- `/ai-cache-rules` guarantees that `rules[].cond` is unique within the set at write time (byte-for-byte comparison, returning 422 on a duplicate), preventing duplicate conditions from causing BFE to reject the entire `ai_cache.data` file;
 - Through `ApikeyRouteTableBindings` it implements three-level priority routing of **apikey → entity → global**, with condition expressions matched in rule order within each route table; intent classification is provided by `mod_ai_intent` through lazy resolution, triggered on the first evaluation of `req_ai_intent_in`;
+- The system-time primitive `time_weekday_in` enables time-of-week scheduling; its bitmask compilation and time zone resolution all happen at load time, and its validation runs together with `condition.Build` during hot reload;
 - The configuration file uses a layered design of JSON DTO and runtime structures, accommodating legacy field differences such as `route_rules`/`RouteRules` and `api_key`/`apikey`;
 - Condition expression compilation and weight validation are completed at configuration load time, ensuring configuration correctness at startup and during hot reload;
 - Hot reload atomically swaps the in-memory route tables only after validation passes, so failures do not affect the currently running rules;
@@ -859,6 +884,7 @@ Understanding the implementation of `mod_ai_route` helps you quickly find the ro
 - `bfe/bfe_modules/mod_ai_route/route_table.go`
 - `bfe/bfe_modules/bfe_modules.go`
 - `bfe/bfe_basic/request_ai_route.go`
+- `bfe/bfe_basic/condition/` (`WeekdayMatcher`, the `time_weekday_in` primitive)
 - `bfe/bfe_server/reverseproxy.go`
 - `bfe/bfe_model_protocol/` (protocol adapter layer, source of the ErrorNormalizer seam in `shouldTriggerFallback`)
 - `bfe/bfe_modules/mod_ai_cache/mod_ai_cache.go`, `cache_rule_load.go`, `request.go` (cache lookup and hit short-circuit)

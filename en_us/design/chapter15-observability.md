@@ -21,7 +21,7 @@ The industry typically divides observability into three pillars: Logs, Metrics, 
 
 ### Logs
 
-Logs are used to record the complete lifecycle of every request. The BFE Data Plane outputs key information about each stage of a request — authentication, routing, forwarding, and billing — through the Access Log, enabling downstream troubleshooting, billing reconciliation, and security auditing. AI-specific fields uniformly occupy field numbers 701-900 of the `bfe-access-pb` protocol, covering dimensions such as authentication, routing, rate limiting, quota, cache, mirror, intent, context compression, token metering, and cost; the full set of observable fields is in `bfe/docs/zh_cn/sys_design/ai_access_log_fields.md`.
+Logs are used to record the complete lifecycle of every request. The BFE Data Plane outputs key information about each stage of a request — authentication, routing, forwarding, and billing — through the Access Log, enabling downstream troubleshooting, billing reconciliation, and security auditing. AI-specific fields uniformly occupy field numbers 701-900 of the `bfe-access-pb` protocol (batch-task fields additionally occupy the 901-907 extension range), covering dimensions such as authentication, routing, rate limiting, quota, cache, mirror, intent, context compression, token metering, and cost; the full set of observable fields is in `bfe/docs/zh_cn/sys_design/ai_access_log_fields.md`.
 
 ### Metrics
 
@@ -58,6 +58,7 @@ AI observability fields uniformly occupy field numbers 701-900 of `bfe-access-pb
 | 801 - 840 | Routing, transformation, plugins, and intent, such as route rule hits, cluster/key attempt lists, and intent classification results |
 | 841 - 880 | Security, compliance, privacy, and traffic mirroring, such as hit/rejected Quota Plan IDs and mirror hit/target cluster |
 | 881 - 900 | Vendor extensions and reserved |
+| 901 - 907 | Batch tasks, such as task ID, file ID/operation, file line/byte counts, task status, and settlement |
 
 ### Core AI Access Log Fields
 
@@ -143,6 +144,41 @@ The access log of `mod_traffic_mirror` (traffic mirroring) records only fields t
 
 Among the above fields, 10 columns — `ai_cache_status` (789), the seven `ai_intent_*` fields (803-809), and `mirror_hit` / `mirror_cluster` (842/843) — are registered and written to the reporting database by log-reader `mod_log_mysql`. The MySQL detail table `bfe_ai_request_log` has 99 columns, with column order identical to the ai-gateway-api `db_ddl_report_mysql.sql`; `ai_cache_key` / `ai_cache_semantic` / `ai_cache_similarity` (790-792) and the four `ai_context_*` fields (793-796) are visible only at the access-log layer and do not land in the reporting database. On the Kafka side, the default field set of `mod_kafka` is aligned with the MySQL write columns (92 fields); among them, `ai_intent_confidence` / `ai_intent_latency_us` / `ai_intent_cache_hit` are proto optional numerics that output JSON `null` when not evaluated, semantically consistent with NULL on the MySQL side.
 
+### Billing Attribution, Upstream Error Normalization, and Batch Task Fields
+
+Beyond the fields above, the access log provides three more groups of fields for billing reconciliation and error attribution (this chapter only lists them briefly; implementation details are in [Chapter 32: mod_ai_token_auth Implementation](../implementation/chapter32-mod-ai-token-auth.md)).
+
+Billing attribution fields (763-765), filled by `mod_ai_token_auth` at the metering stage, make billing bypasses and zero-cost requests directly queryable and attributable in reconciliation:
+
+| Field Name | Number | Type | Description |
+|--------|------|------|------|
+| `ai_price_miss` | 763 | bool | Price-miss marker: true when the `(model, mode)` price entry is absent and the cost falls back to the model's chat-mode price (or is billed 0 when no fallback price exists) |
+| `ai_usage_source` | 764 | string | Usage source: `parsed` (final usage parsed from the upstream response) / `estimated` (estimated tokens approved for billing) / `aborted` (client disconnected, billing skipped) / `unrecognized` (usage unrecognized and not estimatable, billing skipped) |
+| `ai_zero_cost_reason` | 765 | string | Reason a 2xx request was charged 0: `cache_hit` / `batch_release` / `price_miss` / `price_zero` / `no_usage_tokens`, etc. |
+
+Upstream error normalization fields (810-815), recording the error normalization result of the gateway's forwarding to upstreams, so that errors from different vendors can be counted under a unified convention in reports and alerts:
+
+| Field Name | Number | Type | Description |
+|--------|------|------|------|
+| `ai_upstream_status` | 810 | int32 | Original upstream HTTP status code |
+| `ai_upstream_err_code` | 811 | string | Upstream error code |
+| `ai_err_normalized` | 812 | bool | Whether the error has been normalized to a gateway-standard error |
+| `ai_err_normalize_miss` | 813 | bool | The error matched no normalization rule |
+| `ai_stream_error_rewritten` | 814 | bool | Whether an error in the streaming response has been rewritten |
+| `ai_stream_truncated` | 815 | bool | Whether the streaming response was truncated |
+
+Batch task fields (901-907), filled by `mod_ai_batch` in batch-task and file-operation scenarios:
+
+| Field Name | Number | Type | Description |
+|--------|------|------|------|
+| `ai_batch_id` | 901 | string | Batch task ID (`batch_xxx`), carried on the task and on file operations belonging to it |
+| `ai_file_id` | 902 | string | File ID (`file-xxx`), filled on file operations |
+| `ai_batch_op` | 903 | string | Batch/file operation type |
+| `ai_file_lines` | 904 | int64 | jsonl line count (counted at upload or parsed from the batch output file) |
+| `ai_file_bytes` | 905 | int64 | File size in bytes |
+| `ai_batch_status` | 906 | string | Vendor-side batch task status snapshot: `validating` / `queued` / `in_progress`, etc. |
+| `ai_batch_settle` | 907 | string | Batch task settlement result |
+
 ### Zero-Value Semantics of Duration Fields
 
 The five duration fields of the access log — `ClusterServeTime` / `BackendServeTime` / `WriteClientTime` / `SessionOffsetTime` / `ProxyDelayTime` — are all funneled through `durationMsUint32` in `bfe_modules/mod_access_pb3/request_log.go`: when either endpoint is a zero time or the difference is negative, the value is written as 0.
@@ -152,6 +188,20 @@ The five duration fields of the access log — `ClusterServeTime` / `BackendServ
 ### Subset Semantics of Responses API Cache Metering
 
 For the Responses API, `input_tokens` already includes `cached_tokens` (`total_tokens = input_tokens + output_tokens`, consistent with the total-input semantics of Chat Completions / Gemini). The protocol adaptation layer (`ParseOpenAIUsageFields` in `bfe/bfe_model_protocol/utils/usage_parse.go`) takes `input_tokens` directly as `PromptTokens` for the Responses chain without stacking cache sub-items on top — in the access log, `ai_input_tokens` is the total input and `ai_cache_read_tokens` is its subset. The Anthropic protocol differs: its `input_tokens` counts only fresh (cache-missing) tokens and excludes `cache_read_input_tokens` / `cache_creation_input_tokens`, so the adaptation layer (`ParseAnthropicUsageFields`) keeps the additive normalization (`PromptTokens = input_tokens + cache_read + cache_creation`) to align with the total-input semantics of OpenAI's `prompt_tokens`. The two accounting conventions are unified at the parsing layer, so downstream billing splits and reports do not need to distinguish protocols.
+
+### Logid Encoding and the Report Dedup Key
+
+The `logid` in access logs is a per-request unique identifier, and reports use it as the request-level discriminator.
+
+**Logid encoding**: BFE's `genLogId` (`bfe/bfe_modules/mod_logid/mod_logid.go`) generates a decimal string in the range `[1, 2^63-1]`: it converts losslessly to and from the uint64 log field in the access log, and the 63-bit upper bound guarantees the value always fits within the signed BIGINT range of MySQL / Doris / StarRocks. The `X-Bfe-Log-Id` response header, the `log_id` in the text access log, the `%bfe_log_id` log template variable, and the logid in WAF/mirror logs all carry this decimal string, and downstream consumers parse it as decimal (parsing it as 32-hex cannot correlate). For sessions whose logid cannot be converted (`mod_logid` not loaded, malformed values), `mod_access_pb3` regenerates a non-zero id locally and counts it in the `LogidRegenerated` / `SessionIdRegenerated` module counters respectively; it never writes 0.
+
+**Report dedup key**: the unique key `uk_dedup` of the report detail table spans the five columns `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)`. With logid as the request-level discriminator in the key, concurrent requests with the same key and model in the same second each get their own row; only a replay of the same request (same logid) hits the overwrite, so redeliveries / `-b` re-reads remain idempotent. How this lands on each backend:
+
+- **MySQL**: the `logid` column of `bfe_ai_request_log` is `BIGINT NOT NULL DEFAULT 0` (NULLs are never equal under unique-key semantics, so a nullable column would let logid-missing rows escape deduplication). The header of `db_ddl_report_mysql.sql` ships migration `ALTER` statements (backfill `logid IS NULL` rows first, then rebuild the unique key).
+- **Doris**: the detail table's UNIQUE KEY spans the five columns (logid as the 5th KEY column, `BIGINT NOT NULL`). Doris does not support online schema change for the KEY column set, so adjusting it requires a table rebuild: pause the Routine Load → create a `_v2` table with the target schema and backfill with `IFNULL(logid,0)` (semantically equivalent to the four-tuple) → `REPLACE WITH TABLE` swap for an atomic rename → resume the Routine Load → verify → drop the old table. Full steps are in `ai-gateway-observability/doris/docs/user/HOWTO.md` §11.5; verified on Doris 3.0.8.
+- **ClickHouse / StarRocks**: the ClickHouse detail table is MergeTree (append-only, with no dedup merge in the write path; `ORDER BY` is four columns and `logid` is `UInt64 DEFAULT 0`), and the StarRocks detail table is DUPLICATE KEY (append-only). Neither has UNIQUE KEY merge semantics.
+
+**log-reader side**: for rows with `logid=0`, `mod_log_mysql` degrades to four-tuple semantics (same-second concurrent rows still overwrite each other) and counts such rows in the `LOGID_EMPTY` counter. The threshold for this counter should be 0 — any value >0 should trigger an alert, indicating that some upstream is still producing zero-logid logs. See `ai-gateway-api/db_ddl_report_mysql.sql`, `log-reader/doc/modules/mod_log_mysql/output-columns.md` and `ai-gateway-observability/doris/docs/user/HOWTO.md` §11.5.
 
 ### Control Plane Operation Logs (Audit Data Source)
 
@@ -166,6 +216,8 @@ Write operations on each resource (covering create/update/delete on modules such
 - Request context: `request_path`, `request_method`, `client_ip`, `user_agent`, and `created_at`.
 
 Operation logs are stored in the `operation_logs` table of the Control Plane database. The `log_id` is consistent with the LogID in the BFE access log, so audit scenarios can query by operator, resource, time range, and other criteria with pagination, enabling two-way tracing between "configuration changes" and "request behavior".
+
+The query interface uses page-number pagination and returns `{list, pagination: {page, page_size, total}}`; the list is ordered by `created_at DESC, id DESC`, and the filter columns are covered by composite indexes to support high-frequency audit queries. `pagination.total` comes from a count cache with a 10s TTL: writes on the local instance invalidate the cache immediately, while invalidation across instances relies on asynchronous batch flushes (roughly one 5s cycle), so in a multi-instance deployment `total` may lag by one flush cycle; decide that paging has ended based on whether `list` is empty.
 
 ## Key Monitoring Metrics
 
@@ -282,11 +334,24 @@ The aggregation table is unified across the four backends at 40 dimensions + 24 
 
 The official components of the standard form (ai-gateway-observability repository) are named as follows: on the Doris side, the database `bfe_observability` is created, containing the detail table `bfe_ai_request_log` and the minute-aggregation table `bfe_ai_metrics_1m`; details are loaded from Kafka via the Routine Load `bfe_ai_log_load`, and minute pre-aggregation is done on the Doris side by the INSERT JOB `bfe_ai_metrics_1m_job`; Grafana uses a MySQL-protocol connection to the Doris FE query port (9030 by default) as its data source, with the dashboard configured as `grafana/dashboards/bfe-ai-gateway-observability.json`. On the ClickHouse side, `clickhouse/setup.sh` creates the database and five kinds of objects in six steps: the detail table (MergeTree, 7-day TTL), the Kafka engine staging table, the consuming materialized view (flattens JSON into the detail table), the aggregation table (SummingMergeTree), and the aggregation materialized view (minute buckets); the Kafka consumer groups for detail and aggregation are `clickhouse_bfe_ai_log`. On the StarRocks side, `starrocks/setup.sh` creates in four steps the database, the detail table (DUPLICATE KEY), the async materialized view `bfe_ai_metrics_1m` (`REFRESH ASYNC EVERY (INTERVAL 1 MINUTE)` — the name is the report query contract name), and the Routine Load `bfe_ai_log_load`; the consumer group is `starrocks_bfe_ai_log`. Deployment guides for the three sides are in `doris/docs/user/HOWTO.md`, `clickhouse/docs/user/HOWTO.md`, and `starrocks/docs/user/HOWTO.md`; table designs are in the `docs/design/TABLE_DESIGN.md` of each directory; Grafana panels and SQL are in `grafana/docs/design/DASHBOARD_DESIGN.md`; and the PB-field → log-reader-JSON-field mapping is in `api/depends_api/req_log.md`.
 
+### Boolean Columns in the StarRocks Detail Table
+
+In the StarRocks detail table `bfe_ai_request_log`, the columns `is_trust_src_ip`, `ai_stream`, `mirror_hit`, and `ai_intent_cache_hit` are typed `BOOLEAN`, and JSON `true`/`false` in Kafka messages are written directly as boolean values. If these columns are declared `TINYINT` out of habit from other engines, Routine Load does not fail; it silently writes `NULL` — trust-source-IP decisions, streaming flags, mirror hits, and intent cache hits all become distorted across reports, with nothing visible in the error logs.
+
+The cross-engine type alignment is: Doris `TINYINT`, ClickHouse `UInt8`, StarRocks `BOOLEAN`. When the detail table already exists with mismatched boolean column types, StarRocks cannot alter `TINYINT` to `BOOLEAN` in place, and the table must be rebuilt:
+
+1. `STOP ROUTINE LOAD FOR bfe_ai_log_load`;
+2. `DROP MATERIALIZED VIEW bfe_ai_metrics_1m`, then `DROP TABLE bfe_ai_request_log`;
+3. Run `starrocks/setup.sh` to recreate the detail table, materialized view, and Routine Load with the target schema;
+4. Replay Kafka messages with `OFFSET_BEGINNING` to backfill old values within the rebuild window.
+
+Reports return no data during the rebuild window, so schedule it for off-peak hours and confirm Kafka retention covers the gap in advance.
+
 Key design trade-offs of the four pipelines:
 
 - **The plugin writes directly to the database, without routing through the Control Plane**. log-reader is deployed with BFE in the Data Plane, and the availability of the log pipeline must not depend on the release and load of the Control Plane (AI Gateway API). Access logs are the highest-throughput data stream of the Data Plane; relaying them through the API would create a convergence bottleneck. This is consistent with the existing convention of `mod_kafka` writing directly to Kafka.
 - **Same-name, same-column table design**. The detail tables of the four backends share the same name, with column sets aligned to the same set of log-reader output fields. The query API returns identically structured responses for each backend, differing only in the presence of optional fields (e.g., MySQL provides no percentiles).
-- **Idempotent writes**. The unique key `(hostid, log_time, ai_apikey_id, ai_requested_model)` is enforced differently on each side: on the MySQL side, writes use `INSERT ... ON DUPLICATE KEY UPDATE` overwrite semantics, so log-reader redeliveries or `-b` re-reads produce no duplicates; on the Doris / StarRocks sides, the Routine Load guarantees by message offset; on the ClickHouse side, the consumption pipeline is at-least-once, and the query side falls back on dimensional aggregation.
+- **Idempotent writes**. The unique key `uk_dedup` consists of five columns `(hostid, log_time, ai_apikey_id, ai_requested_model, logid)` (logid is the request-level discriminator column; see the "Logid Encoding and the Report Dedup Key" section above) and is enforced differently on each side: on the MySQL side, writes use `INSERT ... ON DUPLICATE KEY UPDATE` overwrite semantics, so only a replay of the same request (same logid) hits the overwrite, and log-reader redeliveries or `-b` re-reads produce no duplicates; on the Doris side it is guaranteed by the UNIQUE KEY merge semantics (adjusting the KEY set requires a full table rebuild, see HOWTO §11.5); on the StarRocks side the Routine Load guarantees it by message offset; on the ClickHouse side, the consumption pipeline is at-least-once, and the query side falls back on dimensional aggregation.
 - **One landing form per cluster**. If multiple landing forms are enabled for the same cluster, the reports become inconsistent due to their respective data-gap windows. Multiple storage backends can be deployed in parallel against the same Kafka topic for grayscale comparison, but production environments should follow "one landing form per cluster".
 - **Schema-first**. The DDL of the two report tables (detail table + minute aggregation table) is released before the plugin is enabled: for the MySQL form, it is released with the ai-gateway-api repository (`db_ddl_report_mysql.sql`); for the Doris / ClickHouse / StarRocks forms, it is released from the ai-gateway-observability repository (the `sqls/` directories and `setup.sh`). The deployment pipeline creates the tables before enabling the log-reader plugin; the plugin itself provides no auto table creation.
 - **Least-privilege accounts**. The log-reader write account holds only INSERT/UPDATE on the target table (overwrite needs UPDATE), with no DDL/DELETE. The AI Gateway API query account needs only SELECT on query-only backends (Doris / ClickHouse / StarRocks); for the MySQL form it additionally needs INSERT/DELETE on the aggregation table, DELETE on the detail table (non-partitioned fallback cleanup), and ALTER TABLE (partition management).
@@ -339,9 +404,12 @@ The availability of the reporting pipeline depends on log-reader writing continu
 - **Startup connection tolerance**: when MySQL is temporarily unreachable, the process does not exit; `connSupervisor` keeps retrying in the background at `ConnectRetryIntervalMs` (default 3000ms), and the monitoring key `MYSQL_CONN_STATE` is `DOWN`. New logs accumulate in the buffer queue until the connection succeeds, then are drained and backfilled automatically. Configuration errors (empty `Addr`/`User`/`DBName`/`Table`, missing or malformed configuration file) still fail fast: `Init` returns an error and the process exits.
 - **Automatic reconnect on runtime disconnects**: after write retries are exhausted, `markDown` sets `MYSQL_CONN_STATE` to `DOWN`, counts `MYSQL_CONN_LOST`, and holds the batch without occupying `QueueSize`; the supervisor reconnects in the background at `ConnectRetryIntervalMs`, and after success the failed batch is backfilled first — only if the backfill still fails is `SEND_MYSQL_FAILED` counted and the batch dropped. Writes use `INSERT ... ON DUPLICATE KEY UPDATE` idempotent overwrite, so backfills/replays produce no duplicate rows. Within a disconnect window, row order may differ from arrival order; consumers should rely on `log_time` + `logid`, and minute-aggregation reports are unaffected.
 - **Optional health probing**: when `HealthPingIntervalMs > 0`, the supervisor periodically calls `PingContext` while UP and marks down on failure, detecting half-open connections (firewall drops, NAT timeouts) earlier; the default 0 disables it.
+- **Numeric column clamping**: before writing, 16 integer columns are bounded — `req_num`, `req_header_len`, `req_body_len`, `res_header_len`, `res_body_len`, `all_time`, `read_client_time`, `cluster_serve_time`, `backend_serve_time`, `write_client_time`, `connect_backend_time`, `proxy_delay_time`, `session_offset_time`, and `ai_retry_count` cap at `2147483647` (INT), `res_status_code` caps at 32767 (SMALLINT), and `backend_retry` caps at 127 (TINYINT). Out-of-range values are clamped to the column limit and written normally. Each clamp counts the field value in `VALUE_NORMALIZED` and raises a rate-limited alert, so an anomalous value does not fail the whole INSERT batch.
+- **Bad-row isolation**: when a batch write hits a row-locatable data error (MySQL 1264/1406 with `at row N` in the message), the row is dropped and the statement is immediately rebuilt and re-issued, consuming no retry and triggering no `markDown`, and the drop is counted in `ROW_DROPPED_DATA`. `SEND_MYSQL_FAILED` counts only structural errors (missing table, revoked privileges, etc.); `WRITE_BATCH_SIZE` counts the rows actually persisted, so after a dropped row it is smaller than the original batch size. `VALUE_NORMALIZED` and `ROW_DROPPED_DATA` are constantly 0 in steady state; any non-zero value warrants investigating upstream field values or data quality.
 - **Connection-related configuration keys**: `[mysql]` section `ConnectTimeoutMs = 3000`, `ConnectRetryIntervalMs = 3000`, `HealthPingIntervalMs = 0`; `[Writer]` section `BatchTimeoutMs = 30000`.
 - **Connection monitoring keys**: `MYSQL_CONN_STATE` (`UP`/`DOWN`), `MYSQL_CONN_RETRY` (cumulative connect retries), `MYSQL_CONN_OK` (cumulative connect successes), `MYSQL_CONN_LOST` (runtime disconnect count). Alerts are recommended on `MYSQL_CONN_STATE` transitions or sustained `DOWN`; runtime disconnects themselves do not contribute to `SEND_MYSQL_FAILED` (a positive count there means a structural error, such as a dropped table or revoked privileges).
 - **mod_kafka field alignment**: the default field set has 92 fields, aligned with the `mod_log_mysql` write columns; fields such as `log_tag` / `client_network` / `user_agent` / `vip` also have values in the Kafka JSON. The three proto optional numerics `ai_intent_confidence` / `ai_intent_latency_us` / `ai_intent_cache_hit` output JSON `null` when not evaluated, semantically consistent with NULL (not evaluated) on the MySQL side.
+- **Logid fallback and alerting**: rows with `logid=0` cannot be deduplicated by the request-level discriminator column; at write time they fall back to four-tuple semantics (same-second concurrent rows still overwrite each other) and are counted in the `LOGID_EMPTY` counter. The threshold for this counter should be 0 — a value >0 means some upstream is still producing zero-logid logs (e.g., an older BFE) and should trigger an alert.
 
 ### Module Assembly and Release Order
 
@@ -396,6 +464,8 @@ Based on logs and metrics, the following alert rules are recommended:
 | High time to first token | `ai_ttft_us` P99 exceeds business SLA | warning | Investigate network latency, backend model load, cold start hits |
 | High average output token latency | `ai_tpot_us` P99 exceeds threshold | warning | Check model instance load, streaming response bandwidth |
 | High retry count | `ai_retry_count` average rises abnormally | info | Check upstream key availability, model service stability |
+| Report detail logid missing | log-reader `LOGID_EMPTY` > 0 | warning | Rows with logid=0 exist and report dedup degrades to four-tuple semantics; investigate nodes still running an older BFE or logid conversion anomalies |
+| log-reader write data anomaly | `VALUE_NORMALIZED` or `ROW_DROPPED_DATA` > 0 | warning | Field values were clamped to column limits or bad rows were dropped; investigate upstream field values and coverage of the column range table |
 
 Alert notifications should be split by product line or tenant to avoid global alerts drowning out critical information. Meanwhile, for billing-related alerts (such as insufficient quota), the business party should be notified first rather than only the operations team.
 
@@ -452,13 +522,14 @@ Since BFE access logs are encoded with Protocol Buffers, the log platform needs 
 This chapter introduced the observability design of the Rainway AI Gateway. The key points are as follows:
 
 - Observability consists of three pillars: logs, metrics, and traces. The BFE Data Plane currently has deep customization in logs and metrics;
-- The AI-specific fields of the access log cover the full lifecycle information of authentication, routing, rate limiting, quota, cache, mirror, intent, context compression, token metering (including image/video generation sub-items), and cost estimation, and the log does not record the raw API Key;
+- The AI-specific fields of the access log cover the full lifecycle information of authentication, routing, rate limiting, quota, cache, mirror, intent, context compression, token metering (including image/video generation sub-items), cost estimation, billing attribution, upstream error normalization, and batch tasks, and the log does not record the raw API Key;
+- logid is a decimal string in the range `[1, 2^63-1]` (compatible with signed BIGINT), and the report dedup key is a five-column unique key including logid; `X-Bfe-Log-Id` and related fields carry decimal strings, which downstream consumers parse as decimal; sessions whose logid cannot be converted are regenerated locally with a non-zero id and counted in the `LogidRegenerated` / `SessionIdRegenerated` counters;
 - Control Plane operation logs record the operator, resource, change summary (with diff_keys), and request context of every configuration change, with sensitive fields masked, and can be queried for audit via `GET /open-api/v1/operation-logs`;
 - Key monitoring metrics include `REQ_TOTAL`, route hit/miss/fallback, rate limit triggers, quota hits and rejections, token consumption rate, TTFT/TPOT, etc.;
 - Prometheus can collect BFE metrics via pull, and Zabbix can integrate via HTTP agent or custom scripts;
 - The reporting system adopts one query API and console pages with four storage backends (MySQL / Doris / ClickHouse / StarRocks), switched by `[Report].Backend`; when absent, the module stays unassembled (endpoints 404). Production follows "one landing form per cluster", while multiple storage backends can be deployed in parallel against the same Kafka topic for grayscale comparison;
 - The aggregation table is unified across the four backends at 40 dimensions + 24 metrics (including cache/mirror/intent drill-down dimensions), with pre-aggregation divided by form: MySQL relies on the built-in minute-aggregation JOB and partition-management JOB, Doris on the INSERT JOB, ClickHouse on materialized views, and StarRocks on the async materialized view;
-- The report query API shields the dialect differences of the four backends behind the `ReportStorager` interface and `BackendCaps` capability gating; the overview/timeseries/rankings/distribution/logs endpoints provide three metric groups (cache, mirror, intent) and filter parameters; log-reader `mod_log_mysql` guarantees write resilience with "long-running process + background reconnect + failed-batch-first backfill";
+- The report query API shields the dialect differences of the four backends behind the `ReportStorager` interface and `BackendCaps` capability gating; the overview/timeseries/rankings/distribution/logs endpoints provide three metric groups (cache, mirror, intent) and filter parameters; log-reader `mod_log_mysql` guarantees write resilience with "long-running process + background reconnect + failed-batch-first backfill", a `LOGID_EMPTY` count >0 should trigger an alert, and `VALUE_NORMALIZED` / `ROW_DROPPED_DATA` stay at 0 in steady state; the boolean columns of the StarRocks detail table (`is_trust_src_ip`, `ai_stream`, `mirror_hit`, `ai_intent_cache_hit`) are `BOOLEAN`, and declaring them `TINYINT` silently writes NULL;
 - The error code system is divided into four layers: authentication and admission, rate limit check, quota deduction, and forwarding and protocol adaptation, with a clear correspondence to access log fields;
 - Alerts should cover error rate, rate limiting, quota, route hit rate, latency, and retries, and notifications should be split by product line or tenant.
 
@@ -473,8 +544,8 @@ Observability is not a one-time effort; it evolves continuously as business scal
 - `ai-gateway-api/docs/zh_cn/config_param.md` — AI Gateway API Configuration File Documentation
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/operation-logs.md` — Operation Log Interface Definition
 - `ai-gateway-api/design-docs/api-define/OpenAPI接口定义/report.md` — Report Query Interface Definition
-- `ai-gateway-api/design-docs/modifications/2026-09-15-report-query-api/change-summary.md` — Report Query API Change Summary
-- `ai-gateway-api/db_ddl_report_mysql.sql` — Report Detail and Aggregation Table DDL (MySQL Form)
+- `ai-gateway-api/db_ddl_report_mysql.sql` — Report detail and aggregation table DDL (MySQL form, including `uk_dedup` and migration statements)
+- `log-reader/doc/modules/mod_log_mysql/output-columns.md` — mod_log_mysql output columns and idempotency key (including the request-level logid discriminator)
 - `log-reader/doc/modules/mod_log_mysql/mod_log_mysql.md` — mod_log_mysql plugin documentation (connection tolerance, write batching, and monitoring keys)
 - `log-reader/doc/modules/mod_kafka/output-fields.md` — mod_kafka default output fields (92) and optional-null semantics
 - `ai-gateway-observability/doris/docs/user/HOWTO.md` — Doris deployment guide (standard form)

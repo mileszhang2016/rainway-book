@@ -32,6 +32,8 @@ The Conf Agent code lives under `conf-agent/` in the repository root. By functio
 
 A typical production configuration file can be found at `conf-agent/conf/conf-agent.toml`, which defines a `Reloader` for 11 modules such as `server_data_conf`, `cluster_conf`, and `tls_conf`, as well as `mod_ai_route`, `mod_ai_token_auth`, `mod_ai_rate_limit`, `mod_body_process`, `mod_ai_cache`, `mod_traffic_mirror`, `mod_ai_intent`, and `mod_ai_context`.
 
+It is worth noting that the entire `[Reloaders.tls_conf]` section (including `CopyFiles` and `[[Reloaders.tls_conf.ExtraFileTasks]]`) is commented out by default in the sample configuration: AI Gateway API currently does not support TLS configuration delivery, and enabling this Reloader would make the prober polling produce a large volume of error-level logs; the TLS capability (server certificates and client CA/CRL delivery, see the "Extra File Task" section below) is not used in current deployments. When TLS is enabled in the future, uncommenting the section restores the Reloader — no Go code changes are required. Accordingly, the "11 modules" mentioned above are the full form of the sample configuration; the set of Reloaders actually in effect is determined by each deployment's own `conf-agent.toml`.
+
 ## Agent and Reloader Lifecycle
 
 ### Startup Flow
@@ -591,7 +593,7 @@ if runtime.GOOS == "windows" && targetInfo.IsDir() {
 
 Conf Agent is the key component that enables the Rainway AI Gateway to "deliver from the Control Plane and load on the Data Plane without interruption." This chapter focused on its source-code implementation and covered the following:
 
-- **Directory and module division**: `main.go`, `agent`, and `conf_reload` each have their own responsibilities; `prober`, `file_store`, and `trigger` complete the three steps of pulling, storing, and triggering.
+- **Directory and module division**: `main.go`, `agent`, and `conf_reload` each have their own responsibilities; `prober`, `file_store`, and `trigger` complete the three steps of pulling, storing, and triggering; in the sample configuration, the `[Reloaders.tls_conf]` section is commented out by default because AI Gateway API does not yet support TLS configuration delivery — uncommenting it when TLS is enabled requires no Go code changes.
 - **Lifecycle**: `Agent` manages multiple `Reloader` goroutines; each `Reloader` polls at `ReloadInterval`, with random jitter added at startup to avoid thundering herd.
 - **Configuration pulling**: normal tasks pull one-to-one; multi-key JSON tasks split multiple files out of one large JSON; extra-file tasks parse and download extra resources such as certificates via JSON Path.
 - **Versioned storage**: a `ConfDir_{version}` temporary directory is created each time and a `.conf-agent-version` marker is written; at switch time a symlink/junction atomically points to the new version.

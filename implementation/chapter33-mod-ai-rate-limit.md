@@ -8,6 +8,7 @@
 - 掌握 TPM、RPM 与并发三种限流算法的 Redis 实现原理；
 - 理解控制面（AI Gateway API）如何生成稳定的 Redis 限流 Key 并下发给 BFE；
 - 跟踪限流触发后的 429 响应构造流程；
+- 掌握批量任务限流（`rules.batch`）的检查实现与全局文件硬顶的合并规则；
 - 掌握模块配置的加载、校验与热加载机制；
 - 了解模块暴露的监控指标与 Prometheus 指标含义。
 
@@ -157,6 +158,54 @@ sequenceDiagram
     M ->> RC: UpdateConsumeToken(bucketTime, tokenDelta)
     M ->> RC: ConnRelease
 ```
+
+## 批量任务限流（rules.batch 与全局硬顶）
+
+控制面导出的 `batch_limits`（见[第十二章 配额与限流设计](../design/chapter12-quota-and-rate-limit.md)）在 BFE 侧落地为 `ai_rate_limit.data` 中每条策略的 `rules.batch` 段（`PolicyConf.Rules.Batch`），实现位于 `bfe/bfe_modules/mod_ai_rate_limit/batch_check.go`。与 TPM/RPM/并发不同，batch 限流**不按 `policy.Models` 过滤**——batch 操作不携带模型。
+
+### 操作分类与检查维度
+
+入口先由 `isBatchOpRequest` 判定：请求模式为 `ModeFile` / `ModeBatch` 且 `bfe_basic.ClassifyBatchOp` 能按 HTTP 方法 + 路径分类出具体操作（create / upload 等）才进入 batch 限流。`checkBatchLimits` 按操作类型检查三个维度：
+
+| 操作 | 维度 | 实现 |
+|------|------|------|
+| create | `max_create_rpm` | `limiterManager` 的 batch create 计数器（Redis） |
+| create | `max_active_batches` | `mod_ai_batch.BatchActiveCount(meta.ClientKeyId)` 与上限比较 |
+| upload | `max_file_bytes` / `max_file_lines` | 非 multipart 上传可按 `Content-Length` 直接比较；multipart 上传按 `file` part 的内容度量（见下节）；chunked 流式上传由 `mod_ai_batch` 的计数 reader 按生效硬顶中途 enforcing |
+
+超限响应由 `executeBatchPolicyAction` 构造：文件硬顶命中返回 413 `CodeBatchFileTooLarge`（type `rate_limit_error`、`LimitTypeBatchFile`），其余维度返回 429 及 RPM 类错误码。
+
+### 文件限额的度量口径
+
+文件字节/行数的度量对象是 multipart 请求中 `name="file"` 的 part 内容，不含 boundary 行、part 头、`purpose` 等表单字段与 CRLF。若按整个请求体计数，一个 1 行/138 字节的合法文件在 11 行/502 字节的信封里就会被误判超限，同时抬高预留额度估算。
+
+度量按请求体是否已缓冲分两条路径：
+
+- **已缓冲（前置检查）**：`mod_body_process` 为提取模型已缓冲请求体时，`mod_ai_batch` 用 `multipartFilePartStats` 定位第一个 `file` part，得到精确的 filename / lines / bytes，在转发前用生效硬顶做前置比较。超限直接返回 413 `BATCH_FILE_TOO_LARGE`（type `rate_limit_error`，`details.limit_type=batch_file`），并计入 `UPLOAD_REJECT_SIZE`。
+- **流式（chunked 或超出缓冲）**：`multipartLimitBody` 增量状态机逐段解析 multipart，只对 `file` part 的 payload 计数，其余字节原样转发。跨读的 boundary 分隔符与 part 头由 pending 缓冲拼接处理，因此不会因分包而误判。计数达到生效硬顶时读取返回错误，上传在流中被中断（计入 `UPLOAD_ABORT_STREAM`），客户端需要重传；中断发生在响应头之前，因此无法再返回 413，这也是优先走缓冲前置检查的原因。
+- **兜底（信封无法解析）**：没有 boundary、part 头超过 8KB 上限或信封结构不可解析时，退回对整个请求体计数，`lines_src` / `bytes_src` 标记为 `approx` 并计入 `UPLOAD_COUNT_APPROX`。整包计数包含信封开销，只会比真实文件值更大，因此限额判断偏保守，不会放行超限文件。
+
+非 multipart 上传（请求体本身即文件）直接按 `Content-Length` 比较字节上限，行数在流式转发中累计；multipart 请求的 `Content-Length` 含信封开销，不能与单文件字节上限直接比较。
+
+### 生效硬顶的单一计算点
+
+文件字节/行数的生效硬顶由 `resolveBatchFileLimits` 单点计算：**绑定策略的 `batch_limits` 与 `mod_ai_batch.data` 全局硬顶（`mod_ai_batch.BatchGlobalFileCeilings()`）取最小值**，结果写入 `AiBasicInfo.BatchEffMaxFileBytes` / `BatchEffMaxFileLines`。`mod_ai_batch` 的转发前预检与计数 reader 都从这两个字段读取，保证同一请求各检查点看到的硬顶一致。
+
+### 未绑定策略的 API-Key 与全局硬顶
+
+`executeCheckLimitPolicy` 对未绑定任何限流策略的 API-Key 直接放行（不做 TPM/RPM/并发检查），但文件硬顶是例外：该无绑定分支同样调用 `resolveBatchFileLimits`（以空策略列表合并全局硬顶），全局 `MaxFileBytes` / `MaxFileLines` 硬顶因此对所有 API-Key 生效。
+
+```go
+policyIds := m.productTable.getPolicyIds(apiKey)
+if len(policyIds) == 0 {
+    // mod_ai_batch.data 全局硬顶必须在未绑定任何限流策略时同样生效：
+    // 以 0 条绑定策略调用 resolveBatchFileLimits，仅合并全局硬顶
+    resolveBatchFileLimits(meta, nil, m.productTable.getPolicy)
+    return bfe_module.BfeHandlerGoOn, nil
+}
+```
+
+---
 
 ## Redis 限流 Key 设计
 
@@ -512,6 +561,7 @@ func (m *ModuleAiRateLimit) limitRequestFinishHandler(req *bfe_basic.Request, re
 - 回调按集群 attempt 触发，但限流检查每请求最多一次：`PolicyLimiterContext` 兼作幂等守卫，key 轮换与 fallback 的重复回调直接放行。
 - 模块支持 TPM、RPM 与最大并发数三类限制，分别基于 Redis Hash、Redis ZSET 与 Redis String 实现，均通过 Lua 脚本保证原子性。
 - TPM 采用"预扣 + 修正"两阶段方案：`HandleAfterAITargetModel` 阶段按预测 Token 预扣，`HandleRequestFinish` 阶段根据实际 Token 消耗修正。
+- 批量任务限流由 `rules.batch` 段实现（create RPM、活跃 batch 数、文件字节/行数硬顶），不按 `policy.Models` 过滤；文件硬顶的生效值为绑定策略 `batch_limits` 与 `mod_ai_batch.data` 全局硬顶的最小值，由 `resolveBatchFileLimits` 单点计算后写入 `AiBasicInfo`，字节/行数按 multipart 中 `name="file"` 的 part 度量（缓冲前置检查返回 413，流式路径中途中断），未绑定任何策略的 API-Key 同样受全局硬顶约束。
 - 控制面为每条 TPM/RPM 规则生成稳定的 `redis_key`（`RL_TPM_rlp-<id>_<idx>` / `RL_RPM_rlp-<id>_<idx>`），BFE 优先使用该字段构建 Redis Key，未指定时回退到旧逻辑。
 - 限流触发后，模块根据 `hit_action` 执行 `FINISH` 或 `CLOSE`，默认返回 429 Too Many Requests，并在响应体中携带限流类型与错误码；本地限流置 `bfe_basic.ErrAiRateLimit` 标记，阻断 key 轮换与集群 fallback，上游 429 仍按原 key 轮换逻辑处理。
 - 配置采用 INI + JSON 双层结构，支持通过 `/reload/mod_ai_rate_limit` 热加载；热加载时会保留旧限流器的统计计数，避免监控跳变。
@@ -521,6 +571,7 @@ func (m *ModuleAiRateLimit) limitRequestFinishHandler(req *bfe_basic.Request, re
 
 - `bfe/bfe_modules/mod_ai_rate_limit/mod_ai_rate_limit.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/policy_limiter.go`
+- `bfe/bfe_modules/mod_ai_rate_limit/batch_check.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/data_load.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/conf_load.go`
 - `bfe/bfe_modules/mod_ai_rate_limit/policy_table.go`

@@ -27,7 +27,7 @@ The relationship between the AI Gateway API and its surrounding components in th
 | Dashboard | Management console | Calls the OpenAPI to perform visual operations |
 | BFE | Data Plane | Consumes configurations exported via InnerAPI and performs forwarding |
 | Conf Agent | Configuration agent | Polls InnerAPI, pulls the latest configuration, and triggers BFE hot reload |
-| Service Controller | Service discovery | Syncs backend service instance information to the Control Plane |
+| ai-gateway-controller (formerly Service Controller) | Service discovery | Reports the Ready instances of K8s Services/Endpoints as a K8s pool (InnerAPI `k8s_pools`); the Control Plane then fans it out to the Provider mirror and Cluster derived pools, and finally exports it to BFE through `cluster_table` |
 
 The current functional scope of the AI Gateway API covers: API-Key / Entity / Entity-Type management, Provider and Cluster management, model pricing management, QuotaPlan and RateLimitPolicy management, AI routing rule management, AI cache rules, traffic mirror rules, intent configuration, context compression rules, K8s Pool management, certificate and extra file management, authentication and authorization, configuration operation log auditing, and configuration export for the Data Plane.
 
@@ -313,7 +313,7 @@ The operation log module records all configuration write operations on the manag
 
 - **Manager design**: `OperationLogManager` implements the two-level interfaces `OperationLogRecorder` (`Record`) and `OperationLogManagerInterface` (including `QueryLogs` and `Close`). Each business Manager injects the recorder via `SetOperationLogManager` and depends only on the minimal `OperationLogRecorder` interface, avoiding a reverse dependency on the query capability;
 - **Storage implementation**: `storage/rdb/ioperlog/operation_log.go` implements `BatchCreate` (batch insert) and `List` (filtered query with pagination). The DAO counterpart is `storage/rdb/internal/dao/table_operation_logs.go`;
-- **Query interface**: `endpoints/openapi_v1/operation_log/list.go` exposes `GET /open-api/v1/operation-logs`, authorized by `iauth.FeatureOperationLog + ActionReadAll`, so only callers with the full `ScopeSystem` permission can query it.
+- **Query interface**: `endpoints/openapi_v1/operation_log/list.go` exposes `GET /open-api/v1/operation-logs`, authorized by `iauth.FeatureOperationLog + ActionReadAll`; both `ScopeSystem` (system administrator) and `ScopeSystemReadonly` (system administrator, read-only) carry that read permission.
 
 ### Asynchronous Buffered Write Mechanism
 

@@ -229,6 +229,8 @@ CREATE TABLE entity_types (
 );
 ```
 
+The `description` of an Entity-Type is limited to 0–255 bytes.
+
 ### `entities` Table
 
 ```sql
@@ -255,7 +257,8 @@ CREATE TABLE entities (
 ```sql
 CREATE TABLE api_keys (
     id VARCHAR(64) PRIMARY KEY,
-    key VARCHAR(128) NOT NULL UNIQUE,
+    key VARCHAR(128) NOT NULL,
+    api_key_hash CHAR(64) NOT NULL COMMENT 'Hex encoding of HMAC-SHA256(pepper, key); irreversible',
     description VARCHAR(512) NOT NULL,
     enabled TINYINT NOT NULL DEFAULT 1,
     expired_time BIGINT DEFAULT -1,
@@ -267,9 +270,25 @@ CREATE TABLE api_keys (
     route_rules_id BIGINT DEFAULT NULL,
     entity_id VARCHAR(64) DEFAULT NULL COMMENT 'ID of the mounted Entity',
     create_time BIGINT NOT NULL,
-    update_time BIGINT NOT NULL
+    update_time BIGINT NOT NULL,
+    UNIQUE KEY uk_api_key_hash (api_key_hash)
 );
 ```
+
+In line with the security design, the storage of the `api_keys` table follows two conventions:
+
+- **Irreversible hash for lookup**: the `api_key_hash` column stores the hex encoding of `HMAC-SHA256(pepper, key)`. The unique key is `uk_api_key_hash`, so both Data Plane validation and duplicate checks go through the hash column, and no plaintext index usable for direct calls exists in the database;
+- **Encryption at rest**: the `api_key` column is stored encrypted in the database (in the `enc$v1$` envelope format), controlled by the `[Security].MasterKeyFile` switch; even a leaked database file cannot directly reveal the Key plaintext.
+
+### Response Masking
+
+The OpenAPI v1 response assembly layer (`lib/xmask`) uniformly masks sensitive fields. It applies only to openapi_v1, with zero changes to InnerAPI exports. The masked fields are `key` of `api-keys`, `keys[].key` of `providers`, and `token` of `tokens`; masking is triggered when the caller is the read-only role (`system_admin_readonly`), while system administrators still see the full plaintext. The algorithm depends on the field length:
+
+- Length > 8: keep the first 4 characters + `********` + the last 4 characters;
+- 4 < length ≤ 8: keep the first 2 characters + `****` + the last 2 characters;
+- Length ≤ 4: mask everything.
+
+The login response is unaffected by masking and still returns the caller's own Session Key; user list/detail responses contain no Session Key, which is an established contract.
 
 ---
 
@@ -280,7 +299,8 @@ This chapter described in detail the two core concepts on the consumer side of t
 - **Entity data model**: the `entities` and `entity_types` tables jointly express the business organizational structure, forming a hierarchy tree constrained by `parent_id` and `level`;
 - **Model inheritance**: `allow_models` in the Entity hierarchy are intersected and `block_models` are unioned, and the final result together with the API-Key's own allowlist determines the usable models;
 - **Entity-level policy binding**: each Entity can independently bind a quota plan, a rate limit policy, and routing rules, serving as the source of policies inherited by API-Keys;
-- **API-Key data model**: the `api_keys` table records key fields such as the Key value, enabled status, expiration time, model allowlist, subnet restriction, and mounted Entity;
+- **API-Key data model**: the `api_keys` table records key fields such as the Key value, enabled status, expiration time, model allowlist, subnet restriction, and mounted Entity; at the storage layer, Keys are located by the `api_key_hash` unique key (HMAC-SHA256), and the `api_key` column is encrypted at rest (in the `enc$v1$` envelope);
+- **Response masking**: the read-only role (`system_admin_readonly`) sees `key`, `providers.keys[].key`, and `token` masked by length tier via `lib/xmask`;
 - **Generation and validation**: supports external Key import and backend generation; the Data Plane BFE performs multi-dimensional validation such as validity, expiration, and subnet in `mod_ai_token_auth`;
 - **Lifecycle**: creation, query, update, deletion, and quota reset are all performed via OpenAPI; deletion cascades cleanup of the dedicated configuration and the Redis Key;
 - **Policy binding and export**: after an API-Key is mounted to an Entity, its own policies are merged with the Entity hierarchy policies, forming the final effective multi-Redis-Key quota, multi-rate-limit-policy, and multi-level routing bindings.
