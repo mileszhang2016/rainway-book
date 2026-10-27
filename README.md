@@ -6,7 +6,7 @@ This book is written for **users and developers of the Rainway AI Gateway**. It 
 
 ## Version Notes
 
-This book is continuously updated along with the Rainway AI Gateway releases. The current version of this book corresponds to **Rainway AI Gateway v0.8.0**. Release address: <https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.8.0>.
+This book is continuously updated along with the Rainway AI Gateway releases. The current version of this book corresponds to **Rainway AI Gateway v0.8.0**. Release address: <https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.8.0.0>.
 
 v0.8.0 includes the following component versions:
 
