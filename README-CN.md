@@ -6,7 +6,7 @@
 
 ## 版本说明
 
-本书会随着壬远AI网关的升级而持续更新。本书的当前版本对应 **壬远AI网关 v0.8.0**，release 地址：<https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.8.0>。
+本书会随着壬远AI网关的升级而持续更新。本书的当前版本对应 **壬远AI网关 v0.8.0**，release 地址：<https://github.com/rainway-ai-gateway/ai-gateway/releases/tag/v0.8.0.0>。
 
 v0.8.0 包含以下组件版本：
 
